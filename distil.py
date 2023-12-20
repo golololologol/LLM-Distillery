@@ -30,16 +30,17 @@ def load_model(model_path: str, max_input_len: int):
 
     return model, tokenizer
 
-def save_tokenized_dataset(dataset_tokenized: list, dataset_turn_lengths: list, save_folder: str, tokenizer: ExLlamaV2Tokenizer):
+def save_tokenized_dataset(dataset_tokenized: list, dataset_turn_lengths: list, assistant_turns_content_ranges: list, save_folder: str, tokenizer: ExLlamaV2Tokenizer):
     file = save_folder + "/dataset_tokenized.jsonl"
     with open(file, 'w', encoding='utf-8') as f:
         for i, convo_tokenized in enumerate(dataset_tokenized):
             data_to_save = {
-            "convo_tokenized": convo_tokenized.tolist(),
-            "turn_lengths": dataset_turn_lengths[i]
+                "convo_tokenized": convo_tokenized.tolist(),
+                "turn_lengths": dataset_turn_lengths[i],
+                "content_ranges": assistant_turns_content_ranges[i]
             }
             f.write(json.dumps(data_to_save, ensure_ascii=False) + '\n')
-            decoded = {"Decoded" : tokenizer.decode(convo_tokenized, decode_special_tokens=True)}
+            decoded = {"Decoded": tokenizer.decode(convo_tokenized, decode_special_tokens=True)}
             f.write(json.dumps(decoded, ensure_ascii=False) + '\n')
 
 def async_save_partial_distributions(dataset_distributions: list, save_path: str, count: int):
@@ -62,39 +63,49 @@ def async_save_partial_distributions(dataset_distributions: list, save_path: str
 def tokenize_dataset(user_discriminator: str, assistant_discriminator: str, assistant_turn_end: str, user_turn_end: str, dataset: list, tokenizer: ExLlamaV2Tokenizer, sort: bool, device: str, add_EOS_token: bool):
     dataset_tokenized = []
     dataset_turn_lengths = []
-    total_processed_tokens = 0
-    crop_start = 0
-    assistant_turn_end = assistant_turn_end + tokenizer.eos_token if add_EOS_token else assistant_turn_end
-    for item in dataset: #tqdm(dataset, desc="Pre-Processing", unit=" convo", smoothing=0.04):
+    assistant_turns_content_ranges = []
+
+    for item in dataset:
         conversation_tokenized = torch.Tensor().to(device)
         turn_lengths = []
+        assistant_turn_content_ranges = []
 
+        start_index = 0
         for i, turn in enumerate(item["conversations"]):
             assistant = i % 2
             discriminator = assistant_discriminator + tokenizer.bos_token if assistant else user_discriminator
             turn_end = assistant_turn_end if assistant else user_turn_end
+
+            # Add the BOS token for assistant turns
             turn_finalized = discriminator + turn.strip() + turn_end
-            print(turn_finalized)
-            turn_tokenized = tokenizer.encode(turn_finalized, encode_special_tokens=True).squeeze(0)
+            turn_tokenized = tokenizer.encode(turn_finalized, encode_special_tokens=True).squeeze(0) # type: ignore
             
             turn_len = turn_tokenized.numel()
-            total_processed_tokens += turn_len
+            end_index = start_index + turn_len
+
+            if assistant:
+                content_start_index = start_index + turn_tokenized.tolist().index(tokenizer.bos_token_id) + 1
+                content_end_index = end_index - 1
+                assistant_turn_content_ranges.append((content_start_index, content_end_index))
+
+            start_index = end_index
             turn_lengths.append(turn_len)
 
-            conversation_tokenized = turn_tokenized if conversation_tokenized.numel() == 0 else torch.cat((conversation_tokenized, turn_tokenized))
+            conversation_tokenized = torch.cat((conversation_tokenized, turn_tokenized)) if conversation_tokenized.numel() > 0 else turn_tokenized
 
         dataset_tokenized.append(conversation_tokenized.to("cpu"))
         dataset_turn_lengths.append(turn_lengths)
+        assistant_turns_content_ranges.append(assistant_turn_content_ranges)
 
     if sort:
-        combined_list = list(zip(dataset_tokenized, dataset_turn_lengths))
+        combined_list = list(zip(dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges))
         combined_list.sort(key=lambda x: sum(x[1]), reverse=True)
-        dataset_tokenized, dataset_turn_lengths = zip(*combined_list)
+        dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges = zip(*combined_list)
 
-    return dataset_tokenized, dataset_turn_lengths, crop_start
+    return dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges
 
 
-def generate_probability_distributions(model: ExLlamaV2, dataset_tokenized: list, dataset_turn_lengths: list, save_path: str, max_cache_gb: int, device: str, window_size: int, crop_start: int):
+def generate_probability_distributions(model: ExLlamaV2, dataset_tokenized: list, dataset_turn_lengths: list, assistant_turns_content_ranges: list, save_path: str, max_cache_gb: int, device: str, window_size: int):
     TOKEN_DISTRIBUTION_SIZE_KB = 62.5
     MAX_CACHE_SIZE_KB = max_cache_gb * 1048576
     MAX_CACHE_SIZE_TOKENS = MAX_CACHE_SIZE_KB / TOKEN_DISTRIBUTION_SIZE_KB
@@ -104,23 +115,16 @@ def generate_probability_distributions(model: ExLlamaV2, dataset_tokenized: list
     count = 0
     total_saved_tokens = 0
 
-    for (conversation_tokenized, conversation_turn_lengths) in tqdm(zip(dataset_tokenized, dataset_turn_lengths), desc="Generating Distributions", unit="convo", smoothing=0.04):
+    for (conversation_tokenized, conversation_turn_lengths, assistant_ranges) in tqdm(zip(dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges), desc="Generating Distributions", unit="convo"):
         conversation_tokenized_gpu = conversation_tokenized[:window_size].to(device)
-        conversation_distributions = model.forward(conversation_tokenized_gpu.unsqueeze(0)).squeeze(0).to("cpu")
+        conversation_distributions = model.forward(conversation_tokenized_gpu.unsqueeze(0)).squeeze(0).to("cpu")  # type: ignore
         conversation_assistant_turns_distributions = []
-        start_index = 0
 
-        for i, turn_len in enumerate(conversation_turn_lengths):
-            assistant = i % 2
-            if assistant:
-                end_index = start_index + turn_len
-                assistant_turn_distributions = conversation_distributions[start_index+crop_start:end_index-1]
-                print(conversation_tokenized[start_index+crop_start:end_index-1])
-                total_saved_tokens += assistant_turn_distributions.size(0)
-                conversation_assistant_turns_distributions.append(assistant_turn_distributions)
+        for start_index, end_index in assistant_ranges:
+            assistant_turn_distributions = conversation_distributions[start_index:end_index]
+            total_saved_tokens += assistant_turn_distributions.size(0)
+            conversation_assistant_turns_distributions.append(assistant_turn_distributions)
 
-            start_index += turn_len
-            
         current_cache_size_tokens += conversation_tokenized_gpu.size(0)
         all_conversations_distributions.append(conversation_assistant_turns_distributions)
 
@@ -165,8 +169,8 @@ dataset = read_jsonl(dataset_path)
 if not os.path.exists(save_folder):
     os.makedirs(save_folder)
 
-dataset_tokenized, dataset_turn_lengths, crop_start = tokenize_dataset(user_discriminator, assistant_discriminator, assistant_turn_end, user_turn_end, dataset, tokenizer, sort, device, add_EOS_token)
-save_tokenized_dataset(dataset_tokenized, dataset_turn_lengths, save_folder, tokenizer)
-generate_probability_distributions(model, dataset_tokenized, dataset_turn_lengths, save_folder, max_cache_gb, device, window_size, crop_start)
+dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges = tokenize_dataset(user_discriminator, assistant_discriminator, assistant_turn_end, user_turn_end, dataset, tokenizer, sort, device, add_EOS_token)
+save_tokenized_dataset(dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges, save_folder, tokenizer)
+generate_probability_distributions(model, dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges, save_folder, max_cache_gb, device, window_size)
 
 print("Done!\nIf the script didn't close yet, that means its still writing to disk!\nDO NOT STOP IT MANUALLY!")
