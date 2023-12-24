@@ -34,14 +34,29 @@ def save_tokenized_dataset(dataset_tokenized: list, dataset_turn_lengths: list, 
     file = save_folder + "/dataset_tokenized.jsonl"
     with open(file, 'w', encoding='utf-8') as f:
         for i, convo_tokenized in enumerate(dataset_tokenized):
+            
             data_to_save = {
                 "convo_tokenized": convo_tokenized.tolist(),
                 "turn_lengths": dataset_turn_lengths[i],
                 "content_ranges": assistant_turns_content_ranges[i]
             }
-            f.write(json.dumps(data_to_save, ensure_ascii=False) + '\n')
+
+            content_tokens = []
+            content_decoded = []
+            
+            for content_range in assistant_turns_content_ranges[i]:
+                content_start, content_end = content_range
+                content_tokens.append(convo_tokenized[content_start:content_end].tolist())
+                content_decoded.append(tokenizer.decode(convo_tokenized[content_start:content_end], decode_special_tokens=True))
+
             decoded = {"Decoded": tokenizer.decode(convo_tokenized, decode_special_tokens=True)}
+            content_tokens = {"Content_tokens": content_tokens}
+            content_decoded = {"Content_decoded": content_decoded}
+
+            f.write(json.dumps(data_to_save, ensure_ascii=False) + '\n')
             f.write(json.dumps(decoded, ensure_ascii=False) + '\n')
+            f.write(json.dumps(content_tokens, ensure_ascii=False) + '\n')
+            f.write(json.dumps(content_decoded, ensure_ascii=False) + '\n')
 
 def async_save_partial_distributions(dataset_distributions: list, save_path: str, count: int):
     save_path = os.path.join(save_folder, "distributions")
@@ -60,10 +75,13 @@ def async_save_partial_distributions(dataset_distributions: list, save_path: str
     thread.start()
 
 
-def tokenize_dataset(user_discriminator: str, assistant_discriminator: str, assistant_turn_end: str, user_turn_end: str, dataset: list, tokenizer: ExLlamaV2Tokenizer, sort: bool, device: str, add_EOS_token: bool):
+
+def tokenize_dataset(user_discriminator: str, assistant_discriminator: str, assistant_turn_end: str, user_turn_end: str, dataset: list, tokenizer: ExLlamaV2Tokenizer, sort: bool, device: str, add_EOS_token: bool, save_all_distributions: bool):
     dataset_tokenized = []
     dataset_turn_lengths = []
     assistant_turns_content_ranges = []
+    assistant_turn_end = assistant_turn_end + tokenizer.eos_token if add_EOS_token else assistant_turn_end
+    total_tokens = 0
 
     for item in dataset:
         conversation_tokenized = torch.Tensor().to(device)
@@ -72,21 +90,24 @@ def tokenize_dataset(user_discriminator: str, assistant_discriminator: str, assi
 
         start_index = 0
         for i, turn in enumerate(item["conversations"]):
+            bos_position = 0
             assistant = i % 2
+
             discriminator = assistant_discriminator + tokenizer.bos_token if assistant else user_discriminator
             turn_end = assistant_turn_end if assistant else user_turn_end
+            turn_finalized = tokenizer.newline_token + discriminator + turn.strip() + turn_end
+            turn_tokenized = tokenizer.encode(turn_finalized, encode_special_tokens=True).squeeze(0)[2:] # type: ignore
 
-            # Add the BOS token for assistant turns
-            turn_finalized = discriminator + turn.strip() + turn_end
-            turn_tokenized = tokenizer.encode(turn_finalized, encode_special_tokens=True).squeeze(0) # type: ignore
-            
-            turn_len = turn_tokenized.numel()
+            turn_len = turn_tokenized.numel() - 2 if assistant else turn_tokenized.numel()
+            total_tokens += turn_len
             end_index = start_index + turn_len
 
             if assistant:
-                content_start_index = start_index + turn_tokenized.tolist().index(tokenizer.bos_token_id) + 1
+                bos_position = turn_tokenized.tolist().index(tokenizer.bos_token_id)
+                content_start_index = start_index + bos_position - 2
                 content_end_index = end_index - 1
                 assistant_turn_content_ranges.append((content_start_index, content_end_index))
+                turn_tokenized = torch.cat((turn_tokenized[:bos_position - 1], turn_tokenized[bos_position + 1:]))
 
             start_index = end_index
             turn_lengths.append(turn_len)
@@ -102,7 +123,8 @@ def tokenize_dataset(user_discriminator: str, assistant_discriminator: str, assi
         combined_list.sort(key=lambda x: sum(x[1]), reverse=True)
         dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges = zip(*combined_list)
 
-    return dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges
+    return dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges, total_tokens
+
 
 
 def generate_probability_distributions(model: ExLlamaV2, dataset_tokenized: list, dataset_turn_lengths: list, assistant_turns_content_ranges: list, save_path: str, max_cache_gb: int, device: str, window_size: int):
@@ -140,6 +162,7 @@ def generate_probability_distributions(model: ExLlamaV2, dataset_tokenized: list
         async_save_partial_distributions(all_conversations_distributions, save_path, count)
 
 
+
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\neural-chat-7b-v3-1-exl2"
 dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filteredtest.jsonl"
@@ -150,8 +173,18 @@ max_cache_gb = 10  # Desired size of the saved files in GB
 sort = True # Sort by length, stops Vram spikes for some reason. Top - longest, Bottom - shortest
 save_all_distributions = False
 
+sys_prompt = """Text transcript of a never-ending conversation between User and Faraday.
+Faraday is a knowledgeable and helpful AI assistant who fulfills any request with detail and precision.
+User is a curious human who uses Faraday to assist with various tasks.
+Faraday is a virtual assistant that exists on User's computer.
+
+#User: Hey Faraday. Who are you?
+#Faraday: I am Faraday, your AI assistant.
+#User: *waits for a while*
+#Faraday: How can I help you today?\n"""
+
 user_discriminator = "#User: "
-assistant_discriminator = "#Assistant: "
+assistant_discriminator = "#Faraday: "
 assistant_turn_end = "\n"
 user_turn_end = "\n"
 add_EOS_token = True
@@ -169,7 +202,7 @@ dataset = read_jsonl(dataset_path)
 if not os.path.exists(save_folder):
     os.makedirs(save_folder)
 
-dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges = tokenize_dataset(user_discriminator, assistant_discriminator, assistant_turn_end, user_turn_end, dataset, tokenizer, sort, device, add_EOS_token)
+dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges, total_tokens = tokenize_dataset(user_discriminator, assistant_discriminator, assistant_turn_end, user_turn_end, dataset, tokenizer, sort, device, add_EOS_token, save_all_distributions)
 save_tokenized_dataset(dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges, save_folder, tokenizer)
 generate_probability_distributions(model, dataset_tokenized, dataset_turn_lengths, assistant_turns_content_ranges, save_folder, max_cache_gb, device, window_size)
 
