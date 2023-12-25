@@ -27,10 +27,9 @@ def load_model(model_path: str, max_input_len: int):
     cache = ExLlamaV2Cache(model, lazy=True)
 
     model.load_autosplit(cache)
-
     return model, tokenizer
 
-def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list, save_folder: str, tokenizer: ExLlamaV2Tokenizer):
+def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list):
     file = save_folder + "/dataset_tokenized.jsonl"
     with open(file, 'w', encoding='utf-8') as f:
         for i, convo_tokenized in enumerate(dataset_tokenized):
@@ -57,7 +56,7 @@ def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list
             f.write(json.dumps(content_tokens, ensure_ascii=False) + '\n')
             f.write(json.dumps(content_decoded, ensure_ascii=False) + '\n')
 
-def async_save_partial_distributions(dataset_distributions: list, save_path: str, count: int):
+def async_save_partial_distributions(dataset_distributions: list, count: int):
     save_path = os.path.join(save_folder, "distributions")
     dataset_distributions_cpu = []
     for convo_distr in dataset_distributions:
@@ -71,68 +70,73 @@ def async_save_partial_distributions(dataset_distributions: list, save_path: str
     thread.start()
 
 
+def tokenize_dataset(dataset: list):
 
-def tokenize_dataset(user_discriminator: str, assistant_discriminator: str, assistant_turn_end: str, user_turn_end: str, dataset: list, tokenizer: ExLlamaV2Tokenizer, sort: bool, device: str, add_EOS_token: bool, save_all_distributions: bool):
+    def good_encode(text: str, encode_special_tokens = False):
+        return tokenizer.encode("\n" + text, encode_special_tokens=encode_special_tokens).squeeze(0)[2:] # type: ignore
+    
     dataset_tokenized = []
-    assistant_turns_content_ranges = []
-    assistant_turn_end = assistant_turn_end + tokenizer.eos_token if add_EOS_token else assistant_turn_end
-    total_tokens = 0
+    dataset_content_ranges = []
+    user_start_tokenized = good_encode(USER_START.replace("<bos>", tokenizer.bos_token), encode_special_tokens=True)
+    user_end_tokenized = good_encode(USER_END.replace("<eos>", tokenizer.eos_token), encode_special_tokens=True)
+    assistant_start_tokenized = good_encode(ASSISTANT_START.replace("<bos>", tokenizer.bos_token), encode_special_tokens=True)
+    assistant_end_tokenized = good_encode(ASSISTANT_END.replace("<eos>", tokenizer.eos_token), encode_special_tokens=True)
+    content_start_offset = assistant_start_tokenized.numel() - 1
+    content_end_offset = assistant_end_tokenized.numel()
 
-    for item in dataset:
+    for item in dataset: # Every conversation
         conversation_tokenized = torch.Tensor().to(device)
-        turn_lengths = []
-        assistant_turn_content_ranges = []
-
+        conversation_content_ranges = []
         start_index = 0
-        for i, turn in enumerate(item["conversations"]):
-            bos_position = 0
+
+        sys_content = item["init"]
+        if sys_content:
+            sys_finalized = SYS_START.replace("<bos>", tokenizer.bos_token) + sys_content.strip() + SYS_END.replace("<eos>", tokenizer.eos_token)
+            sys_tokenized = good_encode(sys_finalized, encode_special_tokens=True)
+            conversation_tokenized = sys_tokenized
+            start_index = sys_tokenized.numel()
+
+        for i, turn in enumerate(item["conversations"]): # Every turn
             assistant = i % 2
 
-            discriminator = assistant_discriminator + tokenizer.bos_token if assistant else user_discriminator
-            turn_end = assistant_turn_end if assistant else user_turn_end
-            turn_finalized = tokenizer.newline_token + discriminator + turn.strip() + turn_end
-            turn_tokenized = tokenizer.encode(turn_finalized, encode_special_tokens=True).squeeze(0)[2:] # type: ignore Cuts out the appended space and filler newline tokens
+            turn_start_tokenized = assistant_start_tokenized if assistant else user_start_tokenized
+            turn_end_tokenized = assistant_end_tokenized if assistant else user_end_tokenized
+            turn_tokenized = good_encode(turn.strip(), encode_special_tokens=True)
 
-            turn_len = turn_tokenized.numel() - 2 if assistant else turn_tokenized.numel()
-            total_tokens += turn_len
-            end_index = start_index + turn_len    
+            full_turn_tokenized = torch.cat((turn_start_tokenized, turn_tokenized, turn_end_tokenized))
+            end_index = start_index + full_turn_tokenized.numel()
 
             if assistant:
-                #indexing hell
-                bos_position = turn_tokenized.tolist().index(tokenizer.bos_token_id) + 1 # Adjusting for space before BOS
-                content_start_index = start_index + bos_position - 3 # -2 for two tokens of the BOS tokens, and -1 to include the token just before the actual response
-                content_end_index = end_index - 1 # Excludes EOS token
-                assistant_turn_content_ranges.append((content_start_index, content_end_index))
-                turn_tokenized = torch.cat((turn_tokenized[:bos_position - 2], turn_tokenized[bos_position:]))
+                content_start_index = start_index + content_start_offset
+                content_end_index = end_index - content_end_offset
+                conversation_content_ranges.append((content_start_index, content_end_index))
 
             start_index = end_index
-            turn_lengths.append(turn_len)
 
-            conversation_tokenized = torch.cat((conversation_tokenized, turn_tokenized)) if conversation_tokenized.numel() > 0 else turn_tokenized
+            conversation_tokenized = torch.cat((conversation_tokenized, full_turn_tokenized)) if conversation_tokenized.numel() > 0 else full_turn_tokenized
 
         dataset_tokenized.append(conversation_tokenized.to("cpu"))
-        assistant_turns_content_ranges.append(assistant_turn_content_ranges)
+        dataset_content_ranges.append(conversation_content_ranges)
 
     if sort:
-        combined_list = list(zip(dataset_tokenized, assistant_turns_content_ranges))
-        combined_list.sort(key=lambda x: sum(x[1]), reverse=True)
-        dataset_tokenized, assistant_turns_content_ranges = zip(*combined_list)
+        combined_list = list(zip(dataset_tokenized, dataset_content_ranges))
+        combined_list.sort(key=lambda x: x[0].shape[0], reverse=True)
+        dataset_tokenized, dataset_content_ranges = map(list, zip(*combined_list))
 
-    return dataset_tokenized, assistant_turns_content_ranges, total_tokens
+    return dataset_tokenized, dataset_content_ranges
 
 
-
-def generate_probability_distributions(model, dataset_tokenized, dataset_content_ranges, save_path, max_cache_gb, device, window_size):
+def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, device):
     TOKEN_DISTRIBUTION_SIZE_KB = 62.5
     MAX_CACHE_SIZE_KB = max_cache_gb * 1048576  # 1GB = 1048576KB
     MAX_CACHE_SIZE_TOKENS = MAX_CACHE_SIZE_KB / TOKEN_DISTRIBUTION_SIZE_KB
 
     def process_conversation(conversation_tokenized, conversation_content_ranges):
         conv_tokenized_gpu = conversation_tokenized[:window_size].to(device)
-        conv_distributions = model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0).to("cpu")
+        conv_distributions = model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0).to("cpu") # type: ignore
         return [conv_distributions[start:end] for start, end in conversation_content_ranges]
 
-    all_conversations_distributions = []
+    dataset_distributions = []
     current_cache_size_tokens = 0
     count = 0
     total_saved_tokens = 0
@@ -140,22 +144,21 @@ def generate_probability_distributions(model, dataset_tokenized, dataset_content
     for conversation_tokenized, conversation_content_ranges in tqdm(zip(dataset_tokenized, dataset_content_ranges), desc="Generating Distributions", unit="convo"):
         content_distributions = process_conversation(conversation_tokenized, conversation_content_ranges)
         conversation_content_distributions = torch.cat(content_distributions, dim=0)
-        all_conversations_distributions.append(conversation_content_distributions)
+        dataset_distributions.append(conversation_content_distributions)
 
         total_saved_tokens += conversation_content_distributions.size(0)
-        current_cache_size_tokens += conversation_tokenized[:window_size].size(0)
+        current_cache_size_tokens += conversation_content_distributions.size(0)
 
         if current_cache_size_tokens >= MAX_CACHE_SIZE_TOKENS:
             count += 1
-            async_save_partial_distributions(all_conversations_distributions, save_path, count)
-            all_conversations_distributions = []
+            async_save_partial_distributions(dataset_distributions, count)
+            dataset_distributions = []
             current_cache_size_tokens = 0
 
     print(f"Total saved tokens: {total_saved_tokens}")
-    if all_conversations_distributions:
+    if dataset_distributions:
         count += 1
-        async_save_partial_distributions(all_conversations_distributions, save_path, count)
-
+        async_save_partial_distributions(dataset_distributions, count)
 
 
 # Main Script
@@ -166,23 +169,13 @@ max_input_len = 8192
 window_size = 7168
 max_cache_gb = 10  # Desired size of the saved files in GB
 sort = True # Sort by length, stops Vram spikes for some reason. Top - longest, Bottom - shortest
-save_all_distributions = False
 
-sys_prompt = """Text transcript of a never-ending conversation between User and Faraday.
-Faraday is a knowledgeable and helpful AI assistant who fulfills any request with detail and precision.
-User is a curious human who uses Faraday to assist with various tasks.
-Faraday is a virtual assistant that exists on User's computer.
-
-#User: Hey Faraday. Who are you?
-#Faraday: I am Faraday, your AI assistant.
-#User: *waits for a while*
-#Faraday: How can I help you today?\n"""
-
-user_discriminator = "#User: "
-assistant_discriminator = "#Faraday: "
-assistant_turn_end = "\n"
-user_turn_end = "\n"
-add_EOS_token = True
+SYS_START = "<|im_start|>system\n"
+USER_START = "<|im_start|>user\n"
+ASSISTANT_START = "<|im_start|>assistant\n"
+SYS_END = "<|im_end|>\n"
+USER_END = "<|im_end|>\n"
+ASSISTANT_END = "<|im_end|>\n" # Use <eos> when the model needs to stop
 
 device = "cuda:0"
 model_name = os.path.basename(os.path.normpath(model_path))
@@ -197,8 +190,8 @@ dataset = read_jsonl(dataset_path)
 if not os.path.exists(save_folder):
     os.makedirs(save_folder)
 
-dataset_tokenized, dataset_content_ranges, total_tokens = tokenize_dataset(user_discriminator, assistant_discriminator, assistant_turn_end, user_turn_end, dataset, tokenizer, sort, device, add_EOS_token, save_all_distributions)
-save_tokenized_dataset(dataset_tokenized, dataset_content_ranges, save_folder, tokenizer)
-generate_probability_distributions(model, dataset_tokenized, dataset_content_ranges, save_folder, max_cache_gb, device, window_size)
+dataset_tokenized, dataset_content_ranges = tokenize_dataset(dataset)
+save_tokenized_dataset(dataset_tokenized, dataset_content_ranges)
+generate_probability_distributions(dataset_tokenized, dataset_content_ranges, device)
 
 print("Done!\nIf the script didn't close yet, that means its still writing to disk!\nDO NOT STOP IT MANUALLY!")
