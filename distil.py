@@ -33,28 +33,18 @@ def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list
     file = save_folder + "/dataset_tokenized.jsonl"
     with open(file, 'w', encoding='utf-8') as f:
         for i, convo_tokenized in enumerate(dataset_tokenized):
-            
-            data_to_save = {
-                "convo_tokenized": convo_tokenized.tolist(),
-                "content_ranges": dataset_content_ranges[i]
-            }
-
             content_tokens = []
-            content_decoded = []
-            
             for content_range in dataset_content_ranges[i]:
                 content_start, content_end = content_range
-                content_tokens.append(convo_tokenized[content_start:content_end].tolist())
-                content_decoded.append(tokenizer.decode(convo_tokenized[content_start:content_end], decode_special_tokens=True))
+                content_tokens.extend(convo_tokenized[content_start:content_end].tolist())
 
-            decoded = {"Decoded": tokenizer.decode(convo_tokenized, decode_special_tokens=True)}
-            content_tokens = {"Content_tokens": content_tokens}
-            content_decoded = {"Content_decoded": content_decoded}
+            data_to_save = {
+                "convo_tokenized": convo_tokenized.tolist(),
+                "content_ranges": dataset_content_ranges[i],
+                "Content_tokens": content_tokens
+            }
 
             f.write(json.dumps(data_to_save, ensure_ascii=False) + '\n')
-            f.write(json.dumps(decoded, ensure_ascii=False) + '\n')
-            f.write(json.dumps(content_tokens, ensure_ascii=False) + '\n')
-            f.write(json.dumps(content_decoded, ensure_ascii=False) + '\n')
 
 def async_save_partial_distributions(dataset_distributions: list, count: int):
     save_path = os.path.join(save_folder, "distributions")
@@ -71,9 +61,9 @@ def async_save_partial_distributions(dataset_distributions: list, count: int):
 
 
 def tokenize_dataset(dataset: list):
-
+    total_tokens = 0
     def good_encode(text: str, encode_special_tokens = False):
-        return tokenizer.encode("\n" + text, encode_special_tokens=encode_special_tokens).squeeze(0)[2:] # type: ignore
+        return tokenizer.encode(f"\n{text}", encode_special_tokens=encode_special_tokens).squeeze(0)[2:] # type: ignore
     
     dataset_tokenized = []
     dataset_content_ranges = []
@@ -114,7 +104,7 @@ def tokenize_dataset(dataset: list):
             start_index = end_index
 
             conversation_tokenized = torch.cat((conversation_tokenized, full_turn_tokenized)) if conversation_tokenized.numel() > 0 else full_turn_tokenized
-
+        total_tokens += conversation_tokenized.numel()
         dataset_tokenized.append(conversation_tokenized.to("cpu"))
         dataset_content_ranges.append(conversation_content_ranges)
 
@@ -123,6 +113,7 @@ def tokenize_dataset(dataset: list):
         combined_list.sort(key=lambda x: x[0].shape[0], reverse=True)
         dataset_tokenized, dataset_content_ranges = map(list, zip(*combined_list))
 
+    print(f"Total processed tokens: {total_tokens}")
     return dataset_tokenized, dataset_content_ranges
 
 
@@ -163,19 +154,19 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
 
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\neural-chat-7b-v3-1-exl2"
-dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filteredtest.jsonl"
+dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filtered.jsonl"
 distributions_save_folder = r"F:\distilled"
 max_input_len = 8192
 window_size = 7168
 max_cache_gb = 10  # Desired size of the saved files in GB
 sort = True # Sort by length, stops Vram spikes for some reason. Top - longest, Bottom - shortest
 
-SYS_START = "<|im_start|>system\n"
-USER_START = "<|im_start|>user\n"
-ASSISTANT_START = "<|im_start|>assistant\n"
-SYS_END = "<|im_end|>\n"
-USER_END = "<|im_end|>\n"
-ASSISTANT_END = "<|im_end|>\n" # Use <eos> when the model needs to stop
+SYS_START = "### System\n"
+USER_START = "### User\n"
+ASSISTANT_START = "### Assistant\n"
+SYS_END = "\n"
+USER_END = "\n"
+ASSISTANT_END = "<eos>\n" # Use <eos> and <bos> for model-specific special tokens
 
 device = "cuda:0"
 model_name = os.path.basename(os.path.normpath(model_path))
