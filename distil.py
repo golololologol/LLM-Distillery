@@ -62,15 +62,17 @@ def async_save_partial_distributions(dataset_distributions: list, count: int):
 
 def tokenize_dataset(dataset: list):
     total_tokens = 0
-    def good_encode(text: str, encode_special_tokens = False):
-        return tokenizer.encode(f"\n{text}", encode_special_tokens=encode_special_tokens).squeeze(0)[2:] # type: ignore
+    def good_encode(text: str, encode_special = True, replace_tokens = False):
+        if replace_tokens:
+            return tokenizer.encode(f"\n{text.replace('<bos>', tokenizer.bos_token).replace('<eos>', tokenizer.eos_token)}", encode_special_tokens=encode_special).squeeze(0)[2:] # type: ignore
+        return tokenizer.encode(f"\n{text}", encode_special_tokens=encode_special).squeeze(0)[2:] # type: ignore
     
     dataset_tokenized = []
     dataset_content_ranges = []
-    user_start_tokenized = good_encode(USER_START.replace("<bos>", tokenizer.bos_token), encode_special_tokens=True)
-    user_end_tokenized = good_encode(USER_END.replace("<eos>", tokenizer.eos_token), encode_special_tokens=True)
-    assistant_start_tokenized = good_encode(ASSISTANT_START.replace("<bos>", tokenizer.bos_token), encode_special_tokens=True)
-    assistant_end_tokenized = good_encode(ASSISTANT_END.replace("<eos>", tokenizer.eos_token), encode_special_tokens=True)
+    user_start_tokenized = good_encode(USER_START, replace_tokens=True)
+    user_end_tokenized = good_encode(USER_END, replace_tokens=True)
+    assistant_start_tokenized = good_encode(ASSISTANT_START, replace_tokens=True)
+    assistant_end_tokenized = good_encode(ASSISTANT_END, replace_tokens=True)
     content_start_offset = assistant_start_tokenized.numel() - 1
     content_end_offset = assistant_end_tokenized.numel()
 
@@ -81,8 +83,8 @@ def tokenize_dataset(dataset: list):
 
         sys_content = item["init"]
         if sys_content:
-            sys_finalized = SYS_START.replace("<bos>", tokenizer.bos_token) + sys_content.strip() + SYS_END.replace("<eos>", tokenizer.eos_token)
-            sys_tokenized = good_encode(sys_finalized, encode_special_tokens=True)
+            sys_finalized = SYS_START + sys_content.strip() + SYS_END
+            sys_tokenized = good_encode(sys_finalized, replace_tokens=True)
             conversation_tokenized = sys_tokenized
             start_index = sys_tokenized.numel()
 
@@ -91,7 +93,7 @@ def tokenize_dataset(dataset: list):
 
             turn_start_tokenized = assistant_start_tokenized if assistant else user_start_tokenized
             turn_end_tokenized = assistant_end_tokenized if assistant else user_end_tokenized
-            turn_tokenized = good_encode(turn.strip(), encode_special_tokens=True)
+            turn_tokenized = good_encode(turn.strip(), encode_special=False)
 
             full_turn_tokenized = torch.cat((turn_start_tokenized, turn_tokenized, turn_end_tokenized))
             end_index = start_index + full_turn_tokenized.numel()
