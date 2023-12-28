@@ -58,8 +58,7 @@ def tokenize_dataset(dataset, device, sort, model_path, return_metadata, prompt_
 
             start_index = end_index
 
-            conversation_tokenized = torch.cat(
-                (conversation_tokenized, full_turn_tokenized)) if conversation_tokenized.numel() > 0 else full_turn_tokenized
+            conversation_tokenized = torch.cat((conversation_tokenized, full_turn_tokenized)) if conversation_tokenized.numel() > 0 else full_turn_tokenized
         total_tokens += conversation_tokenized.numel()
         dataset_tokenized.append(conversation_tokenized.to("cpu"))
         dataset_content_ranges.append(conversation_content_ranges)
