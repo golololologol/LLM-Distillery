@@ -135,7 +135,7 @@ dataset = read_jsonl(dataset_path)
 if not os.path.exists(save_folder):
     os.makedirs(save_folder)
 
-dataset_tokenized, dataset_content_ranges, metadata = tokenize_dataset(dataset, device, sort, model_path, save_metadata, prompt_format, save_sys_range, save_user_range, save_assistant_range)
+dataset_tokenized, dataset_content_ranges, metadata = tokenize_dataset(dataset, device, sort, model_path, save_metadata, prompt_format, window_size, save_sys_range, save_user_range, save_assistant_range)
 save_tokenized_dataset(dataset_tokenized, dataset_content_ranges, metadata, save_metadata)
 generate_probability_distributions(dataset_tokenized, dataset_content_ranges, device)
 

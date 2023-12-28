@@ -1,7 +1,7 @@
 import torch
 from transformers import AutoTokenizer
 
-def tokenize_dataset(dataset, device, sort, model_path, return_metadata, prompt_format, save_sys_range=False, save_user_range=False, save_assistant_range=False):
+def tokenize_dataset(dataset, device, sort, model_path, return_metadata, prompt_format, context_len, save_sys_range=False, save_user_range=False, save_assistant_range=False):
 
     print("Tokenizing the dataset")
     total_tokens = 0
@@ -81,6 +81,7 @@ def tokenize_dataset(dataset, device, sort, model_path, return_metadata, prompt_
                 "save_sys_range": save_sys_range,
                 "save_user_range": save_user_range,
                 "save_assistant_range": save_assistant_range,
+                "context_len": context_len,
                 "bos_id": tokenizer.bos_token_id,
                 "eos_id": tokenizer.eos_token_id,
                 "pad_id": tokenizer.pad_token_id,
