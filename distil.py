@@ -2,9 +2,11 @@ import json
 import os
 import threading
 import pickle
+from numpy import save
 import torch
 from tqdm import tqdm
-from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache, ExLlamaV2Tokenizer
+from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
+from tokenize_dataset import tokenize_dataset
 
 def read_jsonl(file_path):
     data = []
@@ -23,15 +25,16 @@ def load_model(model_path: str, max_input_len: int):
     config.max_attention_size = max_input_len**2
 
     model = ExLlamaV2(config)
-    tokenizer = ExLlamaV2Tokenizer(config)
     cache = ExLlamaV2Cache(model, lazy=True)
 
     model.load_autosplit(cache)
-    return model, tokenizer
+    return model
 
-def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list):
-    file = save_folder + "/dataset_tokenized.jsonl"
-    with open(file, 'w', encoding='utf-8') as f:
+def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list, metadata, save_metadata: bool):
+    file = os.path.join(save_folder, "dataset_tokenized.jsonl")
+    metadata_file = os.path.join(save_folder, "dataset_metadata.json")
+
+    with open(file, 'w', encoding='utf-8') as f, open(metadata_file, 'w', encoding='utf-8') as meta_f:
         for i, convo_tokenized in enumerate(dataset_tokenized):
             content_tokens = []
             for content_range in dataset_content_ranges[i]:
@@ -41,10 +44,12 @@ def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list
             data_to_save = {
                 "convo_tokenized": convo_tokenized.tolist(),
                 "content_ranges": dataset_content_ranges[i],
-                "Content_tokens": content_tokens
+                "content_tokens": content_tokens
             }
-
             f.write(json.dumps(data_to_save, ensure_ascii=False) + '\n')
+
+        if save_metadata:
+            meta_f.write(json.dumps(metadata, ensure_ascii=False) + '\n')
 
 def async_save_partial_distributions(dataset_distributions: list, count: int):
     save_path = os.path.join(save_folder, "distributions")
@@ -58,66 +63,6 @@ def async_save_partial_distributions(dataset_distributions: list, count: int):
 
     thread = threading.Thread(target=save_thread)
     thread.start()
-
-
-def tokenize_dataset(dataset: list):
-    total_tokens = 0
-    def good_encode(text: str, encode_special = True, replace_tokens = False):
-        if replace_tokens:
-            return tokenizer.encode(f"\n{text.replace('<bos>', tokenizer.bos_token).replace('<eos>', tokenizer.eos_token)}", encode_special_tokens=encode_special).squeeze(0)[2:] # type: ignore
-        return tokenizer.encode(f"\n{text}", encode_special_tokens=encode_special).squeeze(0)[2:] # type: ignore
-    
-    dataset_tokenized = []
-    dataset_content_ranges = []
-    user_start_tokenized = good_encode(USER_START, replace_tokens=True)
-    user_end_tokenized = good_encode(USER_END, replace_tokens=True)
-    assistant_start_tokenized = good_encode(ASSISTANT_START, replace_tokens=True)
-    assistant_end_tokenized = good_encode(ASSISTANT_END, replace_tokens=True)
-    content_start_offset = assistant_start_tokenized.numel() - 1
-    content_end_offset = assistant_end_tokenized.numel()
-
-    for item in dataset: # Every conversation
-        conversation_tokenized = torch.Tensor().to(device)
-        conversation_content_ranges = []
-        start_index = 0
-
-        sys_content = item["init"]
-        if sys_content:
-            sys_finalized = SYS_START + sys_content.strip() + SYS_END
-            sys_tokenized = good_encode(sys_finalized, replace_tokens=True)
-            conversation_tokenized = sys_tokenized
-            start_index = sys_tokenized.numel()
-
-        for i, turn in enumerate(item["conversations"]): # Every turn
-            assistant = i % 2
-
-            turn_start_tokenized = assistant_start_tokenized if assistant else user_start_tokenized
-            turn_end_tokenized = assistant_end_tokenized if assistant else user_end_tokenized
-            turn_tokenized = good_encode(turn.strip(), encode_special=False)
-
-            full_turn_tokenized = torch.cat((turn_start_tokenized, turn_tokenized, turn_end_tokenized))
-            end_index = start_index + full_turn_tokenized.numel()
-
-            if assistant:
-                content_start_index = start_index + content_start_offset
-                content_end_index = end_index - content_end_offset
-                conversation_content_ranges.append((content_start_index, content_end_index))
-
-            start_index = end_index
-
-            conversation_tokenized = torch.cat((conversation_tokenized, full_turn_tokenized)) if conversation_tokenized.numel() > 0 else full_turn_tokenized
-        total_tokens += conversation_tokenized.numel()
-        dataset_tokenized.append(conversation_tokenized.to("cpu"))
-        dataset_content_ranges.append(conversation_content_ranges)
-
-    if sort:
-        combined_list = list(zip(dataset_tokenized, dataset_content_ranges))
-        combined_list.sort(key=lambda x: x[0].shape[0], reverse=True)
-        dataset_tokenized, dataset_content_ranges = map(list, zip(*combined_list))
-
-    print(f"Total processed tokens: {total_tokens}")
-    return dataset_tokenized, dataset_content_ranges
-
 
 def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, device):
     TOKEN_DISTRIBUTION_SIZE_KB = 62.5
@@ -156,19 +101,26 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
 
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\neural-chat-7b-v3-1-exl2"
-dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filtered.jsonl"
+dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filteredtest.jsonl"
 distributions_save_folder = r"F:\distilled"
 max_input_len = 8192
 window_size = 7168
 max_cache_gb = 10  # Desired size of the saved files in GB
 sort = True # Sort by length, stops Vram spikes for some reason. Top - longest, Bottom - shortest
+save_metadata = True
+save_sys_range = True
+save_user_range = True
+save_assistant_range = True
 
-SYS_START = "### System\n"
-USER_START = "### User\n"
-ASSISTANT_START = "### Assistant\n"
-SYS_END = "\n"
-USER_END = "\n"
-ASSISTANT_END = "<eos>\n" # Use <eos> and <bos> for model-specific special tokens
+
+prompt_format = {
+    'SYS_START': "### System:\n",
+    'USER_START': "### User:\n",
+    'ASSISTANT_START': "### Assistant:\n",
+    'SYS_END': '\n',
+    'USER_END': '\n',
+    'ASSISTANT_END': '<eos>\n' # Use <eos> and <bos> for model-specific special tokens
+}
 
 device = "cuda:0"
 model_name = os.path.basename(os.path.normpath(model_path))
@@ -177,14 +129,14 @@ save_folder = os.path.join(distributions_save_folder, dataset_name, model_name)
 
 print(f"Model: {model_name}\nDataset: {dataset_name}")
 
-model, tokenizer = load_model(model_path, max_input_len)
+model = load_model(model_path, max_input_len)
 dataset = read_jsonl(dataset_path)
 
 if not os.path.exists(save_folder):
     os.makedirs(save_folder)
 
-dataset_tokenized, dataset_content_ranges = tokenize_dataset(dataset)
-save_tokenized_dataset(dataset_tokenized, dataset_content_ranges)
+dataset_tokenized, dataset_content_ranges, metadata = tokenize_dataset(dataset, device, sort, model_path, save_metadata, prompt_format, save_sys_range, save_user_range, save_assistant_range)
+save_tokenized_dataset(dataset_tokenized, dataset_content_ranges, metadata, save_metadata)
 generate_probability_distributions(dataset_tokenized, dataset_content_ranges, device)
 
 print("Done!\nIf the script didn't close yet, that means its still writing to disk!\nDO NOT STOP IT MANUALLY!")
