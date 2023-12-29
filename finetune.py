@@ -14,8 +14,8 @@ def read_jsonl(file_path):
             data.append(json.loads(line))
     return data
 
-def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list):
-    file = save_folder + "/dataset_tokenized.jsonl"
+def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list, save_folder: str):
+    file = os.path.join(save_folder, "dataset_tokenized.jsonl")
     with open(file, 'w', encoding='utf-8') as f:
         for i, convo_tokenized in enumerate(dataset_tokenized):
             content_tokens = []
@@ -28,7 +28,6 @@ def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list
                 "content_ranges": dataset_content_ranges[i],
                 "Content_tokens": content_tokens
             }
-
             f.write(json.dumps(data_to_save, ensure_ascii=False) + '\n')
 
 def load_metadata(distributions_path):
@@ -58,29 +57,53 @@ def teacher_tensors_hander(distributions_path):
                 for tensor in tensor_list:
                     yield tensor
 
+def ensure_compatibility(teacher_logits, index_map):
+    compatible_teacher_distr = torch.empty_like(teacher_logits[0])
+
+    for teacher_distr in teacher_logits:
+        for idx2, idx1 in index_map.items():
+            compatible_teacher_distr[idx1] = teacher_distr[idx2]
+
+    return compatible_teacher_distr
+
 def calculate_kl_divergence(student_logits, teacher_logits):
     student_probs = torch.nn.functional.softmax(student_logits, dim=-1)
     teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
     kl_div = torch.nn.functional.kl_div(student_probs.log(), teacher_probs, reduction='batchmean')
     return kl_div
 
-def finetune(model: nn.Module, dataset_tokenized: list, dataset_content_ranges: list, distr_context_len: int):
+def finetune(model: nn.Module, dataset_tokenized: list, dataset_content_ranges: list, distr_context_len: int, teacher_metadata: dict, student_metadata: dict):
+    teacher_dict = teacher_metadata['vocab']
+    student_dict = student_metadata['vocab']
+    all_tokens_present = all(token in student_dict for token in teacher_dict)
+    if all_tokens_present:
+        index_map = {teacher_dict[token]: student_dict[token] for token in teacher_dict}
+        sorted_indices = [index_map[i] for i in range(len(index_map))]
+    else:
+        index_map = {}
+        sorted_indices = []
+        print("Teacher and student vocabularies are not compatible!")
+        os._exit
+
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr)
-    teacher_gen = teacher_tensors_hander(distributions_path)
+    teacher_tensor = teacher_tensors_hander(distributions_path)
     dataset_len = len(dataset_tokenized)
     crop_to_len = min(distr_context_len, context_length)
     step = 0
 
     for epoch in range(num_epochs):
         total_loss = 0
-        for conversation_tokenized, conversation_content_ranges in tqdm(zip(dataset_tokenized, dataset_content_ranges), total=dataset_len, desc="Finetuning", unit="convo"):
+        for conversation_tokenized, conversation_content_ranges in tqdm(zip(dataset_tokenized, dataset_content_ranges), total=dataset_len, desc="Finetuning", unit="convo", postfix={"Epoch": epoch, "Loss": total_loss/dataset_len}):
             conversation_tokenized = torch.tensor(conversation_tokenized).to(device)
-            teacher_logits = next(teacher_gen).to(device)
+            teacher_logits = next(teacher_tensor).to(device)[:crop_to_len]
 
             # Generating logits from the student model
-            full_student_logits = model(conversation_tokenized, labels=conversation_tokenized)[1][:crop_to_len]
+            full_student_logits = model(conversation_tokenized, labels=conversation_tokenized)[1].squeeze()[:crop_to_len]
             student_logits = torch.cat([full_student_logits[start:end] for start, end in conversation_content_ranges], dim=0)
+            
+            # Ensure compatibility between teacher and student logits
+            teacher_logits = teacher_logits[:, sorted_indices]
 
             # Calculate loss
             loss = calculate_kl_divergence(student_logits, teacher_logits)
@@ -91,8 +114,6 @@ def finetune(model: nn.Module, dataset_tokenized: list, dataset_content_ranges: 
             loss.backward()
             optimizer.step()
             step += 1
-
-        print(f"Epoch: {epoch}, Average loss: {total_loss/dataset_len}")
 
     # Save the fine-tuned model
     model.save_pretrained(trained_model_save_folder)
@@ -135,6 +156,7 @@ if distr_metadata is not None:
         dataset, device, distr_metadata['sort'], model_path, True, prompt_format, 999, 
         distr_metadata['save_sys_range'], distr_metadata['save_user_range'], 
         distr_metadata['save_assistant_range'])
-    save_tokenized_dataset(dataset_tokenized, dataset_content_ranges)
+    save_tokenized_dataset(dataset_tokenized, dataset_content_ranges, trained_model_save_folder)
     distr_context_len = distr_metadata['context_len']
-    finetune(model, dataset_tokenized, dataset_content_ranges, distr_context_len)
+    if student_metadata is not None:
+        finetune(model, dataset_tokenized, dataset_content_ranges, distr_context_len, distr_metadata, student_metadata)
