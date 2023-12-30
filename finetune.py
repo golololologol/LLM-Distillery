@@ -1,3 +1,4 @@
+from operator import index
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -57,14 +58,37 @@ def teacher_tensors_hander(distributions_path):
                 for tensor in tensor_list:
                     yield tensor
 
-def ensure_compatibility(teacher_logits, index_map):
-    compatible_teacher_distr = torch.empty_like(teacher_logits[0])
+def create_index_map(teacher_metadata, student_metadata):
+    teacher_vocab = teacher_metadata['vocab']
+    student_vocab = student_metadata['vocab']
 
-    for teacher_distr in teacher_logits:
-        for idx2, idx1 in index_map.items():
-            compatible_teacher_distr[idx1] = teacher_distr[idx2]
+    special_tokens_map = {}
+    for key in ["unk_id", "bos_id", "eos_id", "pad_id"]:
+        teacher_special_id = teacher_metadata.get(key)
+        student_special_id = student_metadata.get(key)
+        if teacher_special_id is not None and student_special_id is not None:
+            special_tokens_map[teacher_special_id] = student_special_id
+    
+    index_map = special_tokens_map.copy()
+    
+    for teacher_token, teacher_token_id in teacher_vocab.items():
+        if teacher_token_id not in special_tokens_map:
+            student_token_id = student_vocab.get(teacher_token)
+            if student_token_id is not None:
+                index_map[teacher_token_id] = student_token_id
 
-    return compatible_teacher_distr
+    return index_map
+
+def ensure_compatibility(teacher_logits, student_logits, index_map):
+    compatible_teacher_logits = torch.empty_like(student_logits)
+
+    sorted_indices = [index_map.get(i, -1) for i in range(teacher_logits.size(1))]
+
+    sorted_indices = [i for i in sorted_indices if i != -1]
+
+    compatible_teacher_logits = teacher_logits[:, sorted_indices]
+
+    return compatible_teacher_logits
 
 def calculate_kl_divergence(student_logits, teacher_logits):
     student_probs = torch.nn.functional.softmax(student_logits, dim=-1)
@@ -73,24 +97,13 @@ def calculate_kl_divergence(student_logits, teacher_logits):
     return kl_div
 
 def finetune(model: nn.Module, dataset_tokenized: list, dataset_content_ranges: list, distr_context_len: int, teacher_metadata: dict, student_metadata: dict):
-    teacher_dict = teacher_metadata['vocab']
-    student_dict = student_metadata['vocab']
-    all_tokens_present = all(token in student_dict for token in teacher_dict)
-    if all_tokens_present:
-        index_map = {teacher_dict[token]: student_dict[token] for token in teacher_dict}
-        sorted_indices = [index_map[i] for i in range(len(index_map))]
-    else:
-        index_map = {}
-        sorted_indices = []
-        print("Teacher and student vocabularies are not compatible!")
-        os._exit
-
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr)
     teacher_tensor = teacher_tensors_hander(distributions_path)
     dataset_len = len(dataset_tokenized)
     crop_to_len = min(distr_context_len, context_length)
     step = 0
+    index_map = create_index_map(teacher_metadata, student_metadata)
 
     for epoch in range(num_epochs):
         total_loss = 0
@@ -103,7 +116,7 @@ def finetune(model: nn.Module, dataset_tokenized: list, dataset_content_ranges: 
             student_logits = torch.cat([full_student_logits[start:end] for start, end in conversation_content_ranges], dim=0)
             
             # Ensure compatibility between teacher and student logits
-            teacher_logits = teacher_logits[:, sorted_indices]
+            teacher_logits = ensure_compatibility(teacher_logits, student_logits, index_map)
 
             # Calculate loss
             loss = calculate_kl_divergence(student_logits, teacher_logits)
