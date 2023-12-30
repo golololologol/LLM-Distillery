@@ -90,13 +90,33 @@ def ensure_compatibility(teacher_logits, student_logits, index_map):
 
     return compatible_teacher_logits
 
+def validate(model, validation_dataset_tokenized, device):
+    model.eval()
+    total_loss = 0
+    criterion = nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        for conversation_tokenized in validation_dataset_tokenized:
+            inputs = torch.tensor(conversation_tokenized).to(device)
+            outputs = model(inputs, labels=inputs)
+            logits = outputs.logits
+
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = inputs[..., 1:].contiguous()
+
+            loss = criterion(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            total_loss += loss.item()
+
+    average_loss = total_loss / len(validation_dataset_tokenized)
+    return average_loss
+
 def calculate_kl_divergence(student_logits, teacher_logits):
     student_probs = torch.nn.functional.softmax(student_logits, dim=-1)
     teacher_probs = torch.nn.functional.softmax(teacher_logits, dim=-1)
     kl_div = torch.nn.functional.kl_div(student_probs.log(), teacher_probs, reduction='batchmean')
     return kl_div
 
-def finetune(model: nn.Module, dataset_tokenized: list, dataset_content_ranges: list, distr_context_len: int, teacher_metadata: dict, student_metadata: dict):
+def finetune(model: nn.Module, dataset_tokenized: list, dataset_content_ranges: list, validation_dataset_tokenized:list, validation_dataset_ranges: list, distr_context_len: int, teacher_metadata: dict, student_metadata: dict, device: str):
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr)
     teacher_tensor = teacher_tensors_hander(distributions_path)
@@ -127,6 +147,10 @@ def finetune(model: nn.Module, dataset_tokenized: list, dataset_content_ranges: 
             loss.backward()
             optimizer.step()
             step += 1
+        validation_loss = validate(model, validation_dataset_tokenized, device)
+        print(f"Epoch {epoch}: Validation Loss: {validation_loss}")
+
+        model.train()
 
     # Save the fine-tuned model
     model.save_pretrained(trained_model_save_folder)
@@ -135,6 +159,7 @@ def finetune(model: nn.Module, dataset_tokenized: list, dataset_content_ranges: 
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\neural-chat-7b-v3-1-exl2"
 dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filtered.jsonl"
+validation_dataset_tokenized = r"C:\Users\gololo\Documents\janny\janny_Filteredtest.jsonl"
 distributions_path = r"F:\distilled\janny_Filtered\neural-chat-7b-v3-1-exl2"
 save_folder = r"F:\trained"
 trained_model_name = r"BallCrusher9000"
@@ -166,10 +191,18 @@ distr_metadata = load_metadata(distributions_path)
 
 if distr_metadata is not None:
     dataset_tokenized, dataset_content_ranges, student_metadata = tokenize_dataset(
-        dataset, device, distr_metadata['sort'], model_path, True, prompt_format, 999, 
+        dataset, device, distr_metadata['sort'], model_path, prompt_format, context_length, 
         distr_metadata['save_sys_range'], distr_metadata['save_user_range'], 
         distr_metadata['save_assistant_range'])
+    
+    validation_dataset_tokenized, validation_dataset_ranges, _ = tokenize_dataset(
+        validation_dataset_tokenized, device, distr_metadata['sort'], model_path, prompt_format, context_length, 
+        distr_metadata['save_sys_range'], distr_metadata['save_user_range'], 
+        distr_metadata['save_assistant_range'])
+    
     save_tokenized_dataset(dataset_tokenized, dataset_content_ranges, trained_model_save_folder)
+
     distr_context_len = distr_metadata['context_len']
-    if student_metadata is not None:
-        finetune(model, dataset_tokenized, dataset_content_ranges, distr_context_len, distr_metadata, student_metadata)
+
+    finetune(model, dataset_tokenized, dataset_content_ranges, validation_dataset_tokenized,
+                  validation_dataset_ranges, distr_context_len, distr_metadata, student_metadata, device)

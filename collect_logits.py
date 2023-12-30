@@ -29,7 +29,7 @@ def load_model(model_path: str, max_input_len: int):
     model.load_autosplit(cache)
     return model
 
-def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list, metadata, save_metadata: bool, save_folder: str):
+def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list, metadata, save_folder: str):
     file = os.path.join(save_folder, "dataset_tokenized.jsonl")
     metadata_file = os.path.join(save_folder, "dataset_metadata.json")
 
@@ -47,8 +47,7 @@ def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list
             }
             f.write(json.dumps(data_to_save, ensure_ascii=False) + '\n')
 
-        if save_metadata:
-            meta_f.write(json.dumps(metadata, ensure_ascii=False) + '\n')
+        meta_f.write(json.dumps(metadata, ensure_ascii=False) + '\n')
 
 def async_save_partial_distributions(dataset_distributions: list, count: int):
     save_path = os.path.join(save_folder, "distributions")
@@ -135,8 +134,8 @@ dataset = read_jsonl(dataset_path)
 if not os.path.exists(save_folder):
     os.makedirs(save_folder)
 
-dataset_tokenized, dataset_content_ranges, metadata = tokenize_dataset(dataset, device, sort, model_path, save_metadata, prompt_format, window_size, save_sys_range, save_user_range, save_assistant_range)
-save_tokenized_dataset(dataset_tokenized, dataset_content_ranges, metadata, save_metadata, save_folder)
+dataset_tokenized, dataset_content_ranges, metadata = tokenize_dataset(dataset, device, sort, model_path, prompt_format, window_size, save_sys_range, save_user_range, save_assistant_range)
+save_tokenized_dataset(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
 generate_probability_distributions(dataset_tokenized, dataset_content_ranges, device)
 
 print("Done!\nIf the script didn't close yet, that means its still writing to disk!\nDO NOT STOP IT MANUALLY!")
