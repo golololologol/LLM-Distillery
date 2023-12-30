@@ -4,7 +4,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import pickle
 import os
 from tqdm import tqdm
-from tokenize_dataset import tokenize_dataset
+from utils.tokenize_dataset import tokenize_dataset
 import json
 
 def read_jsonl(file_path):

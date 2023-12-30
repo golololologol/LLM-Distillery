@@ -2,11 +2,10 @@ import json
 import os
 import threading
 import pickle
-from numpy import save
 import torch
 from tqdm import tqdm
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
-from tokenize_dataset import tokenize_dataset
+from utils.tokenize_dataset import tokenize_dataset
 
 def read_jsonl(file_path):
     data = []
