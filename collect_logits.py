@@ -79,8 +79,8 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
 
 
 # Main Script
-model_path = r"C:\Users\gololo\Desktop\neural-chat-7b-v3-1-exl2"
-dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filteredtest.jsonl"
+model_path = r"C:\Users\gololo\Desktop\speechless-llama2-hermes-orca-platypus-wizardlm-13b-exl2"
+dataset_path = r"F:\down\theoremqa.jsonl"
 distributions_save_folder = r"F:\distilled"
 max_input_len = 8192
 window_size = 7168
@@ -96,9 +96,9 @@ prompt_format = {
     'SYS_START': "### System:\n",
     'USER_START': "### User:\n",
     'ASSISTANT_START': "### Assistant:\n",
-    'SYS_END': '\n',
-    'USER_END': '\n',
-    'ASSISTANT_END': '<eos>\n' # Use <eos> and <bos> for model-specific special tokens
+    'SYS_END': '\n\n',
+    'USER_END': '\n\n',
+    'ASSISTANT_END': '<eos>\n\n' # Use <eos> and <bos> for model-specific special tokens
 }
 
 device = "cuda:0"
