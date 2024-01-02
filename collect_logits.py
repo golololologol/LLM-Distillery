@@ -5,8 +5,7 @@ import pickle
 import torch
 from tqdm import tqdm
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
-from utils.tokenize_dataset import tokenize_dataset
-from utils.dataset_utils import save_dataset_and_metadata
+from utils.dataset_utils import save_dataset_and_metadata, tokenize_dataset
 
 def read_jsonl(file_path):
     data = []
@@ -43,15 +42,30 @@ def async_save_partial_distributions(dataset_distributions: list, count: int):
     thread = threading.Thread(target=save_thread)
     thread.start()
 
-def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, device):
+def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost):
     TOKEN_DISTRIBUTION_SIZE_KB = 62.5
     MAX_CACHE_SIZE_KB = max_cache_gb * 1048576  # 1GB = 1048576KB
     MAX_CACHE_SIZE_TOKENS = MAX_CACHE_SIZE_KB / TOKEN_DISTRIBUTION_SIZE_KB
 
+    def modify_distributions(model_output, conversation_tokenized) -> torch.Tensor:
+        modified_output = model_output.clone()
+        for i in range(conversation_tokenized.size(0) - 1):
+            next_token = conversation_tokenized[i + 1]
+            current_distribution = modified_output[i]
+            if set_max_token_prob:
+                max_logit = torch.max(current_distribution)
+                current_distribution[next_token] = max_logit * next_token_prob_boost
+            else:
+                current_distribution[next_token] *= next_token_prob_boost
+        return modified_output
+
     def process_conversation(conversation_tokenized: torch.Tensor, conversation_content_ranges: list):
-        conv_tokenized_gpu = conversation_tokenized.to(device)
-        conv_distributions = model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0).to("cpu") # type: ignore
-        return [conv_distributions[start:end] for start, end in conversation_content_ranges]
+        conv_tokenized_gpu = conversation_tokenized.to(device)[:window_size]
+        conv_distributions = model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0)
+        if not next_token_prob_boost <= 1:
+            conv_distributions = modify_distributions(conv_distributions, conv_tokenized_gpu)
+        modified_distributions_cpu = conv_distributions.to("cpu")
+        return [modified_distributions_cpu[start:end] for start, end in conversation_content_ranges]
 
     dataset_distributions = []
     current_cache_size_tokens = 0
@@ -80,13 +94,15 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
 
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\speechless-llama2-hermes-orca-platypus-wizardlm-13b-exl2"
-dataset_path = r"F:\down\theoremqa.jsonl"
+dataset_path = r"f:\down\vsakoye\randoBS.jsonl"
 distributions_save_folder = r"F:\distilled"
 max_input_len = 8192
-window_size = 7168
+window_size = 7*1024
 max_cache_gb = 10  # Desired size of the saved files in GB
+
+set_max_token_prob = True
+next_token_prob_boost = 1.05  # Boost the probability of the next token by this factor
 sort = True # Sort by length, stops Vram spikes for some reason. Top - longest, Bottom - shortest
-save_metadata = True
 
 save_sys_range = False
 save_user_range = False
@@ -94,7 +110,7 @@ save_assistant_range = True
 
 prompt_format = {
     'SYS_START': "### System:\n",
-    'USER_START': "### User:\n",
+    'USER_START': "",
     'ASSISTANT_START': "### Assistant:\n",
     'SYS_END': '\n\n',
     'USER_END': '\n\n',
@@ -113,8 +129,20 @@ model = load_model(model_path, max_input_len)
 if not os.path.exists(save_folder):
     os.makedirs(save_folder)
 
-dataset_tokenized, dataset_content_ranges, metadata = tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, window_size, save_sys_range, save_user_range, save_assistant_range)
+additional_data = {
+    'sorted': sort,
+    'save_sys_range': save_sys_range,
+    'save_user_range': save_user_range,
+    'save_assistant_range': save_assistant_range,
+    'context_len': window_size,
+    'next_token_prob_boost': next_token_prob_boost,
+    'set_max_token_prob': set_max_token_prob
+}
+
+dataset_tokenized, dataset_content_ranges, metadata = tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save_sys_range, save_user_range, save_assistant_range)
+#add additional data to metadata
+metadata = {**additional_data, **metadata}
 save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
-generate_probability_distributions(dataset_tokenized, dataset_content_ranges, device)
+generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost)
 
 print("Done!\nIf the script didn't close yet, that means its still writing to disk!\nDO NOT STOP IT MANUALLY!")
