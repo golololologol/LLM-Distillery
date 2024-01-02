@@ -46,12 +46,13 @@ save_folder = r"F:\trained"
 trained_model_name = r"BallCrusher9000"
 
 training = "full" # "full" "lora" "qlora"
-optimizer = "adamw8it" # "adamw8it" "adamw" "adam" "sgd"
+optimizer = "adamw8bit" # "adamw8bit" "adamw" "adagrad8bit" "sgd" "paged_adamw8bit"
 load_in_8bit = False
 context_length = 2048
 num_epochs = 12
 num_warmup_steps = 120
 lr = 2e-6
+lr_scheduler = "linear"
 
 prompt_format = {
     'SYS_START': "### System:\n",
@@ -71,8 +72,7 @@ if not os.path.exists(trained_model_folder):
 
 distr_metadata = load_metadata(distributions_path)
 
-#print the training parameters
-print(f"Context Len: {context_length}, Num Epochs: {num_epochs}, Num Warmup Steps: {num_warmup_steps}, LR: {lr}, Optimizer: {optimizer}")
+print(f"Context Len: {context_length}, Num Epochs: {num_epochs}, Num Warmup Steps: {num_warmup_steps}, LR: {lr} {lr_scheduler}, Optimizer: {optimizer}, Prob Boost: {distr_metadata['next_token_prob_boost']}, Set Prob to Max: {distr_metadata['set_max_token_prob']}")
 
 if distr_metadata is not None:
     dataset_tokenized, dataset_content_ranges, student_metadata = tokenize_dataset(
@@ -86,14 +86,16 @@ if distr_metadata is not None:
 
     parameters = {
         "model_path": model_path,
-        "save_folder": save_folder,
+        "save_folder": trained_model_folder,
         "dataset_tokenized": dataset_tokenized,
         "dataset_content_ranges": dataset_content_ranges,
         "distributions_path": distributions_path,
         "context_length": context_length,
+        "optimizer_name": optimizer,
         "num_epochs": num_epochs,
         "num_warmup_steps": num_warmup_steps,
         "lr": lr,
+        "lr_scheduler_name": lr_scheduler,
         "device": device,
         "load_in_8bit": load_in_8bit
     }
