@@ -1,11 +1,12 @@
-import json
 import os
 import threading
 import pickle
 import torch
 from tqdm import tqdm
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
-from utils.dataset_utils import save_dataset_and_metadata, tokenize_dataset, read_jsonl_lazy, load_metadata, generate_metadata
+import llama_cpp
+import ctypes
+from utils.dataset_utils import save_dataset_and_metadata, tokenize_dataset, generate_metadata, save_metadata
 
 def load_model(model_path: str, max_input_len: int):
     print("Loading model...")
@@ -89,7 +90,6 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
 model_path = r"F:\tulu-2-dpo-70b-4.0bpw-h6-exl2"
 dataset_path = r"F:\down\full_data_better.jsonl"
 distributions_save_folder = r"F:\distilled"
-tokenizer = "exl" # "exl" "transformers"
 max_input_len = 3*1024
 window_size = 3*1024
 max_cache_gb = 10  # Desired size of the saved files in GB
@@ -97,6 +97,9 @@ max_cache_gb = 10  # Desired size of the saved files in GB
 set_max_token_prob = False # Set the probability of the next token to the max logit in the distribution
 next_token_prob_boost = 1.2  # Boost the probability of the next token by this factor
 sort = True # Sort by length, stops Vram spikes for some reason. Top - longest, Bottom - shortest
+
+backend = "lcpp" # "lcpp" "exl"
+only_get_metadata = False
 
 save_sys_range = False
 save_user_range = False
@@ -133,9 +136,14 @@ config_data = {
     'set_max_token_prob': set_max_token_prob
 }
 
-dataset_tokenized, dataset_content_ranges, metadata = tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, tokenizer, save_sys_range, save_user_range, save_assistant_range)
-metadata = {**config_data, **metadata}
-save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
-generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost)
-
+if not only_get_metadata:
+    dataset_tokenized, dataset_content_ranges = tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save_sys_range, save_user_range, save_assistant_range)
+    metadata = generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)
+    metadata = {**config_data, **metadata}
+    save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
+    generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost)
+else:
+    metadata = generate_metadata(model_path, [], [])
+    metadata = {**config_data, **metadata}
+    save_metadata(metadata, save_folder)
 print("Done!\nIf the script didn't close yet, that means its still writing to disk!\nDO NOT STOP IT MANUALLY!")

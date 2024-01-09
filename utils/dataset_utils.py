@@ -3,38 +3,25 @@ import json
 import torch
 import json
 from transformers import AutoTokenizer
-from exllamav2 import ExLlamaV2Config, ExLlamaV2Tokenizer
+
 
 def read_jsonl_lazy(file_path): # Generator to lazy read the dataset line-by-line
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 yield json.loads(line)
 
+
 def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, tokenizer_type, save_sys_range=False, save_user_range=False, save_assistant_range=False):
 
     print("Tokenizing the dataset...")
     total_tokens = 0
 
-    if tokenizer_type == "transformers":
-        tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
-    elif tokenizer_type == "exl":
-        config = ExLlamaV2Config()
-        config.model_dir = model_path
-        config.prepare()
-        tokenizer = ExLlamaV2Tokenizer(config)
-    else:
-        raise ValueError(f"Invalid tokenizer name: {tokenizer_type}\nAvailable tokenizers: transformers, exl")   
+    tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
         
     def good_encode(text: str, encode_special = True, replace_tokens = True) -> torch.Tensor:
-            if replace_tokens:
-                text = text.replace('<bos>', tokenizer.bos_token).replace('<eos>', tokenizer.eos_token)
-
-            if tokenizer_type == "transformers":
-                return tokenizer.encode("\n" + text, add_special_tokens=False, return_tensors="pt").squeeze(0)[2:] # type: ignore
-            elif tokenizer_type == "exl":
-                return tokenizer.encode("\n" + text, encode_special_tokens=encode_special).squeeze(0)[2:] # type: ignore
-            else:
-                raise ValueError(f"Invalid tokenizer")
+        if replace_tokens:
+            text = text.replace('<bos>', tokenizer.bos_token).replace('<eos>', tokenizer.eos_token)
+        return tokenizer.encode("\n" + text, add_special_tokens=False, return_tensors="pt").squeeze(0)[2:] # type: ignore
             
     dataset_tokenized = []
     dataset_content_ranges = []
@@ -100,19 +87,23 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, toke
 
     print(f"Total processed tokens: {total_tokens}")
     print(f"Total content tokens saved: {sum([range[1] - range[0] for ranges in dataset_content_ranges for range in ranges])}")
-
-    metadata = generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)
     
-    return dataset_tokenized, dataset_content_ranges, metadata
+    return dataset_tokenized, dataset_content_ranges
+
 
 def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_ranges: list) -> dict:
     tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
 
-    first_content_decoded = []
-    for content_range in dataset_content_ranges[0]:
-        content_start, content_end = content_range
-        content_decoded = tokenizer.decode(dataset_tokenized[0][content_start:content_end])
-        first_content_decoded.append(content_decoded)
+    if not (dataset_tokenized and dataset_content_ranges):
+        first_convo_decoded = ""
+        first_content_decoded = []
+    else:
+        first_convo_decoded = tokenizer.decode(dataset_tokenized[0])
+        first_content_decoded = []
+        for content_range in dataset_content_ranges[0]:
+            content_start, content_end = content_range
+            content_decoded = tokenizer.decode(dataset_tokenized[0][content_start:content_end])
+            first_content_decoded.append(content_decoded)
 
     special_tokens = {tokenizer.unk_token, tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token}
     all_added_tokens = tokenizer.get_added_vocab()
@@ -120,9 +111,9 @@ def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_
     added_tokens_ids = [v for k, v in all_added_tokens.items() if k not in special_tokens]
 
     vocab = {k: v for k, v in sorted(tokenizer.get_vocab().items(), key=lambda item: item[1])}
-
+    
     metadata = {
-            "first_convo_decoded": tokenizer.decode(dataset_tokenized[0]),
+            "first_convo_decoded": first_convo_decoded,
             "first_content_decoded": first_content_decoded,
             "bos_id": tokenizer.bos_token_id,
             "eos_id": tokenizer.eos_token_id,
@@ -136,6 +127,7 @@ def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_
     
     return metadata
 
+
 def get_vocab_family(tokenizer) -> str:
         vocab_size_to_family = {
             30000: "GPT2",
@@ -146,34 +138,17 @@ def get_vocab_family(tokenizer) -> str:
             50265: "GPTNeo",
             50257: "GPTJ"
         }
-
         vocab_family = vocab_size_to_family.get(tokenizer.vocab_size, "Unknown")
 
         if isinstance(vocab_family, dict):
             token_29999 = tokenizer.convert_ids_to_tokens(29999)
             vocab_family = vocab_family.get(token_29999, "Unknown")
-
         return vocab_family
 
-def save_dataset_and_metadata(dataset_tokenized: list, dataset_content_ranges: list, metadata, save_folder: str):
-    file = os.path.join(save_folder, "dataset_tokenized.jsonl")
-    metadata_file = os.path.join(save_folder, "dataset_metadata.json")
 
-    with open(file, 'w', encoding='utf-8') as f, open(metadata_file, 'w', encoding='utf-8') as meta_f:
-        for i, convo_tokenized in enumerate(dataset_tokenized):
-            content_tokens = []
-            for content_range in dataset_content_ranges[i]:
-                content_start, content_end = content_range
-                content_tokens.extend(convo_tokenized[content_start:content_end].tolist())
-
-            data_to_save = {
-                "convo_tokenized": convo_tokenized.tolist(),
-                "content_ranges": dataset_content_ranges[i],
-                "content_tokens": content_tokens
-            }
-            f.write(json.dumps(data_to_save, ensure_ascii=False) + '\n')
-
-        json.dump(metadata, meta_f, ensure_ascii=False, indent=4)
+def save_dataset_and_metadata(dataset_tokenized: list, dataset_content_ranges: list, metadata: dict, save_folder: str):
+    save_tokenized_dataset(dataset_tokenized, dataset_content_ranges, save_folder)
+    save_metadata(metadata, save_folder)
 
 
 def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list, save_folder: str):
@@ -194,7 +169,13 @@ def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list
             f.write(json.dumps(data_to_save, ensure_ascii=False) + '\n')
 
 
-def load_metadata(distributions_path):
+def save_metadata(metadata: dict, save_folder: str):
+    metadata_file = os.path.join(save_folder, "dataset_metadata.json")
+    with open(metadata_file, 'w', encoding='utf-8') as meta_f:
+        json.dump(metadata, meta_f, ensure_ascii=False, indent=4)
+
+
+def load_metadata(distributions_path: str):
     metadata_path = os.path.join(distributions_path, "dataset_metadata.json")
     with open(metadata_path, 'r', encoding='utf-8') as file:
         metadata = json.load(file)

@@ -3,6 +3,14 @@ import torch
 import pickle
 import threading
 from utils.finetuning_utils import teacher_tensors_hander
+from utils.dataset_utils import load_metadata
+
+def preprocess_logits(distributions_tensor: torch.Tensor, device: str, metadata: dict):
+    added_tokens_ids = metadata.get("added_tokens_ids", [])
+    if added_tokens_ids:
+        mask = ~torch.isin(torch.arange(distributions_tensor.size(0)), torch.tensor(added_tokens_ids, device=device))
+        distributions_tensor = distributions_tensor[mask]
+    return distributions_tensor
 
 def async_save_merged_logits(merged_logits_list: list, save_folder: str, count: int):
     merged_logits_cpu = [logit.numpy() for logit in merged_logits_list]
@@ -27,7 +35,7 @@ def merge_and_save_logits(all_distributions_folder: str, device: str, output_fol
                      for model_name in os.listdir(all_distributions_folder) 
                      if os.path.isdir(os.path.join(all_distributions_folder, model_name))]
 
-    model_metadatas = []
+    model_metadatas = [load_metadata(model_folder) for model_folder in model_folders]
 
     generators = [teacher_tensors_hander(model_folder, device) for model_folder in model_folders]
 
