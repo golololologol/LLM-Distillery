@@ -1,40 +1,46 @@
+import math
 import torch
-import bitsandbytes as bnb
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from tqdm import tqdm
 from utils.finetuning_utils import calculate_kl_divergence, teacher_tensors_hander, set_optimizer
 
-def full_finetune(parameters):
+def full_finetune(params):
     model = AutoModelForCausalLM.from_pretrained(
-        parameters["model_path"], 
-        device_map="auto", 
-        load_in_8bit=parameters["load_in_8bit"]
+        params["model_path"],
+        device_map="auto",
+        load_in_8bit=params["load_in_8bit"]
     )
     
     model.train()
-    teacher_tensor = teacher_tensors_hander(parameters["distributions_path"], parameters["device"])
+    grad_accum_steps = params["grad_accum_steps"]
+    teacher_tensor = teacher_tensors_hander(params["distributions_path"], params["device"])
     optimizer = set_optimizer(
         model.parameters(), 
-        lr=parameters["lr"], 
-        betas=(0.9, 0.995), 
-        optimizer_name=parameters["optimizer_name"]
+        lr=params["lr"],
+        grad_accum_steps=grad_accum_steps,
+        betas=(0.9, 0.995),
+        optimizer_name=params["optimizer_name"]
     )
 
-    num_training_steps = parameters["num_epochs"] * len(parameters["dataset_tokenized"])
+    dataset_len = len(params["dataset_tokenized"])
+    num_training_steps = params["num_epochs"] * dataset_len
     lr_scheduler = get_scheduler(
-        name=parameters["lr_scheduler_name"].lower(), 
+        name=params["lr_scheduler_name"].lower(),
         optimizer=optimizer, 
-        num_warmup_steps=parameters["num_warmup_steps"], 
-        num_training_steps=num_training_steps
+        num_warmup_steps=params["num_warmup_steps"], 
+        num_training_steps=len(params["dataset_tokenized"])
     )
 
+    print("Num Gradient Updates:", math.ceil(dataset_len / grad_accum_steps))
     recent_losses = []
-    pbar = tqdm(total=num_training_steps, desc="Finetuning", unit="convo", smoothing=0.06)
+    updated = False
+    pbar = tqdm(total=num_training_steps, desc=f"{params['training_type']} Finetuning", unit="convo", smoothing=0.06)
     for step in range(num_training_steps):
-        idx = step % len(parameters["dataset_tokenized"])
-        conversation_tokenized, conversation_content_ranges = parameters["dataset_tokenized"][idx], parameters["dataset_content_ranges"][idx]
-        conversation_tokenized = conversation_tokenized.to(parameters["device"])[:parameters["context_length"]].unsqueeze(0)
-        
+        updated = False
+        idx = step % dataset_len
+        conversation_tokenized, conversation_content_ranges = params["dataset_tokenized"][idx], params["dataset_content_ranges"][idx]
+        conversation_tokenized = conversation_tokenized.to(params["device"])[:params["context_length"]].unsqueeze(0)
+
         full_student_logits = model(conversation_tokenized).logits.squeeze(0)
         student_logits = torch.cat([full_student_logits[start:end] for start, end in conversation_content_ranges], dim=0)
 
@@ -43,19 +49,29 @@ def full_finetune(parameters):
         loss = calculate_kl_divergence(student_logits[:min_len], teacher_logits[:min_len])
 
         loss.backward()
+
+        if (step + 1) % grad_accum_steps == 0:
+            updated = True
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+
+        recent_losses.append(loss.item())
+        if len(recent_losses) > dataset_len:
+            recent_losses.pop(0)
+        avg_loss = sum(recent_losses) / len(recent_losses)
+
+        pbar.set_postfix({"Epoch": f"{(step+1) / dataset_len:.2f}/{params['num_epochs']}", "Avg Loss": avg_loss, "LR": lr_scheduler.get_last_lr()[0]})
+        pbar.update()
+    
+    if not updated:
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
 
-        recent_losses.append(loss.item())
-        if len(recent_losses) > len(parameters["dataset_tokenized"]):
-            recent_losses.pop(0)
-        avg_loss = sum(recent_losses) / len(recent_losses)
-        pbar.set_postfix({"Epoch": f"{(step+1) / len(parameters['dataset_tokenized']):.2f}/{parameters['num_epochs']}", "Avg Loss": avg_loss})
-        pbar.update()
     pbar.close()
 
-    model.save_pretrained(parameters["save_folder"])
-    tokenizer = AutoTokenizer.from_pretrained(parameters["model_path"])
-    tokenizer.save_pretrained(parameters["save_folder"])
-    print(f"Model successfully saved at {parameters['save_folder']}")
+    model.save_pretrained(params["save_folder"])
+    tokenizer = AutoTokenizer.from_pretrained(params["model_path"])
+    tokenizer.save_pretrained(params["save_folder"])
+    print(f"Model successfully saved at {params['save_folder']}")

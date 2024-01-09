@@ -7,25 +7,25 @@ from utils.dataset_utils import save_dataset_and_metadata, load_metadata, tokeni
 def check_errors(dataset_path: str, distributions_path: str, student_metadata: dict, distr_metadata: dict):
     dataset_name = os.path.splitext(os.path.basename(dataset_path))[0]
     distributions_dataset_name = distributions_path.split(os.sep)[-2] if len(distributions_path.split(os.sep)) > 1 else None
-    kill_it = False
+
+    errors = []
     if dataset_name != distributions_dataset_name:
-        print("DIFFERENT DATASET NAMES!")
-        kill_it = True
+        errors.append("DIFFERENT DATASET NAMES!")
     if (student_metadata['vocab_family'] != distr_metadata['vocab_family']) and (student_metadata['vocab_family'] != "Unknown") and (distr_metadata['vocab_family'] != "Unknown"):
-        print("DIFFERENT VOCAB FAMILIES!")
-        kill_it = True
+        errors.append("DIFFERENT VOCAB FAMILIES!")
     if student_metadata['vocab_size'] != distr_metadata['vocab_size']:
-        print("DIFFERENT VOCAB SIZES!")
-        kill_it = True
+        errors.append("DIFFERENT VOCAB SIZES!")
     if student_metadata['vocab_family'] == "Unknown":
-        print("UNKNOWN STUDENT VOCAB FAMILY!")
-        kill_it = True
+        errors.append("UNKNOWN STUDENT VOCAB FAMILY!")
     if distr_metadata['vocab_family'] == "Unknown":
-        print("UNKNOWN TEACHER VOCAB FAMILY!")
-        kill_it = True
-    if kill_it:
+        errors.append("UNKNOWN TEACHER VOCAB FAMILY!")
+
+    if errors:
+        for error in errors:
+            print(error)
         print("----------------------------------------")
         raise Exception("Errors detected! Aborting!")
+
 
 def finetune(parameters: dict):
     if training.lower() == "full":
@@ -39,19 +39,20 @@ def finetune(parameters: dict):
 
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\TinyLlama-1.1B-intermediate-step-1431k-3T"
-dataset_path = r"f:\down\vsakoye\randoBS.jsonl"
+dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filtered.jsonl"
 #validation_dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filteredtest.jsonl"
-distributions_path = r"F:\distilled\randoBS\speechless-llama2-hermes-orca-platypus-wizardlm-13b-exl2"
+distributions_path = r"F:\distilled\janny_Filtered\speechless-llama2-hermes-orca-platypus-wizardlm-13b-exl2"
 save_folder = r"F:\trained"
-trained_model_name = r"BallCrusher9000"
+trained_model_name = "BallCrusher9000"
 
 training = "full" # "full" "lora" "qlora"
 optimizer = "adamw8bit" # "adamw8bit" "adamw" "adagrad8bit" "sgd" "paged_adamw8bit"
 load_in_8bit = False
-context_length = 2048
-num_epochs = 12
+context_length = 2*1024
+grad_accumulation_steps = 4
+num_epochs = 4
 num_warmup_steps = 120
-lr = 2e-6
+lr = 1e-6
 lr_scheduler = "linear"
 
 prompt_format = {
@@ -90,14 +91,16 @@ if distr_metadata is not None:
         "dataset_tokenized": dataset_tokenized,
         "dataset_content_ranges": dataset_content_ranges,
         "distributions_path": distributions_path,
-        "context_length": context_length,
+        "training_type": training,
+        "load_in_8bit": load_in_8bit,
         "optimizer_name": optimizer,
+        "context_length": context_length,
+        "grad_accum_steps": grad_accumulation_steps,
         "num_epochs": num_epochs,
         "num_warmup_steps": num_warmup_steps,
         "lr": lr,
         "lr_scheduler_name": lr_scheduler,
         "device": device,
-        "load_in_8bit": load_in_8bit
     }
 
     finetune(parameters)

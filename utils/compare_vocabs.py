@@ -25,4 +25,4 @@ def compare_vocabs(file1, file2, output_file):
     with open(output_file, 'w', encoding='utf-8') as output:
         json.dump(result, output, indent=4)
     
-compare_vocabs(r"F:\trained\BallCrusher9000\dataset_metadata.json", r"F:\distilled\janny_Filteredtest\neural-chat-7b-v3-1-exl2\dataset_metadata.json", "comparison_result.json")
+#compare_vocabs(r"F:\trained\BallCrusher9000\dataset_metadata.json", r"F:\distilled\janny_Filteredtest\neural-chat-7b-v3-1-exl2\dataset_metadata.json", "comparison_result.json")

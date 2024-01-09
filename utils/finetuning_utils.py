@@ -20,7 +20,7 @@ def teacher_tensors_hander(distributions_path, device):
                 for numpy_tensor in numpy_tensor_list:
                     yield torch.tensor(numpy_tensor, device=device)
     
-def set_optimizer(model_parameters, lr, betas, optimizer_name: str):
+def set_optimizer(model_parameters, lr, grad_accum_steps, betas, optimizer_name: str):
     optimizer_name = optimizer_name.lower()
     
     optimizer_classes = {
@@ -36,6 +36,7 @@ def set_optimizer(model_parameters, lr, betas, optimizer_name: str):
         "sgd": torch.optim.SGD
     }
     
+    lr = lr * (grad_accum_steps^0.5)
     if optimizer_name in optimizer_classes:
         optimizer_class = optimizer_classes[optimizer_name]
         return optimizer_class(model_parameters, lr=lr, betas=betas)

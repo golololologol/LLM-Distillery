@@ -1,0 +1,19 @@
+metadata = {
+    'sorted': sort,
+    'save_sys_range': save_sys_range,
+    'save_user_range': save_user_range,
+    'save_assistant_range': save_assistant_range,
+    'context_len': window_size,
+    'next_token_prob_boost': next_token_prob_boost,
+    'set_max_token_prob': set_max_token_prob
+    "first_convo_decoded": tokenizer.decode(dataset_tokenized[0]),
+    "first_content_decoded": first_content_decoded,
+    "bos_id": good_tokenizer.bos_token_id,
+    "eos_id": good_tokenizer.eos_token_id,
+    "pad_id": good_tokenizer.pad_token_id,
+    "unk_id": good_tokenizer.unk_token_id,
+    "added_tokens_ids": added_tokens_ids,
+    "vocab_size": good_tokenizer.vocab_size,
+    "vocab_family": get_vocab_family(good_tokenizer),
+    "vocab": vocab
+    }

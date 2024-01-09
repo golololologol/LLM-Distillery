@@ -3,24 +3,39 @@ import json
 import torch
 import json
 from transformers import AutoTokenizer
+from exllamav2 import ExLlamaV2Config, ExLlamaV2Tokenizer
 
-def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save_sys_range=False, save_user_range=False, save_assistant_range=False):
-
-    def read_jsonl_lazy(file_path): # Generator to lazy read the dataset line-by-line
+def read_jsonl_lazy(file_path): # Generator to lazy read the dataset line-by-line
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 yield json.loads(line)
 
+def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, tokenizer_type, save_sys_range=False, save_user_range=False, save_assistant_range=False):
+
     print("Tokenizing the dataset...")
     total_tokens = 0
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-
+    if tokenizer_type == "transformers":
+        tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
+    elif tokenizer_type == "exl":
+        config = ExLlamaV2Config()
+        config.model_dir = model_path
+        config.prepare()
+        tokenizer = ExLlamaV2Tokenizer(config)
+    else:
+        raise ValueError(f"Invalid tokenizer name: {tokenizer_type}\nAvailable tokenizers: transformers, exl")   
+        
     def good_encode(text: str, encode_special = True, replace_tokens = True) -> torch.Tensor:
-        if replace_tokens:
-            text = text.replace('<bos>', tokenizer.bos_token).replace('<eos>', tokenizer.eos_token)
-        return tokenizer.encode("\n" + text, add_special_tokens=False, return_tensors="pt").squeeze(0)[2:] # type: ignore
-    
+            if replace_tokens:
+                text = text.replace('<bos>', tokenizer.bos_token).replace('<eos>', tokenizer.eos_token)
+
+            if tokenizer_type == "transformers":
+                return tokenizer.encode("\n" + text, add_special_tokens=False, return_tensors="pt").squeeze(0)[2:] # type: ignore
+            elif tokenizer_type == "exl":
+                return tokenizer.encode("\n" + text, encode_special_tokens=encode_special).squeeze(0)[2:] # type: ignore
+            else:
+                raise ValueError(f"Invalid tokenizer")
+            
     dataset_tokenized = []
     dataset_content_ranges = []
     sys_start_tokenized = good_encode(prompt_format['SYS_START'])
@@ -34,10 +49,13 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save
         conversation_tokenized = torch.Tensor().to(device)
         conversation_content_ranges = []
         start_index = 0
+        
+        tags = item.get("tags", [])
+        reversed = ("reversed" in tags) or item.get("reversed", False)
 
         sys_content = item.get("init", "")
         if sys_content:
-            sys_content_tokenized = good_encode(sys_content.strip(), replace_tokens=False)
+            sys_content_tokenized = good_encode(sys_content.strip(), replace_tokens=False, encode_special=False)
             sys_tokenized = torch.cat((sys_start_tokenized, sys_content_tokenized, sys_end_tokenized))
             conversation_tokenized = sys_tokenized
             if save_sys_range:
@@ -45,11 +63,14 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save
             start_index = sys_tokenized.numel()
 
         for i, turn in enumerate(item["conversations"]):  # Every turn
-            assistant = i % 2
+            if reversed:
+                assistant = (i + 1) % 2
+            else:
+                assistant = i % 2
 
             turn_start_tokenized = assistant_start_tokenized if assistant else user_start_tokenized
             turn_end_tokenized = assistant_end_tokenized if assistant else user_end_tokenized
-            turn_tokenized = good_encode(turn.strip(), replace_tokens=False)
+            turn_tokenized = good_encode(turn.strip(), replace_tokens=False, encode_special=False)
 
             full_turn_tokenized = torch.cat((turn_start_tokenized, turn_tokenized, turn_end_tokenized))
             end_index = start_index + full_turn_tokenized.numel()
@@ -68,6 +89,8 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save
             conversation_tokenized = torch.cat((conversation_tokenized, full_turn_tokenized)) if conversation_tokenized.numel() > 0 else full_turn_tokenized
         total_tokens += conversation_tokenized.numel()
         dataset_tokenized.append(conversation_tokenized.to("cpu"))
+        if reversed:
+            del conversation_content_ranges[0]
         dataset_content_ranges.append(conversation_content_ranges)
 
     if sort:
@@ -78,40 +101,59 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save
     print(f"Total processed tokens: {total_tokens}")
     print(f"Total content tokens saved: {sum([range[1] - range[0] for ranges in dataset_content_ranges for range in ranges])}")
 
-    def get_vocab_family() -> str:
-        vocab_family = "Unknown"
+    metadata = generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)
+    
+    return dataset_tokenized, dataset_content_ranges, metadata
 
-        if tokenizer.vocab_size == 30000:
-            vocab_family = "GPT2"
-        elif tokenizer.vocab_size == 32000:
-            token_29999 = tokenizer.convert_ids_to_tokens(29999)
-            if token_29999 == "监":
-                vocab_family = "Mistral"
-            elif token_29999 == "Z":
-                vocab_family = "LLAMA"
-        elif tokenizer.vocab_size == 50265:
-            vocab_family = "GPTNeo"
-        elif tokenizer.vocab_size == 50257:
-            vocab_family = "GPTJ"
-        return vocab_family
+def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_ranges: list) -> dict:
+    tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
 
-    content_decoded = ""
-    for range in dataset_content_ranges[0]:
-        content_decoded += tokenizer.decode(dataset_tokenized[0][range[0]:range[1]])
+    first_content_decoded = []
+    for content_range in dataset_content_ranges[0]:
+        content_start, content_end = content_range
+        content_decoded = tokenizer.decode(dataset_tokenized[0][content_start:content_end])
+        first_content_decoded.append(content_decoded)
+
+    special_tokens = {tokenizer.unk_token, tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token}
+    all_added_tokens = tokenizer.get_added_vocab()
+
+    added_tokens_ids = [v for k, v in all_added_tokens.items() if k not in special_tokens]
 
     vocab = {k: v for k, v in sorted(tokenizer.get_vocab().items(), key=lambda item: item[1])}
+
     metadata = {
+            "first_convo_decoded": tokenizer.decode(dataset_tokenized[0]),
+            "first_content_decoded": first_content_decoded,
             "bos_id": tokenizer.bos_token_id,
             "eos_id": tokenizer.eos_token_id,
             "pad_id": tokenizer.pad_token_id,
             "unk_id": tokenizer.unk_token_id,
+            "added_tokens_ids": added_tokens_ids,
             "vocab_size": tokenizer.vocab_size,
-            "vocab_family": get_vocab_family(),
+            "vocab_family": get_vocab_family(tokenizer),
             "vocab": vocab
             }
     
-    return dataset_tokenized, dataset_content_ranges, metadata
+    return metadata
 
+def get_vocab_family(tokenizer) -> str:
+        vocab_size_to_family = {
+            30000: "GPT2",
+            32000: {
+                "监": "Mistral",
+                "Z": "LLAMA"
+            },
+            50265: "GPTNeo",
+            50257: "GPTJ"
+        }
+
+        vocab_family = vocab_size_to_family.get(tokenizer.vocab_size, "Unknown")
+
+        if isinstance(vocab_family, dict):
+            token_29999 = tokenizer.convert_ids_to_tokens(29999)
+            vocab_family = vocab_family.get(token_29999, "Unknown")
+
+        return vocab_family
 
 def save_dataset_and_metadata(dataset_tokenized: list, dataset_content_ranges: list, metadata, save_folder: str):
     file = os.path.join(save_folder, "dataset_tokenized.jsonl")
