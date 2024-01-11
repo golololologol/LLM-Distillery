@@ -1,4 +1,5 @@
 import os
+from numpy import save
 import torch
 import pickle
 import threading
@@ -12,6 +13,21 @@ def preprocess_logits(distributions_tensor: torch.Tensor, device: str, metadata:
         distributions_tensor = distributions_tensor[mask]
     return distributions_tensor
 
+def check_errors(model_folders_paths: list):
+    merged_metadata = load_metadata(model_folders_paths[0])
+
+    flags_to_check = ["sorted", "save_sys_range", "save_user_range", "save_assistant_range"]
+
+    for model_folder_path in model_folders_paths:
+        model_metadata = load_metadata(model_folder_path)
+
+        if model_metadata["vocab_family"] != merged_metadata["vocab_family"]:
+            raise ValueError(f"Vocab family mismatch in {model_folder_path}")
+
+        for flag in flags_to_check:
+            if model_metadata[flag] != merged_metadata[flag]:
+                raise ValueError(f"{flag} mismatch in {model_folder_path}\nModel metadata: {model_metadata}\nMerged metadata: {merged_metadata}")
+        
 def async_save_merged_logits(merged_logits_list: list, save_folder: str, count: int):
     merged_logits_cpu = [logit.numpy() for logit in merged_logits_list]
     save_path = os.path.join(save_folder, f"merged_logits_{count}.pkl")
@@ -23,7 +39,7 @@ def async_save_merged_logits(merged_logits_list: list, save_folder: str, count: 
     thread = threading.Thread(target=save_thread)
     thread.start()
 
-def merge_and_save_logits(all_distributions_folder: str, device: str, output_folder: str, max_cache_gb: int):
+def merge_and_save_logits(model_folders: list, device: str, output_folder: str, max_cache_gb: int):
     TOKEN_DISTRIBUTION_SIZE_KB = 62.5
     MAX_CACHE_SIZE_KB = max_cache_gb * 1048576  # 1GB = 1048576KB
     MAX_CACHE_SIZE_TOKENS = MAX_CACHE_SIZE_KB / TOKEN_DISTRIBUTION_SIZE_KB
@@ -31,13 +47,9 @@ def merge_and_save_logits(all_distributions_folder: str, device: str, output_fol
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    model_folders = [os.path.join(all_distributions_folder, model_name) 
-                     for model_name in os.listdir(all_distributions_folder) 
-                     if os.path.isdir(os.path.join(all_distributions_folder, model_name))]
-
     model_metadatas = [load_metadata(model_folder) for model_folder in model_folders]
 
-    generators = [teacher_tensors_hander(model_folder, device) for model_folder in model_folders]
+    generators = [teacher_tensors_hander(model_folder, device, loop=False) for model_folder in model_folders]
 
     merged_logits_list = []
     current_cache_size_tokens = 0
@@ -68,4 +80,13 @@ distiributions_folders_path = r"F:\distilled\randoBS"
 output_folder = r"F:\distilled\merged_logits"
 device = "cuda:0"
 max_cache_gb = 10
-merge_and_save_logits(distiributions_folders_path, device, output_folder, max_cache_gb)
+
+model_folders = [os.path.join(distiributions_folders_path, model_name) 
+                for model_name in os.listdir(distiributions_folders_path) 
+                if os.path.isdir(os.path.join(distiributions_folders_path, model_name))]
+
+if len(model_folders) < 2:
+    raise ValueError("At least 2 models are required to merge")
+
+check_errors(model_folders)
+merge_and_save_logits(model_folders, device, output_folder, max_cache_gb)

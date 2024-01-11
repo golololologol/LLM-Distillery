@@ -10,7 +10,11 @@ def calculate_kl_divergence(student_logits, teacher_logits):
     kl_div = nn.functional.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
     return kl_div
 
-def teacher_tensors_hander(distributions_path, device):
+import os
+import pickle
+import torch
+
+def teacher_tensors_hander(distributions_path, device, loop=True):
     while True:
         files = sorted([f for f in os.listdir(distributions_path) if f.startswith("distributions_") and f.endswith(".pkl")])
         for file in files:
@@ -19,6 +23,9 @@ def teacher_tensors_hander(distributions_path, device):
                 numpy_tensor_list = pickle.load(f)
                 for numpy_tensor in numpy_tensor_list:
                     yield torch.tensor(numpy_tensor, device=device)
+        
+        if not loop:
+            break
     
 def set_optimizer(model_parameters, lr, grad_accum_steps, betas, optimizer_name: str):
     optimizer_name = optimizer_name.lower()

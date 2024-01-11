@@ -1,36 +1,37 @@
 import os
 import json
 import torch
-import json
 from transformers import AutoTokenizer
-
 
 def read_jsonl_lazy(file_path): # Generator to lazy read the dataset line-by-line
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 yield json.loads(line)
 
+def good_encode(text: str, encode_special = True, replace_tokens = True, tokenizer=None, model_path="") -> torch.Tensor:
+    if tokenizer == None:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
+    if replace_tokens:
+        text = text.replace('<bos>', tokenizer.bos_token).replace('<eos>', tokenizer.eos_token)
+    return tokenizer.encode("\n" + text, add_special_tokens=False, return_tensors="pt").squeeze(0)[2:] # type: ignore
 
-def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, tokenizer_type, save_sys_range=False, save_user_range=False, save_assistant_range=False):
+def encode_prompt_format(prompt_format: dict, tokenizer=None, model_path="") -> dict:
+    if tokenizer == None:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
+    for key, value in prompt_format.items():
+        prompt_format[key] = good_encode(value, tokenizer=tokenizer)
+    return prompt_format
 
+def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save_sys_range=False, save_user_range=False, save_assistant_range=False):
     print("Tokenizing the dataset...")
     total_tokens = 0
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
-        
-    def good_encode(text: str, encode_special = True, replace_tokens = True) -> torch.Tensor:
-        if replace_tokens:
-            text = text.replace('<bos>', tokenizer.bos_token).replace('<eos>', tokenizer.eos_token)
-        return tokenizer.encode("\n" + text, add_special_tokens=False, return_tensors="pt").squeeze(0)[2:] # type: ignore
-            
+    
+    pf = encode_prompt_format(prompt_format, tokenizer)
+
     dataset_tokenized = []
     dataset_content_ranges = []
-    sys_start_tokenized = good_encode(prompt_format['SYS_START'])
-    sys_end_tokenized = good_encode(prompt_format['SYS_END'])
-    user_start_tokenized = good_encode(prompt_format['USER_START'])
-    user_end_tokenized = good_encode(prompt_format['USER_END'])
-    assistant_start_tokenized = good_encode(prompt_format['ASSISTANT_START'])
-    assistant_end_tokenized = good_encode(prompt_format['ASSISTANT_END'])
 
     for item in read_jsonl_lazy(dataset_path):  # Every conversation
         conversation_tokenized = torch.Tensor().to(device)
@@ -42,11 +43,11 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, toke
 
         sys_content = item.get("init", "")
         if sys_content:
-            sys_content_tokenized = good_encode(sys_content.strip(), replace_tokens=False, encode_special=False)
-            sys_tokenized = torch.cat((sys_start_tokenized, sys_content_tokenized, sys_end_tokenized))
+            sys_content_tokenized = good_encode(sys_content.strip(), replace_tokens=False, encode_special=False, tokenizer=tokenizer)
+            sys_tokenized = torch.cat((pf['SYS_START'], sys_content_tokenized, pf['SYS_END']))
             conversation_tokenized = sys_tokenized
             if save_sys_range:
-                conversation_content_ranges.append((sys_start_tokenized.numel()-1, sys_tokenized.numel() - sys_end_tokenized.numel()))
+                conversation_content_ranges.append((pf['SYS_START'].numel()-1, sys_tokenized.numel() - pf['SYS_END'].numel()))
             start_index = sys_tokenized.numel()
 
         for i, turn in enumerate(item["conversations"]):  # Every turn
@@ -55,20 +56,20 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, toke
             else:
                 assistant = i % 2
 
-            turn_start_tokenized = assistant_start_tokenized if assistant else user_start_tokenized
-            turn_end_tokenized = assistant_end_tokenized if assistant else user_end_tokenized
-            turn_tokenized = good_encode(turn.strip(), replace_tokens=False, encode_special=False)
+            turn_start_tokenized = pf['ASSISTANT_START'] if assistant else pf['USER_START']
+            turn_end_tokenized = pf['ASSISTANT_END'] if assistant else pf['USER_END']
+            turn_tokenized = good_encode(turn.strip(), replace_tokens=False, encode_special=False, tokenizer=tokenizer)
 
             full_turn_tokenized = torch.cat((turn_start_tokenized, turn_tokenized, turn_end_tokenized))
             end_index = start_index + full_turn_tokenized.numel()
 
             if save_assistant_range and assistant:
-                content_start_index = start_index + assistant_start_tokenized.numel() - 1
-                content_end_index = end_index - assistant_end_tokenized.numel()
+                content_start_index = start_index + pf['ASSISTANT_START'].numel() - 1
+                content_end_index = end_index - pf['ASSISTANT_END'].numel()
                 conversation_content_ranges.append((content_start_index, content_end_index))
             elif save_user_range and not assistant:
-                content_start_index = start_index + user_start_tokenized.numel() - 1
-                content_end_index = end_index - user_end_tokenized.numel()
+                content_start_index = start_index + pf['USER_START'].numel() - 1
+                content_end_index = end_index - pf['USER_END'].numel()
                 conversation_content_ranges.append((content_start_index, content_end_index))
 
             start_index = end_index
@@ -87,9 +88,7 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, toke
 
     print(f"Total processed tokens: {total_tokens}")
     print(f"Total content tokens saved: {sum([range[1] - range[0] for ranges in dataset_content_ranges for range in ranges])}")
-    
     return dataset_tokenized, dataset_content_ranges
-
 
 def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_ranges: list) -> dict:
     tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
@@ -115,6 +114,8 @@ def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_
     metadata = {
             "first_convo_decoded": first_convo_decoded,
             "first_content_decoded": first_content_decoded,
+            "raw_data_len": len(dataset_tokenized),
+            "cropped_data_len": 0,
             "bos_id": tokenizer.bos_token_id,
             "eos_id": tokenizer.eos_token_id,
             "pad_id": tokenizer.pad_token_id,
@@ -127,29 +128,26 @@ def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_
     
     return metadata
 
-
 def get_vocab_family(tokenizer) -> str:
-        vocab_size_to_family = {
-            30000: "GPT2",
-            32000: {
-                "监": "Mistral",
-                "Z": "LLAMA"
-            },
-            50265: "GPTNeo",
-            50257: "GPTJ"
-        }
-        vocab_family = vocab_size_to_family.get(tokenizer.vocab_size, "Unknown")
+    vocab_size_to_family = {
+        30000: "GPT2",
+        32000: {
+            "监": "Mistral",
+            "Z": "LLAMA"
+        },
+        50265: "GPTNeo",
+        50257: "GPTJ"
+    }
+    vocab_family = vocab_size_to_family.get(tokenizer.vocab_size, "Unknown")
 
-        if isinstance(vocab_family, dict):
-            token_29999 = tokenizer.convert_ids_to_tokens(29999)
-            vocab_family = vocab_family.get(token_29999, "Unknown")
-        return vocab_family
-
+    if isinstance(vocab_family, dict):
+        token_29999 = tokenizer.convert_ids_to_tokens(29999)
+        vocab_family = vocab_family.get(token_29999, "Unknown")
+    return vocab_family
 
 def save_dataset_and_metadata(dataset_tokenized: list, dataset_content_ranges: list, metadata: dict, save_folder: str):
     save_tokenized_dataset(dataset_tokenized, dataset_content_ranges, save_folder)
     save_metadata(metadata, save_folder)
-
 
 def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list, save_folder: str):
     file = os.path.join(save_folder, "dataset_tokenized.jsonl")
@@ -168,15 +166,25 @@ def save_tokenized_dataset(dataset_tokenized: list, dataset_content_ranges: list
             }
             f.write(json.dumps(data_to_save, ensure_ascii=False) + '\n')
 
+def save_sorted_dataset(save_folder: str, dataset_path: str):
+    file = os.path.join(save_folder, "dataset_sorted.jsonl")
+    with open(file, 'w', encoding='utf-8') as f:
+        with open(dataset_path, 'r', encoding='utf-8') as df:
+            data = []
+            for line in df:
+                data.append(json.loads(line))
+            data.sort(key=lambda x: sum(len(turn) for turn in x["conversations"]), reverse=True)
+            for item in data:
+                f.write(json.dumps(item, ensure_ascii=False) + '\n')
 
 def save_metadata(metadata: dict, save_folder: str):
     metadata_file = os.path.join(save_folder, "dataset_metadata.json")
     with open(metadata_file, 'w', encoding='utf-8') as meta_f:
         json.dump(metadata, meta_f, ensure_ascii=False, indent=4)
 
-
 def load_metadata(distributions_path: str):
     metadata_path = os.path.join(distributions_path, "dataset_metadata.json")
     with open(metadata_path, 'r', encoding='utf-8') as file:
         metadata = json.load(file)
         return metadata
+    
