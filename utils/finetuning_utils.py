@@ -10,10 +10,6 @@ def calculate_kl_divergence(student_logits, teacher_logits):
     kl_div = nn.functional.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
     return kl_div
 
-import os
-import pickle
-import torch
-
 def teacher_tensors_hander(distributions_path, device, loop=True):
     while True:
         files = sorted([f for f in os.listdir(distributions_path) if f.startswith("distributions_") and f.endswith(".pkl")])

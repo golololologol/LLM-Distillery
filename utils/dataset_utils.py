@@ -32,9 +32,11 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save
 
     dataset_tokenized = []
     dataset_content_ranges = []
+    num_convos = 0
 
     for item in read_jsonl_lazy(dataset_path):  # Every conversation
         conversation_tokenized = torch.Tensor().to(device)
+        num_convos += 1
         conversation_content_ranges = []
         start_index = 0
         
@@ -114,8 +116,7 @@ def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_
     metadata = {
             "first_convo_decoded": first_convo_decoded,
             "first_content_decoded": first_content_decoded,
-            "raw_data_len": len(dataset_tokenized),
-            "cropped_data_len": 0,
+            "skip_convo_ids": [],
             "bos_id": tokenizer.bos_token_id,
             "eos_id": tokenizer.eos_token_id,
             "pad_id": tokenizer.pad_token_id,

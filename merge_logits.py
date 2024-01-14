@@ -1,6 +1,6 @@
 import os
-from numpy import save
 import torch
+import torch.nn as nn
 import pickle
 import threading
 from utils.finetuning_utils import teacher_tensors_hander
@@ -22,7 +22,7 @@ def check_errors(model_folders_paths: list):
         model_metadata = load_metadata(model_folder_path)
 
         if model_metadata["vocab_family"] != merged_metadata["vocab_family"]:
-            raise ValueError(f"Vocab family mismatch in {model_folder_path}")
+            raise ValueError(f"Vocab family mismatch in {model_folder_path}\nModel family: {model_metadata['vocab_family']}\nMerged family: {merged_metadata['vocab_family']}")
 
         for flag in flags_to_check:
             if model_metadata[flag] != merged_metadata[flag]:
@@ -47,8 +47,6 @@ def merge_and_save_logits(model_folders: list, device: str, output_folder: str, 
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
-    model_metadatas = [load_metadata(model_folder) for model_folder in model_folders]
-
     generators = [teacher_tensors_hander(model_folder, device, loop=False) for model_folder in model_folders]
 
     merged_logits_list = []
@@ -57,10 +55,27 @@ def merge_and_save_logits(model_folders: list, device: str, output_folder: str, 
 
     try:
         while True:
-            logits_list = [next(gen) for gen in generators]
-            merged_logits = torch.stack(logits_list).mean(dim=0)
-            merged_logits_list.append(merged_logits)
+            logits_list = [nn.functional.log_softmax(next(gen)) for gen in generators]
+            logits_list = [tensor for tensor in logits_list if tensor.shape[0] > 0]
+            logits_list.sort(key=lambda x: x.shape[0], reverse=True)
 
+            merged_logits = logits_list[0]
+
+            for tensor in logits_list[1:]:
+                # Determine the number of distributions to merge
+                merge_length = min(merged_logits.shape[0], tensor.shape[0])
+
+                # Slice and merge
+                merged_part = torch.stack([merged_logits[:merge_length], tensor[:merge_length]]).mean(dim=0)
+
+                # Append the unmerged part (if any)
+                if merged_logits.shape[0] > merge_length:
+                    unmerged_part = merged_logits[merge_length:]
+                    merged_logits = torch.cat([merged_part, unmerged_part], dim=0)
+                else:
+                    merged_logits = merged_part
+
+            merged_logits_list.append(merged_logits)
             current_cache_size_tokens += merged_logits.size(0)
             if current_cache_size_tokens >= MAX_CACHE_SIZE_TOKENS:
                 count += 1

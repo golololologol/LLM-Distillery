@@ -46,11 +46,11 @@ def run_test_inference(model: ExLlamaV2, prompt_format, model_path, device, text
 
     formatted_text = torch.cat((prompt_format_encoded['USER_START'], text_tokenized)).to(device)
 
-    token_logits = model.forward(formatted_text.unsqueeze(0)).squeeze(0) # type: ignore
+    per_token_logits = model.forward(formatted_text.unsqueeze(0)).squeeze(0) # type: ignore
 
     context_token_ids = formatted_text.tolist()
     context_tokens = tokenizer.convert_ids_to_tokens(context_token_ids)
-    next_tokens_ids = torch.argmax(token_logits, dim=1).tolist()
+    next_tokens_ids = torch.argmax(per_token_logits, dim=1).tolist()
     next_tokens = tokenizer.convert_ids_to_tokens(next_tokens_ids)
 
     print(f"Input:\n{context_tokens}\nPredicted Next Tokens:\n{next_tokens}")
@@ -86,7 +86,7 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
     count = 0
     total_saved_tokens = 0
 
-    for conversation_tokenized, conversation_content_ranges in tqdm(zip(dataset_tokenized, dataset_content_ranges), desc="Generating Distributions", unit="convo", total=len(dataset_tokenized)):
+    for conv_id, (conversation_tokenized, conversation_content_ranges) in enumerate(tqdm(zip(dataset_tokenized, dataset_content_ranges), desc="Generating Distributions", unit="convo", total=len(dataset_tokenized))):
         content_distributions = process_conversation(conversation_tokenized, conversation_content_ranges)
         conversation_content_distributions = torch.cat(content_distributions, dim=0)
         dataset_distributions.append(conversation_content_distributions)
@@ -104,6 +104,7 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
     if dataset_distributions:
         count += 1
         async_save_partial_distributions(dataset_distributions, count)
+    return metadata
 
 
 # Main Script
@@ -169,7 +170,7 @@ else:
         exit(0)
     dataset_tokenized, dataset_content_ranges = tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save_sys_range, save_user_range, save_assistant_range)
     metadata = {**config_data, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)}
-    save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
     if sort: save_sorted_dataset(save_folder, dataset_path)
-    generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost, context_len, metadata)
+    metadata = generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost, context_len, metadata)
+    save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
     print("Done!\nIf the script didn't close yet, that means its still writing to disk!\nDO NOT STOP IT MANUALLY!")
