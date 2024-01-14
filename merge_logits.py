@@ -4,14 +4,19 @@ import torch.nn as nn
 import pickle
 import threading
 from utils.finetuning_utils import teacher_tensors_hander
-from utils.dataset_utils import load_metadata
+from utils.dataset_utils import load_metadata, save_metadata
 
-def preprocess_logits(distributions_tensor: torch.Tensor, device: str, metadata: dict):
+def preprocess_logits(distributions_tensor: torch.Tensor, mask: torch.Tensor):
+    if mask is not None:
+        distributions_tensor = distributions_tensor[:, mask]
+    return distributions_tensor
+
+def create_mask(metadata: dict):
     added_tokens_ids = metadata.get("added_tokens_ids", [])
     if added_tokens_ids:
-        mask = ~torch.isin(torch.arange(distributions_tensor.size(0)), torch.tensor(added_tokens_ids, device=device))
-        distributions_tensor = distributions_tensor[mask]
-    return distributions_tensor
+        mask = ~torch.isin(torch.arange(metadata['vocab_size']), torch.tensor(added_tokens_ids))
+        return mask
+    return None
 
 def check_errors(model_folders_paths: list):
     merged_metadata = load_metadata(model_folders_paths[0])
@@ -49,34 +54,55 @@ def merge_and_save_logits(model_folders: list, device: str, output_folder: str, 
 
     generators = [teacher_tensors_hander(model_folder, device, loop=False) for model_folder in model_folders]
 
+    model_metadatas = [load_metadata(model_folder) for model_folder in model_folders]
+
+    masks = [create_mask(metadata) for metadata in model_metadatas]
+
+    merged_metadata = model_metadatas[0]
+    merged_metadata["vocab_size"] = merged_metadata["vocab_size"] - len(merged_metadata["added_tokens_ids"])
+    merged_metadata["merged"] = True
+    merged_metadata["context_len"] = max([metadata["context_len"] for metadata in model_metadatas])
+    merged_metadata["merged_models"] = [metadata["model_name"] for metadata in model_metadatas]
+    save_metadata(merged_metadata, output_folder)
+
     merged_logits_list = []
+    empty_convo_ids = []
     current_cache_size_tokens = 0
     count = 0
+    convo_id = 0
 
     try:
         while True:
+            
             logits_list = [nn.functional.log_softmax(next(gen)) for gen in generators]
             logits_list = [tensor for tensor in logits_list if tensor.shape[0] > 0]
-            logits_list.sort(key=lambda x: x.shape[0], reverse=True)
+            empty = True if not logits_list else False
 
-            merged_logits = logits_list[0]
+            if not empty:
+                combined_list = list(zip(logits_list, masks))
+                combined_list.sort(key=lambda x: x[0].shape[0], reverse=True)
+                logits_list, masks = map(list, zip(*combined_list))
+                merged_logits = preprocess_logits(logits_list[0], masks[0])
 
-            for tensor in logits_list[1:]:
-                # Determine the number of distributions to merge
-                merge_length = min(merged_logits.shape[0], tensor.shape[0])
+                for i, tensor in enumerate(logits_list[1:], start=1):
+                    tensor = preprocess_logits(tensor, masks[i])
+                    merge_length = min(merged_logits.shape[0], tensor.shape[0])
 
-                # Slice and merge
-                merged_part = torch.stack([merged_logits[:merge_length], tensor[:merge_length]]).mean(dim=0)
+                    merged_part = torch.stack([merged_logits[:merge_length], tensor[:merge_length]]).mean(dim=0)
 
-                # Append the unmerged part (if any)
-                if merged_logits.shape[0] > merge_length:
-                    unmerged_part = merged_logits[merge_length:]
-                    merged_logits = torch.cat([merged_part, unmerged_part], dim=0)
-                else:
-                    merged_logits = merged_part
-
+                    if merged_logits.shape[0] > merge_length:
+                        unmerged_part = merged_logits[merge_length:]
+                        merged_logits = torch.cat([merged_part, unmerged_part], dim=0)
+                    else:
+                        merged_logits = merged_part
+            else:
+                merged_logits = torch.tensor([], device=device)
+                empty_convo_ids.append(convo_id)
+                
+            convo_id += 1
             merged_logits_list.append(merged_logits)
             current_cache_size_tokens += merged_logits.size(0)
+
             if current_cache_size_tokens >= MAX_CACHE_SIZE_TOKENS:
                 count += 1
                 async_save_merged_logits(merged_logits_list, output_folder, count)
@@ -90,18 +116,18 @@ def merge_and_save_logits(model_folders: list, device: str, output_folder: str, 
 
     print(f"Merged logits saved in {output_folder}")
 
-
-distiributions_folders_path = r"F:\distilled\randoBS"
-output_folder = r"F:\distilled\merged_logits"
+distributions_folders_path = r"F:\distilled\randoBS"
 device = "cuda:0"
 max_cache_gb = 10
 
-model_folders = [os.path.join(distiributions_folders_path, model_name) 
-                for model_name in os.listdir(distiributions_folders_path) 
-                if os.path.isdir(os.path.join(distiributions_folders_path, model_name))]
+model_folders = [os.path.join(distributions_folders_path, model_name) 
+                for model_name in os.listdir(distributions_folders_path) 
+                if os.path.isdir(os.path.join(distributions_folders_path, model_name))]
 
 if len(model_folders) < 2:
     raise ValueError("At least 2 models are required to merge")
+
+output_folder = os.path.join(distributions_folders_path, "merged")
 
 check_errors(model_folders)
 merge_and_save_logits(model_folders, device, output_folder, max_cache_gb)
