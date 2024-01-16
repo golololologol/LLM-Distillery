@@ -8,6 +8,7 @@ from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from utils.dataset_utils import save_dataset_and_metadata, \
     tokenize_dataset, generate_metadata, save_metadata, \
     good_encode, encode_prompt_format, save_sorted_dataset
+from utils.finetuning_utils import create_mask, preprocess_logits
 
 def load_model(model_path: str, context_len: int, chunk_size: int, chunk_size_tokens: int):
     print("Loading model...")
@@ -56,10 +57,12 @@ def run_test_inference(model: ExLlamaV2, prompt_format, model_path, device, text
     print(f"Input:\n{context_tokens}\nPredicted Next Tokens:\n{next_tokens}")
 
 
-def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost, context_len, metadata):
+def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost, context_len, metadata, empty_convo_ids):
     TOKEN_DISTRIBUTION_SIZE_KB = 0.001953125 * metadata['vocab_size']
     MAX_CACHE_SIZE_KB = max_cache_gb * 1048576  # 1GB = 1048576KB
     MAX_CACHE_SIZE_TOKENS = MAX_CACHE_SIZE_KB / TOKEN_DISTRIBUTION_SIZE_KB
+
+    mask = create_mask(metadata)
 
     def modify_distributions(model_output, conversation_tokenized) -> torch.Tensor:
         modified_output = model_output.clone()
@@ -87,12 +90,20 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
     total_saved_tokens = 0
 
     for conv_id, (conversation_tokenized, conversation_content_ranges) in enumerate(tqdm(zip(dataset_tokenized, dataset_content_ranges), desc="Generating Distributions", unit="convo", total=len(dataset_tokenized))):
+        if conv_id in empty_convo_ids:
+            dataset_distributions.append(torch.tensor([], device=device))
+            continue
+        
         content_distributions = process_conversation(conversation_tokenized, conversation_content_ranges)
-        conversation_content_distributions = torch.cat(content_distributions, dim=0)
+        conversation_content_distributions = preprocess_logits(torch.cat(content_distributions, dim=0), mask)
+
         dataset_distributions.append(conversation_content_distributions)
 
         total_saved_tokens += conversation_content_distributions.size(0)
         current_cache_size_tokens += conversation_content_distributions.size(0)
+
+        if conversation_content_distributions.size(0) == 0:
+            print(f"Empty convo id: {conv_id}")
 
         if current_cache_size_tokens >= MAX_CACHE_SIZE_TOKENS:
             count += 1
@@ -104,16 +115,15 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
     if dataset_distributions:
         count += 1
         async_save_partial_distributions(dataset_distributions, count)
-    return metadata
 
 
 # Main Script
-model_path = r"F:\tulu-2-dpo-70b-4.0bpw-h6-exl2"
-dataset_path = r"F:\distilled\full_data_better\tulu-2-dpo-70b-4.0bpw-h6-exl2\dataset_sorted.jsonl"
+model_path = r"F:\down\Mixtral-8x7B-exl2"
+dataset_path = r"F:\down\data-MNHTN-standardized-OpenPlatypus-Train.jsonl"
 distributions_save_folder = r"F:\distilled"
-context_len = 2*1024
+context_len = 8*1024
 #batch_size = 4 # How many conversations to process in parallel #TODO
-chunk_size = 4 # How many `chunk_size_tokens` chunks to process in parallel
+chunk_size = 8 # How many `chunk_size_tokens` chunks to process in parallel
 chunk_size_tokens = 1*1024
 max_cache_gb = 10  # Desired size of the saved files in GB
 
@@ -168,9 +178,13 @@ else:
     if test_inference:
         run_test_inference(model, prompt_format, model_path, device, text="Hey there, my name is")
         exit(0)
-    dataset_tokenized, dataset_content_ranges = tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save_sys_range, save_user_range, save_assistant_range)
-    metadata = {**config_data, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)}
     if sort: save_sorted_dataset(save_folder, dataset_path)
-    metadata = generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost, context_len, metadata)
+
+    dataset_tokenized, dataset_content_ranges, empty_convo_ids = tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save_sys_range, save_user_range, save_assistant_range)
+    metadata = {**config_data, "empty_convo_ids": empty_convo_ids, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)}
     save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
+
+    
+
+    generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost, context_len, metadata, empty_convo_ids)
     print("Done!\nIf the script didn't close yet, that means its still writing to disk!\nDO NOT STOP IT MANUALLY!")

@@ -10,7 +10,8 @@ def calculate_kl_divergence(student_logits, teacher_logits):
     kl_div = nn.functional.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
     return kl_div
 
-def teacher_tensors_hander(distributions_path, device, loop=True):
+def teacher_tensors_hander(distributions_path, device, loop=True, empty_convo_ids=[]):
+    convo_id = 0
     while True:
         files = sorted([f for f in os.listdir(distributions_path) if f.startswith("distributions_") and f.endswith(".pkl")])
         for file in files:
@@ -18,11 +19,25 @@ def teacher_tensors_hander(distributions_path, device, loop=True):
             with open(file_path, 'rb') as f:
                 numpy_tensor_list = pickle.load(f)
                 for numpy_tensor in numpy_tensor_list:
-                    yield torch.tensor(numpy_tensor, device=device)
+                    if convo_id not in empty_convo_ids:
+                        yield torch.tensor(numpy_tensor, device=device)
+                    convo_id += 1
         
         if not loop:
             break
-    
+
+def preprocess_logits(distributions_tensor: torch.Tensor, mask):
+    if mask is not None:
+        distributions_tensor = distributions_tensor[:, mask]
+    return distributions_tensor
+
+def create_mask(metadata: dict):
+    added_tokens_ids = metadata.get("added_tokens_ids", [])
+    if added_tokens_ids:
+        mask = ~torch.isin(torch.arange(metadata['vocab_size']), torch.tensor(added_tokens_ids))
+        return mask
+    return None
+
 def set_optimizer(model_parameters, lr, grad_accum_steps, betas, optimizer_name: str):
     optimizer_name = optimizer_name.lower()
     

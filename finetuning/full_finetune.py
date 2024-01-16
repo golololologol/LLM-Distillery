@@ -2,7 +2,7 @@ import math
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from tqdm import tqdm
-from utils.finetuning_utils import calculate_kl_divergence, teacher_tensors_hander, set_optimizer
+from utils.finetuning_utils import calculate_kl_divergence, teacher_tensors_hander, set_optimizer, create_mask, preprocess_logits
 
 def full_finetune(params):
     model = AutoModelForCausalLM.from_pretrained(
@@ -35,6 +35,8 @@ def full_finetune(params):
     recent_losses = []
     updated = False
     pbar = tqdm(total=num_training_steps, desc=f"{params['training_type']} Finetuning", unit="convo", smoothing=0.06)
+    student_mask = create_mask(params["student_metadata"])
+    
     for step in range(num_training_steps):
         updated = False
         idx = step % dataset_len
@@ -43,6 +45,7 @@ def full_finetune(params):
 
         full_student_logits = model(conversation_tokenized).logits.squeeze(0)
         student_logits = torch.cat([full_student_logits[start:end] for start, end in conversation_content_ranges], dim=0)
+        student_logits = preprocess_logits(student_logits, student_mask)
 
         teacher_logits = next(teacher_tensor)
         min_len = min(student_logits.size(0), teacher_logits.size(0))

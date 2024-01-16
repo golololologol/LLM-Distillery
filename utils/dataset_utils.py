@@ -22,9 +22,10 @@ def encode_prompt_format(prompt_format: dict, tokenizer=None, model_path="") -> 
         prompt_format[key] = good_encode(value, tokenizer=tokenizer)
     return prompt_format
 
-def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save_sys_range=False, save_user_range=False, save_assistant_range=False):
+def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, context_len, save_sys_range=False, save_user_range=False, save_assistant_range=False):
     print("Tokenizing the dataset...")
     total_tokens = 0
+    empty_convo_ids = []
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
     
@@ -34,7 +35,7 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save
     dataset_content_ranges = []
     num_convos = 0
 
-    for item in read_jsonl_lazy(dataset_path):  # Every conversation
+    for convo_id, item in enumerate(read_jsonl_lazy(dataset_path)):  # Every conversation
         conversation_tokenized = torch.Tensor().to(device)
         num_convos += 1
         conversation_content_ranges = []
@@ -77,6 +78,10 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save
             start_index = end_index
 
             conversation_tokenized = torch.cat((conversation_tokenized, full_turn_tokenized)) if conversation_tokenized.numel() > 0 else full_turn_tokenized
+
+        if conversation_content_ranges[0][0] > context_len:
+            empty_convo_ids.append(convo_id)
+
         total_tokens += conversation_tokenized.numel()
         dataset_tokenized.append(conversation_tokenized.to("cpu"))
         if reversed:
@@ -90,7 +95,7 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save
 
     print(f"Total processed tokens: {total_tokens}")
     print(f"Total content tokens saved: {sum([range[1] - range[0] for ranges in dataset_content_ranges for range in ranges])}")
-    return dataset_tokenized, dataset_content_ranges
+    return dataset_tokenized, dataset_content_ranges, empty_convo_ids
 
 def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_ranges: list) -> dict:
     tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
@@ -181,12 +186,16 @@ def save_sorted_dataset(save_folder: str, dataset_path: str):
             for item in data:
                 f.write(json.dumps(item, ensure_ascii=False) + '\n')
 
+def filter_empty_conversations(dataset_tokenized, dataset_content_ranges, empty_convo_ids):
+    return ([item for i, item in enumerate(dataset_tokenized) if i not in empty_convo_ids],
+            [item for i, item in enumerate(dataset_content_ranges) if i not in empty_convo_ids])
+
 def save_metadata(metadata: dict, save_folder: str):
     metadata_file = os.path.join(save_folder, "dataset_metadata.json")
     with open(metadata_file, 'w', encoding='utf-8') as meta_f:
         json.dump(metadata, meta_f, ensure_ascii=False, indent=4)
 
-def load_metadata(distributions_path: str):
+def load_metadata(distributions_path: str) -> dict:
     metadata_path = os.path.join(distributions_path, "dataset_metadata.json")
     with open(metadata_path, 'r', encoding='utf-8') as file:
         metadata = json.load(file)

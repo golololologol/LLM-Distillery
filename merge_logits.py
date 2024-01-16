@@ -3,20 +3,8 @@ import torch
 import torch.nn as nn
 import pickle
 import threading
-from utils.finetuning_utils import teacher_tensors_hander
+from utils.finetuning_utils import teacher_tensors_hander, preprocess_logits, create_mask
 from utils.dataset_utils import load_metadata, save_metadata
-
-def preprocess_logits(distributions_tensor: torch.Tensor, mask: torch.Tensor):
-    if mask is not None:
-        distributions_tensor = distributions_tensor[:, mask]
-    return distributions_tensor
-
-def create_mask(metadata: dict):
-    added_tokens_ids = metadata.get("added_tokens_ids", [])
-    if added_tokens_ids:
-        mask = ~torch.isin(torch.arange(metadata['vocab_size']), torch.tensor(added_tokens_ids))
-        return mask
-    return None
 
 def check_errors(model_folders_paths: list):
     merged_metadata = load_metadata(model_folders_paths[0])
@@ -63,17 +51,14 @@ def merge_and_save_logits(model_folders: list, device: str, output_folder: str, 
     merged_metadata["merged"] = True
     merged_metadata["context_len"] = max([metadata["context_len"] for metadata in model_metadatas])
     merged_metadata["merged_models"] = [metadata["model_name"] for metadata in model_metadatas]
-    save_metadata(merged_metadata, output_folder)
 
     merged_logits_list = []
-    empty_convo_ids = []
     current_cache_size_tokens = 0
     count = 0
     convo_id = 0
 
     try:
         while True:
-            
             logits_list = [nn.functional.log_softmax(next(gen)) for gen in generators]
             logits_list = [tensor for tensor in logits_list if tensor.shape[0] > 0]
             empty = True if not logits_list else False
@@ -97,8 +82,8 @@ def merge_and_save_logits(model_folders: list, device: str, output_folder: str, 
                         merged_logits = merged_part
             else:
                 merged_logits = torch.tensor([], device=device)
-                empty_convo_ids.append(convo_id)
-                
+                merged_metadata["empty_convo_ids"].append(convo_id)
+
             convo_id += 1
             merged_logits_list.append(merged_logits)
             current_cache_size_tokens += merged_logits.size(0)
@@ -110,15 +95,19 @@ def merge_and_save_logits(model_folders: list, device: str, output_folder: str, 
                 current_cache_size_tokens = 0
 
     except StopIteration:
+        save_metadata(merged_metadata, output_folder)
         if merged_logits_list:
             count += 1
             async_save_merged_logits(merged_logits_list, output_folder, count)
 
     print(f"Merged logits saved in {output_folder}")
 
+
+# Parameters
 distributions_folders_path = r"F:\distilled\randoBS"
 device = "cuda:0"
 max_cache_gb = 10
+
 
 model_folders = [os.path.join(distributions_folders_path, model_name) 
                 for model_name in os.listdir(distributions_folders_path) 
