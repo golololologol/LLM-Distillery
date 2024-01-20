@@ -121,7 +121,7 @@ def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_
     metadata = {
             "first_convo_decoded": first_convo_decoded,
             "first_content_decoded": first_content_decoded,
-            "skip_convo_ids": [],
+            "empty_convo_ids": [],
             "merged": False,
             "merged_models": [],
             "model_name": model_path.split("/")[-1],
@@ -148,7 +148,13 @@ def get_vocab_family(tokenizer) -> str:
         50257: "GPTJ"
     }
     vocab_family = vocab_size_to_family.get(tokenizer.vocab_size, "Unknown")
-
+    if vocab_family == "Unknown":
+        token_29999 = tokenizer.convert_ids_to_tokens(29999)
+        if token_29999 == "监":
+            vocab_family = "Mistral"
+        elif token_29999 == "Z":
+            vocab_family = "LLAMA"
+            
     if isinstance(vocab_family, dict):
         token_29999 = tokenizer.convert_ids_to_tokens(29999)
         vocab_family = vocab_family.get(token_29999, "Unknown")

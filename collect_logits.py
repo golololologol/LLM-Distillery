@@ -2,6 +2,7 @@ import os
 import threading
 import pickle
 import torch
+import torch.nn.functional as F
 from transformers import AutoTokenizer
 from tqdm import tqdm
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
@@ -64,23 +65,27 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
 
     mask = create_mask(metadata)
 
-    def modify_distributions(model_output, conversation_tokenized) -> torch.Tensor:
-        modified_output = model_output.clone()
+    def modify_distributions(model_output: torch.Tensor, conversation_tokenized: torch.Tensor) -> torch.Tensor:
+        modified_output = F.softmax(model_output, dim=1)
         for i in range(conversation_tokenized.size(0) - 1):
             next_token = conversation_tokenized[i + 1]
             current_distribution = modified_output[i]
-            if set_max_token_prob:
-                max_logit = torch.max(current_distribution)
-                current_distribution[next_token] = max_logit * next_token_prob_boost
+            max_prob = torch.max(current_distribution)
+            if next_token == eos_token_id:
+                current_distribution[eos_token_id] = max_prob * next_token_prob_boost
             else:
-                current_distribution[next_token] *= next_token_prob_boost
+                if set_max_token_prob:
+                    current_distribution[next_token] = max_prob * next_token_prob_boost
+                elif next_token_prob_boost != 1.0:
+                    current_distribution[next_token] *= next_token_prob_boost
+            current_distribution /= current_distribution.sum()
         return modified_output
+
 
     def process_conversation(conversation_tokenized: torch.Tensor, conversation_content_ranges: list):
         conv_tokenized_gpu = conversation_tokenized.to(device)[:context_len]
-        conv_distributions = model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0)
-        if not next_token_prob_boost <= 1:
-            conv_distributions = modify_distributions(conv_distributions, conv_tokenized_gpu)
+        conv_distributions = preprocess_logits(model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0), mask)
+        conv_distributions = modify_distributions(conv_distributions, conv_tokenized_gpu)
         conv_distributions_cpu = conv_distributions.to("cpu")
         return [conv_distributions_cpu[start:end] for start, end in conversation_content_ranges]
 
@@ -88,14 +93,15 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
     current_cache_size_tokens = 0
     count = 0
     total_saved_tokens = 0
+    eos_token_id = metadata['eos_id']
 
     for conv_id, (conversation_tokenized, conversation_content_ranges) in enumerate(tqdm(zip(dataset_tokenized, dataset_content_ranges), desc="Generating Distributions", unit="convo", total=len(dataset_tokenized))):
         if conv_id in empty_convo_ids:
             dataset_distributions.append(torch.tensor([], device=device))
             continue
-        
+
         content_distributions = process_conversation(conversation_tokenized, conversation_content_ranges)
-        conversation_content_distributions = preprocess_logits(torch.cat(content_distributions, dim=0), mask)
+        conversation_content_distributions = torch.cat(content_distributions, dim=0)
 
         dataset_distributions.append(conversation_content_distributions)
 
@@ -118,7 +124,7 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
 
 
 # Main Script
-model_path = r"F:\down\Mixtral-8x7B-exl2"
+model_path = r"F:\UtopiaXL-13B"
 dataset_path = r"F:\down\data-MNHTN-standardized-OpenPlatypus-Train.jsonl"
 distributions_save_folder = r"F:\distilled"
 context_len = 8*1024
@@ -128,7 +134,7 @@ chunk_size_tokens = 1*1024
 max_cache_gb = 10  # Desired size of the saved files in GB
 
 set_max_token_prob = False # Set the probability of the next token to the max logit in the distribution
-next_token_prob_boost = 1.2  # Boost the probability of the next token by this factor
+next_token_prob_boost = 1  # Boost the probability of the next token by this factor
 sort = False # Sort by length, stops Vram spikes for some reason. Top - longest, Bottom - shortest
 
 only_get_metadata = False # Won't load the model
@@ -140,12 +146,12 @@ save_user_range = False
 save_assistant_range = True
 
 prompt_format = {
-    'SYS_START': "<|im_start|>system\n",
-    'USER_START': "<|im_start|>user\n",
-    'ASSISTANT_START': "<|im_start|>assistant\n",
-    'SYS_END': '<|im_end|>\n',
-    'USER_END': '<|im_end|>\n',
-    'ASSISTANT_END': '<eos><|im_end|>\n' # Use <eos> and <bos> for model-specific special tokens
+    'SYS_START': "### System:\n",
+    'USER_START': "### Instruction:\n",
+    'ASSISTANT_START': "### Response:\n",
+    'SYS_END': '\n\n',
+    'USER_END': '\n\n',
+    'ASSISTANT_END': '<eos>\n\n' # Use <eos> and <bos> for model-specific special tokens
 }
 
 device = "cuda:0"
@@ -183,8 +189,6 @@ else:
     dataset_tokenized, dataset_content_ranges, empty_convo_ids = tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, save_sys_range, save_user_range, save_assistant_range)
     metadata = {**config_data, "empty_convo_ids": empty_convo_ids, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)}
     save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
-
-    
 
     generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, device, max_cache_gb, next_token_prob_boost, context_len, metadata, empty_convo_ids)
     print("Done!\nIf the script didn't close yet, that means its still writing to disk!\nDO NOT STOP IT MANUALLY!")

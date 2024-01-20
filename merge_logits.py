@@ -1,9 +1,8 @@
 import os
 import torch
-import torch.nn as nn
 import pickle
 import threading
-from utils.finetuning_utils import teacher_tensors_hander, preprocess_logits, create_mask
+from utils.finetuning_utils import teacher_tensors_hander
 from utils.dataset_utils import load_metadata, save_metadata
 
 def check_errors(model_folders_paths: list):
@@ -44,61 +43,59 @@ def merge_and_save_logits(model_folders: list, device: str, output_folder: str, 
 
     model_metadatas = [load_metadata(model_folder) for model_folder in model_folders]
 
-    masks = [create_mask(metadata) for metadata in model_metadatas]
-
     merged_metadata = model_metadatas[0]
     merged_metadata["vocab_size"] = merged_metadata["vocab_size"] - len(merged_metadata["added_tokens_ids"])
     merged_metadata["merged"] = True
     merged_metadata["context_len"] = max([metadata["context_len"] for metadata in model_metadatas])
     merged_metadata["merged_models"] = [metadata["model_name"] for metadata in model_metadatas]
 
-    merged_logits_list = []
+    merged_probs_list = []
     current_cache_size_tokens = 0
     count = 0
     convo_id = 0
 
     try:
         while True:
-            logits_list = [nn.functional.log_softmax(next(gen)) for gen in generators]
-            logits_list = [tensor for tensor in logits_list if tensor.shape[0] > 0]
-            empty = True if not logits_list else False
+            logprobs_list = [torch.log(next(gen)) for gen in generators]
+            logprobs_list = [tensor for tensor in logprobs_list if tensor.shape[0] > 0]
+            empty = True if not logprobs_list else False
 
             if not empty:
-                combined_list = list(zip(logits_list, masks))
-                combined_list.sort(key=lambda x: x[0].shape[0], reverse=True)
-                logits_list, masks = map(list, zip(*combined_list))
-                merged_logits = preprocess_logits(logits_list[0], masks[0])
+                logprobs_list.sort(key=lambda x: x.shape[0], reverse=True)
+                merged_logprobs = logprobs_list[0]
 
-                for i, tensor in enumerate(logits_list[1:], start=1):
-                    tensor = preprocess_logits(tensor, masks[i])
-                    merge_length = min(merged_logits.shape[0], tensor.shape[0])
+                for tensor in logprobs_list[1:]:
+                    merge_length = min(merged_logprobs.shape[0], tensor.shape[0])
 
-                    merged_part = torch.stack([merged_logits[:merge_length], tensor[:merge_length]]).mean(dim=0)
+                    merged_part = torch.stack([merged_logprobs[:merge_length], tensor[:merge_length]]).mean(dim=0)
 
-                    if merged_logits.shape[0] > merge_length:
-                        unmerged_part = merged_logits[merge_length:]
-                        merged_logits = torch.cat([merged_part, unmerged_part], dim=0)
+                    if merged_logprobs.shape[0] > merge_length:
+                        unmerged_part = merged_logprobs[merge_length:]
+                        merged_logprobs = torch.cat([merged_part, unmerged_part], dim=0)
                     else:
-                        merged_logits = merged_part
+                        merged_logprobs = merged_part
+                merged_probs = torch.exp(merged_logprobs)
+                merged_probs /= merged_probs.sum()
             else:
-                merged_logits = torch.tensor([], device=device)
+                merged_probs = torch.tensor([], device=device)
                 merged_metadata["empty_convo_ids"].append(convo_id)
 
             convo_id += 1
-            merged_logits_list.append(merged_logits)
-            current_cache_size_tokens += merged_logits.size(0)
+            
+            merged_probs_list.append(merged_probs)
+            current_cache_size_tokens += merged_probs.size(0)
 
             if current_cache_size_tokens >= MAX_CACHE_SIZE_TOKENS:
                 count += 1
-                async_save_merged_logits(merged_logits_list, output_folder, count)
-                merged_logits_list = []
+                async_save_merged_logits(merged_probs_list, output_folder, count)
+                merged_probs_list = []
                 current_cache_size_tokens = 0
 
     except StopIteration:
         save_metadata(merged_metadata, output_folder)
-        if merged_logits_list:
+        if merged_probs_list:
             count += 1
-            async_save_merged_logits(merged_logits_list, output_folder, count)
+            async_save_merged_logits(merged_probs_list, output_folder, count)
 
     print(f"Merged logits saved in {output_folder}")
 

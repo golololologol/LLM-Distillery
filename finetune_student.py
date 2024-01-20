@@ -96,6 +96,7 @@ if distr_metadata is not None:
         "dataset_tokenized": dataset_tokenized,
         "dataset_content_ranges": dataset_content_ranges,
         "distributions_path": distributions_path,
+        "empty_convo_ids": empty_convo_ids,
         "training_type": training,
         "load_in_8bit": load_in_8bit,
         "optimizer_name": optimizer,

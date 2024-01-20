@@ -1,0 +1,4 @@
+Nexusflow/NexusRaven-V2-13B: LLAMA
+Undi95/UtopiaXL-13B: LLAMA
+jebcarter/psyonic-cetacean-20B: LLAMA
+mistralai/Mixtral-8x7B-Instruct-v0.1: Mistral

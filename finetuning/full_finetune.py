@@ -13,7 +13,7 @@ def full_finetune(params):
     
     model.train()
     grad_accum_steps = params["grad_accum_steps"]
-    teacher_tensor = teacher_tensors_hander(params["distributions_path"], params["device"])
+    teacher_tensor = teacher_tensors_hander(params["distributions_path"], params["device"], empty_convo_ids=params["empty_convo_ids"])
     optimizer = set_optimizer(
         model.parameters(), 
         lr=params["lr"],

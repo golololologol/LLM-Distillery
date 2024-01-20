@@ -38,6 +38,11 @@ def create_mask(metadata: dict):
         return mask
     return None
 
+def linear_softmax(tensor):
+    min_val = torch.min(tensor)
+    shifted_tensor = tensor - min_val + 1e-6
+    return shifted_tensor / torch.sum(shifted_tensor)
+
 def set_optimizer(model_parameters, lr, grad_accum_steps, betas, optimizer_name: str):
     optimizer_name = optimizer_name.lower()
     
