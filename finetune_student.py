@@ -13,7 +13,7 @@ def check_errors(dataset_path: str, distributions_path: str, student_metadata: d
         errors.append("DIFFERENT DATASET NAMES!")
     if (student_metadata['vocab_family'] != distr_metadata['vocab_family']) and (student_metadata['vocab_family'] != "Unknown") and (distr_metadata['vocab_family'] != "Unknown"):
         errors.append("DIFFERENT VOCAB FAMILIES!")
-    if student_metadata['vocab_size'] != distr_metadata['vocab_size']:
+    if student_metadata['vocab_size'] - len(student_metadata["added_tokens_ids"]) != distr_metadata['vocab_size'] - len(distr_metadata["added_tokens_ids"]):
         errors.append("DIFFERENT VOCAB SIZES!")
     if student_metadata['vocab_family'] == "Unknown":
         errors.append("UNKNOWN STUDENT VOCAB FAMILY!")
@@ -39,21 +39,21 @@ def finetune(parameters: dict):
 
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\TinyLlama-1.1B-intermediate-step-1431k-3T"
-dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filtered.jsonl"
+dataset_path = r"F:\down\data-MNHTN-standardized-OpenPlatypus-Train.jsonl"
 #validation_dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filteredtest.jsonl"
-distributions_path = r"F:\distilled\janny_Filtered\speechless-llama2-hermes-orca-platypus-wizardlm-13b-exl2"
+distributions_path = r"F:\distilled\data-MNHTN-standardized-OpenPlatypus-Train\merged"
 save_folder = r"F:\trained"
 trained_model_name = "BallCrusher9000"
 
 training = "full" # "full" "lora" "qlora"
-optimizer = "adamw8bit" # "adamw8bit" "adamw" "adagrad8bit" "sgd" "paged_adamw8bit"
+optimizer = "adamw32bit" # "adamw8bit" "adamw" "adagrad8bit" "sgd" "paged_adamw8bit"
 load_in_8bit = False
 context_length = 2*1024
-grad_accumulation_steps = 4
-num_epochs = 4
-num_warmup_steps = 120
-lr = 1e-6
-lr_scheduler = "linear"
+grad_accumulation_steps = 2
+num_epochs = 6
+num_warmup_steps = 200
+lr = 6e-6
+lr_scheduler = "cosine" # "cosine" "linear" "constant" "constant_with_warmup" "polynomial" "inverse_sqrt" "reduce_lr_on_plateau"
 
 prompt_format = {
     'SYS_START': "### System:\n",
@@ -77,7 +77,7 @@ print(f"Context Len: {context_length}, Num Epochs: {num_epochs}, Num Warmup Step
 
 if distr_metadata is not None:
     dataset_tokenized, dataset_content_ranges, empty_convo_ids = tokenize_dataset(
-        dataset_path, device, distr_metadata['sorted'], model_path, prompt_format, 
+        dataset_path, device, distr_metadata['sorted'], model_path, prompt_format, context_length, 
         distr_metadata['save_sys_range'], distr_metadata['save_user_range'], 
         distr_metadata['save_assistant_range'])
     student_metadata = generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)

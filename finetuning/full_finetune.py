@@ -28,14 +28,14 @@ def full_finetune(params):
         name=params["lr_scheduler_name"].lower(),
         optimizer=optimizer, 
         num_warmup_steps=params["num_warmup_steps"], 
-        num_training_steps=len(params["dataset_tokenized"])
+        num_training_steps=len(params["dataset_tokenized"] * params["num_epochs"])
     )
 
-    print("Num Gradient Updates:", math.ceil(dataset_len / grad_accum_steps))
+    print("Num Gradient Updates:", math.ceil(num_training_steps / grad_accum_steps))
     recent_losses = []
     updated = False
-    pbar = tqdm(total=num_training_steps, desc=f"{params['training_type']} Finetuning", unit="convo", smoothing=0.06)
     student_mask = create_mask(params["student_metadata"])
+    pbar = tqdm(total=num_training_steps, desc=f"{params['training_type']} Finetuning", unit="convo", smoothing=0.06)
     
     for step in range(num_training_steps):
         updated = False
@@ -47,11 +47,17 @@ def full_finetune(params):
         student_logits = torch.cat([full_student_logits[start:end] for start, end in conversation_content_ranges], dim=0)
         student_logits = preprocess_logits(student_logits, student_mask)
 
-        teacher_logits = next(teacher_tensor)
-        min_len = min(student_logits.size(0), teacher_logits.size(0))
-        loss = calculate_kl_divergence(student_logits[:min_len], teacher_logits[:min_len])
+        teacher_probs = next(teacher_tensor)
+        min_len = min(student_logits.size(0), teacher_probs.size(0))
+        loss = calculate_kl_divergence(student_logits[:min_len], teacher_probs[:min_len])
 
         loss.backward()
+
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            print(f"Warning: NaN or Inf found in loss at step {step}")
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            continue
 
         if (step + 1) % grad_accum_steps == 0:
             updated = True

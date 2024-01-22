@@ -15,14 +15,14 @@ def good_encode(text: str, encode_special = True, replace_tokens = True, tokeniz
         text = text.replace('<bos>', tokenizer.bos_token).replace('<eos>', tokenizer.eos_token)
     return tokenizer.encode("\n" + text, add_special_tokens=False, return_tensors="pt").squeeze(0)[2:] # type: ignore
 
-def encode_prompt_format(prompt_format: dict, tokenizer=None, model_path="") -> dict:
+def encode_prompt_format(prompt_format: dict, tokenizer=None, model_path="") -> dict[str, torch.Tensor]:
     if tokenizer == None:
         tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
     for key, value in prompt_format.items():
         prompt_format[key] = good_encode(value, tokenizer=tokenizer)
     return prompt_format
 
-def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, context_len, save_sys_range=False, save_user_range=False, save_assistant_range=False):
+def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range):
     print("Tokenizing the dataset...")
     total_tokens = 0
     empty_convo_ids = []
@@ -33,11 +33,9 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, cont
 
     dataset_tokenized = []
     dataset_content_ranges = []
-    num_convos = 0
 
     for convo_id, item in enumerate(read_jsonl_lazy(dataset_path)):  # Every conversation
         conversation_tokenized = torch.Tensor().to(device)
-        num_convos += 1
         conversation_content_ranges = []
         start_index = 0
         
@@ -50,7 +48,7 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, cont
             sys_tokenized = torch.cat((pf['SYS_START'], sys_content_tokenized, pf['SYS_END']))
             conversation_tokenized = sys_tokenized
             if save_sys_range:
-                conversation_content_ranges.append((pf['SYS_START'].numel()-1, sys_tokenized.numel() - pf['SYS_END'].numel()))
+                conversation_content_ranges.append((pf['SYS_START'].numel() - 1, sys_tokenized.numel() - pf['SYS_END'].numel()))
             start_index = sys_tokenized.numel()
 
         for i, turn in enumerate(item["conversations"]):  # Every turn
@@ -121,10 +119,11 @@ def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_
     metadata = {
             "first_convo_decoded": first_convo_decoded,
             "first_content_decoded": first_content_decoded,
+            "dataset_len": len(dataset_tokenized),
             "empty_convo_ids": [],
             "merged": False,
             "merged_models": [],
-            "model_name": model_path.split("/")[-1],
+            "model_name": os.path.basename(os.path.normpath(model_path)),
             "bos_id": tokenizer.bos_token_id,
             "eos_id": tokenizer.eos_token_id,
             "pad_id": tokenizer.pad_token_id,
