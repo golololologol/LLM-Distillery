@@ -8,23 +8,15 @@ def check_errors(dataset_path: str, distributions_path: str, student_metadata: d
     dataset_name = os.path.splitext(os.path.basename(dataset_path))[0]
     distributions_dataset_name = distributions_path.split(os.sep)[-2] if len(distributions_path.split(os.sep)) > 1 else None
 
-    errors = []
-    if dataset_name != distributions_dataset_name:
-        errors.append("DIFFERENT DATASET NAMES!")
-    if (student_metadata['vocab_family'] != distr_metadata['vocab_family']) and (student_metadata['vocab_family'] != "Unknown") and (distr_metadata['vocab_family'] != "Unknown"):
-        errors.append("DIFFERENT VOCAB FAMILIES!")
-    if student_metadata['vocab_size'] - len(student_metadata["added_tokens_ids"]) != distr_metadata['vocab_size'] - len(distr_metadata["added_tokens_ids"]):
-        errors.append("DIFFERENT VOCAB SIZES!")
-    if student_metadata['vocab_family'] == "Unknown":
-        errors.append("UNKNOWN STUDENT VOCAB FAMILY!")
-    if distr_metadata['vocab_family'] == "Unknown":
-        errors.append("UNKNOWN TEACHER VOCAB FAMILY!")
+    flags_to_check = ["dataset_len", "vocab_family", "crop_to_size"]
 
-    if errors:
-        for error in errors:
-            print(error)
-        print("----------------------------------------")
-        raise Exception("Errors detected! Aborting!")
+    if distributions_dataset_name != dataset_name:
+        raise ValueError(f"Dataset name mismatch!")
+
+    for flag in flags_to_check:
+        if student_metadata[flag] != distr_metadata[flag]:
+            raise ValueError(f"{flag} mismatch!\nStudent metadata: {student_metadata}\nDistributions metadata: {distr_metadata}")
+    
 
 
 def finetune(parameters: dict):
@@ -39,21 +31,23 @@ def finetune(parameters: dict):
 
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\TinyLlama-1.1B-intermediate-step-1431k-3T"
-dataset_path = r"F:\down\data-MNHTN-standardized-OpenPlatypus-Train.jsonl"
-#validation_dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filteredtest.jsonl"
-distributions_path = r"F:\distilled\data-MNHTN-standardized-OpenPlatypus-Train\merged"
+dataset_path = r"F:\down\data-MNHTN-standardized-GPTeacher-RP-Instruct-V2.jsonl"
+distributions_path = r"F:\distilled\data-MNHTN-standardized-GPTeacher-RP-Instruct-V2\MythoMax-L2-Kimiko-v2-13b_safetensors"
 save_folder = r"F:\trained"
 trained_model_name = "BallCrusher9000"
 
 training = "full" # "full" "lora" "qlora"
 optimizer = "adamw32bit" # "adamw8bit" "adamw" "adagrad8bit" "sgd" "paged_adamw8bit"
-load_in_8bit = False
+load_in_half = True
 context_length = 2*1024
-grad_accumulation_steps = 2
-num_epochs = 6
+grad_accumulation_steps = 8
+num_epochs = 4
 num_warmup_steps = 200
-lr = 6e-6
-lr_scheduler = "cosine" # "cosine" "linear" "constant" "constant_with_warmup" "polynomial" "inverse_sqrt" "reduce_lr_on_plateau"
+lr = 8e-5
+lr_scheduler = "constant" # "cosine" "linear" "constant" "constant_with_warmup" "polynomial" "inverse_sqrt" "reduce_lr_on_plateau"
+temperature = 2.0
+clip_distr_to_size = 32000
+device = "cuda:0"
 
 prompt_format = {
     'SYS_START': "### System:\n",
@@ -63,8 +57,6 @@ prompt_format = {
     'USER_END': '\n\n',
     'ASSISTANT_END': '<eos>\n\n' # Use <eos> and <bos> for model-specific special tokens
 }
-
-device = "cuda:0"
 
 trained_model_folder = os.path.join(save_folder, trained_model_name)
 
@@ -98,7 +90,7 @@ if distr_metadata is not None:
         "distributions_path": distributions_path,
         "empty_convo_ids": empty_convo_ids,
         "training_type": training,
-        "load_in_8bit": load_in_8bit,
+        "load_in_half": load_in_half,
         "optimizer_name": optimizer,
         "context_length": context_length,
         "grad_accum_steps": grad_accumulation_steps,
@@ -108,6 +100,8 @@ if distr_metadata is not None:
         "lr": lr,
         "lr_scheduler_name": lr_scheduler,
         "device": device,
+        "temperature": temperature,
+        "clip_to_size": clip_distr_to_size
     }
 
     finetune(parameters)

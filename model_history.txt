@@ -1,3 +1,4 @@
+Undi95/MythoMax-L2-Kimiko-v2-13b: LLAMA
 Nexusflow/NexusRaven-V2-13B: LLAMA
 Undi95/UtopiaXL-13B: LLAMA
 jebcarter/psyonic-cetacean-20B: LLAMA
