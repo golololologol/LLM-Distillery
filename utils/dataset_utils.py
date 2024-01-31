@@ -12,7 +12,7 @@ class H5Writer:
         self.save_path = os.path.join(save_folder, "distributions.hdf5")
         if os.path.exists(self.save_path):
             os.remove(self.save_path)
-        self.queue = queue.Queue(maxsize=100)
+        self.queue = queue.Queue(maxsize=2)
         self.thread = threading.Thread(target=self._save_to_hdf5_thread)
         self.thread.start()
         
@@ -20,7 +20,7 @@ class H5Writer:
         with h5py.File(self.save_path, 'a') as hdf_file:
             convo_count = 0
             while True:
-                item = self.queue.get(timeout=15)
+                item = self.queue.get()
                 if item is None:
                     break
                 dataset_name = f'convo_{convo_count}'
@@ -36,9 +36,10 @@ class H5Writer:
         self.thread.join()
 
 class H5Reader:
-    def __init__(self, model_path, device, empty_convo_ids=[], queue_size=5):
+    def __init__(self, model_path, device, empty_convo_ids=[], queue_size=2, timeout=15):
         self.file_path = os.path.join(model_path, "distributions.hdf5")
         self.device = device
+        self.timeout = timeout
         self.empty_convo_ids = empty_convo_ids
         self.queue = queue.Queue(maxsize=queue_size)
         self.stop_loading = threading.Event()
@@ -47,15 +48,15 @@ class H5Reader:
 
     def _load_data(self):
         with h5py.File(self.file_path, 'r') as hdf_file:
-            dataset_names = sorted(hdf_file.keys(), key=lambda x: int(x.split('_')[1]))
-            print(f"Total datasets: {len(dataset_names)}")
-            print(dataset_names)
-            while not self.stop_loading.is_set():
-                for dataset_name in dataset_names:
+            while True:
+                dataset_names = sorted(hdf_file.keys(), key=lambda x: int(x.split('_')[1]))
+                for i, dataset_name in enumerate(dataset_names):
                     if self.stop_loading.is_set():
                         return
+                    if i in self.empty_convo_ids:
+                        continue
                     tensor = torch.tensor(np.array(hdf_file[dataset_name]), device=self.device)
-                    self.queue.put(tensor, timeout=15)
+                    self.queue.put(tensor, timeout=self.timeout)
 
     def read_next(self) -> torch.Tensor:
         tensor = self.queue.get()
@@ -72,8 +73,6 @@ def read_jsonl_lazy(file_path): # Generator to lazy read the dataset line-by-lin
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 data = json.loads(line)
-                if (len(data.get("conversations", [])) < 2):
-                    continue
                 yield data
 
 def good_encode(text: str, encode_special = True, replace_tokens = True, tokenizer=None, model_path="") -> torch.Tensor:
@@ -105,7 +104,14 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, cont
         conversation_tokenized = torch.Tensor().to(device)
         conversation_content_ranges = []
         start_index = 0
-        
+        num_turns = len(item["conversations"])
+
+        if num_turns < 2:
+            empty_convo_ids.append(convo_id)
+            dataset_tokenized.append(conversation_tokenized)
+            dataset_content_ranges.append(conversation_content_ranges)
+            continue
+
         tags = item.get("tags", [])
         reversed = ("reversed" in tags) or item.get("reversed", False)
 
@@ -162,7 +168,7 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, cont
     print(f"Total content tokens saved: {sum([range[1] - range[0] for ranges in dataset_content_ranges for range in ranges])}")
     return dataset_tokenized, dataset_content_ranges, empty_convo_ids
 
-def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_ranges: list) -> dict:
+def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_ranges: list, empty_convo_ids=[]) -> dict:
     tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
 
     if not (dataset_tokenized and dataset_content_ranges):
@@ -189,7 +195,7 @@ def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_
             "dataset_len": len(dataset_tokenized),
             "total_tokens": sum([convo_tokenized.numel() for convo_tokenized in dataset_tokenized]),
             "total_content_tokens": sum([sum([content_range[1] - content_range[0] for content_range in convo_content_ranges]) for convo_content_ranges in dataset_content_ranges]),
-            "empty_convo_ids": [],
+            "empty_convo_ids": empty_convo_ids,
             "merged": False,
             "merged_models": [],
             "model_name": os.path.basename(os.path.normpath(model_path)),
@@ -260,8 +266,13 @@ def save_sorted_dataset(save_folder: str, dataset_path: str):
                 f.write(json.dumps(item, ensure_ascii=False) + '\n')
 
 def filter_empty_conversations(dataset_tokenized, dataset_content_ranges, empty_convo_ids):
-    return ([item for i, item in enumerate(dataset_tokenized) if i not in empty_convo_ids],
-            [item for i, item in enumerate(dataset_content_ranges) if i not in empty_convo_ids])
+    dataset_tokenized_filtered = []
+    dataset_content_ranges_filtered = []
+    for i, convo_tokenized in enumerate(dataset_tokenized):
+        if i not in empty_convo_ids:
+            dataset_tokenized_filtered.append(convo_tokenized)
+            dataset_content_ranges_filtered.append(dataset_content_ranges[i])
+    return dataset_tokenized_filtered, dataset_content_ranges_filtered
 
 def save_metadata(metadata: dict, save_folder: str):
     metadata_file = os.path.join(save_folder, "dataset_metadata.json")

@@ -17,8 +17,6 @@ def check_errors(dataset_path: str, distributions_path: str, student_metadata: d
         if student_metadata[flag] != distr_metadata[flag]:
             raise ValueError(f"{flag} mismatch!\nStudent metadata: {student_metadata}\nDistributions metadata: {distr_metadata}")
     
-
-
 def finetune(parameters: dict):
     if training.lower() == "full":
         full_finetune(parameters)
@@ -31,31 +29,33 @@ def finetune(parameters: dict):
 
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\TinyLlama-1.1B-intermediate-step-1431k-3T"
-dataset_path = r"F:\down\data-MNHTN-standardized-GPTeacher-RP-Instruct-V2.jsonl"
-distributions_path = r"F:\distilled\data-MNHTN-standardized-GPTeacher-RP-Instruct-V2\MythoMax-L2-Kimiko-v2-13b_safetensors"
+dataset_path = r"F:\down\merged_Puffin_UnNatInstr_Lima.jsonl"
+distributions_path = r"F:\distilled\merged_Puffin_UnNatInstr_Lima\merged"
 save_folder = r"F:\trained"
-trained_model_name = "BallCrusher9000"
+trained_model_name = "BallCrusher90005"
 
 training = "full" # "full" "lora" "qlora"
 optimizer = "adamw32bit" # "adamw8bit" "adamw" "adagrad8bit" "sgd" "paged_adamw8bit"
 load_in_half = True
 context_length = 2*1024
-grad_accumulation_steps = 8
-num_epochs = 4
-num_warmup_steps = 200
-lr = 8e-5
+per_token_training = False
+grad_accumulation_steps = 1
+num_epochs = 5
+num_warmup_steps = 400
+lr = 3e-6
 lr_scheduler = "constant" # "cosine" "linear" "constant" "constant_with_warmup" "polynomial" "inverse_sqrt" "reduce_lr_on_plateau"
-temperature = 2.0
-clip_distr_to_size = 32000
-device = "cuda:0"
+temperature = 1.0
+crop_distr_to_size = 32000
+device = "cuda:1"
+stop_at_convo = None
 
 prompt_format = {
-    'SYS_START': "### System:\n",
-    'USER_START': "### User:\n",
-    'ASSISTANT_START': "### Assistant:\n",
-    'SYS_END': '\n\n',
-    'USER_END': '\n\n',
-    'ASSISTANT_END': '<eos>\n\n' # Use <eos> and <bos> for model-specific special tokens
+    'SYS_START': "#System: ",
+    'USER_START': "#User: ",
+    'ASSISTANT_START': "#Assistant: ",
+    'SYS_END': '\n',
+    'USER_END': '\n',
+    'ASSISTANT_END': '<eos>\n' # Use <eos> and <bos> for model-specific special tokens
 }
 
 trained_model_folder = os.path.join(save_folder, trained_model_name)
@@ -65,18 +65,18 @@ if not os.path.exists(trained_model_folder):
 
 distr_metadata = load_metadata(distributions_path)
 
-print(f"Context Len: {context_length}, Num Epochs: {num_epochs}, Num Warmup Steps: {num_warmup_steps}, LR: {lr} {lr_scheduler}, Optimizer: {optimizer}, Prob Boost: {distr_metadata['next_token_prob_boost']}, Set Prob to Max: {distr_metadata['set_max_token_prob']}")
+print(f"Context Len: {context_length}, Num Epochs: {num_epochs}, Num Warmup Steps: {num_warmup_steps}, LR: {lr} {lr_scheduler}, Optimizer: {optimizer}")
 
 if distr_metadata is not None:
     dataset_tokenized, dataset_content_ranges, empty_convo_ids = tokenize_dataset(
         dataset_path, device, distr_metadata['sorted'], model_path, prompt_format, context_length, 
         distr_metadata['save_sys_range'], distr_metadata['save_user_range'], 
         distr_metadata['save_assistant_range'])
-    student_metadata = generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)
     
-    empty_convo_ids = list(set(distr_metadata.get('empty_convo_ids', []) + empty_convo_ids))
+    student_metadata = {**{'crop_to_size': crop_distr_to_size}, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)}
 
-    filter_empty_conversations(dataset_tokenized, dataset_content_ranges, empty_convo_ids)
+    empty_convo_ids = list(set(distr_metadata.get('empty_convo_ids', []) + empty_convo_ids))
+    dataset_tokenized, dataset_content_ranges = filter_empty_conversations(dataset_tokenized, dataset_content_ranges, empty_convo_ids)
 
     save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, student_metadata, trained_model_folder)
     
@@ -91,8 +91,10 @@ if distr_metadata is not None:
         "empty_convo_ids": empty_convo_ids,
         "training_type": training,
         "load_in_half": load_in_half,
+        "per_token_training": per_token_training,
         "optimizer_name": optimizer,
         "context_length": context_length,
+        "stop_at_convo": stop_at_convo,
         "grad_accum_steps": grad_accumulation_steps,
         "num_epochs": num_epochs,
         "num_warmup_steps": num_warmup_steps,
@@ -101,7 +103,7 @@ if distr_metadata is not None:
         "lr_scheduler_name": lr_scheduler,
         "device": device,
         "temperature": temperature,
-        "clip_to_size": clip_distr_to_size
+        "crop_to_size": crop_distr_to_size
     }
 
     finetune(parameters)

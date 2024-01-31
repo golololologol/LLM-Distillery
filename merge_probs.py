@@ -1,9 +1,10 @@
 import os
 import torch
 from tqdm import tqdm
-from utils.dataset_utils import load_metadata, save_metadata, H5Reader, H5Writer
+from utils.dataset_utils import load_metadata, save_metadata, H5Writer, H5Reader
 
 def check_errors(model_folders_paths: list):
+    print("Checking for errors...")
     merged_metadata = load_metadata(model_folders_paths[0])
 
     flags_to_check = ["sorted", "save_sys_range", "save_user_range", "save_assistant_range", "dataset_len", "vocab_family", "crop_to_size"]
@@ -14,9 +15,9 @@ def check_errors(model_folders_paths: list):
         for flag in flags_to_check:
             if model_metadata[flag] != merged_metadata[flag]:
                 raise ValueError(f"{flag} mismatch in {model_folder_path}\nModel metadata: {model_metadata}\nMerged metadata: {merged_metadata}")
-        
-def merge_and_save_logits(model_folders: list, device: str, output_folder: str):
-
+               
+def merge_and_save_probs(model_folders: list, device: str, output_folder: str):
+    print("Initializing merging...")
     readers = [H5Reader(folder, device) for folder in model_folders]
     writer = H5Writer(output_folder)
 
@@ -27,6 +28,8 @@ def merge_and_save_logits(model_folders: list, device: str, output_folder: str):
     merged_metadata["merged"] = True
     merged_metadata["context_len"] = max([metadata["context_len"] for metadata in model_metadatas])
     merged_metadata["merged_models"] = [metadata["model_name"] for metadata in model_metadatas]
+    
+    save_metadata(merged_metadata, output_folder)
 
     for convo_id in tqdm(range(merged_metadata["dataset_len"]), desc="Merging", unit="convo", smoothing=0.05):
         probs_list = [reader.read_next() for reader in readers]
@@ -48,15 +51,14 @@ def merge_and_save_logits(model_folders: list, device: str, output_folder: str):
 
         writer.write_data(merged_probs)
     
-    save_metadata(merged_metadata, output_folder)
     writer.close()
     for reader in readers:
         reader.close()
-    print(f"Merged logits saved in {output_folder}")
+    print(f"Merged probs saved in {output_folder}")
 
 
 # Parameters
-distributions_folders_path = r"F:\distilled\data-MNHTN-standardized-GPTeacher-RP-Instruct-V2"
+distributions_folders_path = r"F:\distilled\merged_Puffin_UnNatInstr_Lima"
 device = "cuda:0"
 
 model_folders = [os.path.join(distributions_folders_path, model_name) 
@@ -72,4 +74,4 @@ if not os.path.exists(output_folder):
         os.makedirs(output_folder)
 
 check_errors(model_folders)
-merge_and_save_logits(model_folders, device, output_folder)
+merge_and_save_probs(model_folders, device, output_folder)

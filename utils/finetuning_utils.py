@@ -3,9 +3,11 @@ import torch
 import bitsandbytes as bnb
 import math
 
-def calculate_kl_divergence(student_logits, teacher_probs, temp=1):
+def calculate_kl_divergence(student_logits, teacher_probs, temp=1, per_token=False):
+    #print(student_logits)
     student_log_probs = nn.functional.log_softmax(student_logits/temp, dim=-1)
-    kl_div = nn.functional.kl_div(student_log_probs, teacher_probs, reduction='batchmean')
+    reduction = 'batchmean' if not per_token else 'sum'
+    kl_div = nn.functional.kl_div(student_log_probs, teacher_probs, reduction=reduction)
     return kl_div
 
 def scale_temperature(current_step, num_training_steps, temperature):

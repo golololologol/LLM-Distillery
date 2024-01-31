@@ -1,6 +1,9 @@
 import json
+import os
 
-def compare_vocabs(file1, file2, output_file):
+def compare_vocabs(folder1, folder2):
+    file1 = os.path.join(folder1, "dataset_metadata.json")
+    file2 = os.path.join(folder2, "dataset_metadata.json")
     with open(file1, 'r', encoding='utf-8') as f1, open(file2, 'r', encoding='utf-8') as f2:
         metadata1 = json.load(f1)
         metadata2 = json.load(f2)
@@ -21,8 +24,6 @@ def compare_vocabs(file1, file2, output_file):
         "Number of unique tokens in dict1": len(unique_tokens_dict1),
         "Number of unique tokens in dict2": len(unique_tokens_dict2)
     }
+    print(result)
     
-    with open(output_file, 'w', encoding='utf-8') as output:
-        json.dump(result, output, indent=4)
-    
-#compare_vocabs(r"F:\trained\BallCrusher9000\dataset_metadata.json", r"F:\distilled\janny_Filteredtest\neural-chat-7b-v3-1-exl2\dataset_metadata.json", "comparison_result.json")
+compare_vocabs(r"F:\distilled\data-MNHTN-standardized-Puffin\Nous-Hermes-Llama2-13b", r"F:\distilled\data-MNHTN-standardized-Puffin\UtopiaXL-13B")

@@ -46,7 +46,7 @@ def rename(pt_filename):
 def copy_additional_files(source_folder, dest_folder):
     for file in os.listdir(source_folder):
         file_path = os.path.join(source_folder, file)
-        if os.path.isfile(file_path) and not (file.endswith('.bin') or file.endswith('.py')):
+        if os.path.isfile(file_path) and not (file.endswith('.bin') or file.endswith('.py') or file.endswith('.git')):
             shutil.copy(file_path, dest_folder)
 
 def find_index_file(source_folder):

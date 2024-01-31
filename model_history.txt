@@ -1,3 +1,6 @@
+v1olet/v1olet_marcoroni-go-bruins-merge-7B: Mistral
+NousResearch/Redmond-Puffin-13B: LLAMA
+NousResearch/Nous-Hermes-Llama2-13b: LLAMA
 Undi95/MythoMax-L2-Kimiko-v2-13b: LLAMA
 Nexusflow/NexusRaven-V2-13B: LLAMA
 Undi95/UtopiaXL-13B: LLAMA

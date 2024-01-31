@@ -50,6 +50,7 @@ def run_test_inference(model: ExLlamaV2, prompt_format, model_path, device, text
 
     print(f"Input:\n{context_tokens}\nPredicted Next Tokens:\n{next_tokens}")
 
+
 def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, metadata, empty_convo_ids, clip_to_size):
     TOKEN_DISTRIBUTION_SIZE_KB = 0.001953125 * clip_to_size
     approx_size = round((metadata['total_content_tokens'] * TOKEN_DISTRIBUTION_SIZE_KB) / 1000000, 2)
@@ -65,7 +66,8 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
             else:
                 if set_max_token_prob:
                     current_distribution[next_token] = torch.max(current_distribution) * next_token_prob_boost
-            current_distribution /= current_distribution.sum() 
+        
+        model_output = model_output / model_output.sum(dim=-1, keepdim=True)
         return model_output
 
     def process_conversation(conversation_tokenized: torch.Tensor, conversation_content_ranges: list):
@@ -82,6 +84,7 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
     for conv_id, (conversation_tokenized, conversation_content_ranges) in enumerate(tqdm(zip(dataset_tokenized, dataset_content_ranges), desc="Generating Distributions", unit="convo", total=len(dataset_tokenized), smoothing=0.06)):
         if conv_id in empty_convo_ids:
             conversation_content_distributions = torch.tensor([], device=device)
+            writer.write_data(conversation_content_distributions)
             continue
 
         content_distributions = process_conversation(conversation_tokenized, conversation_content_ranges)
@@ -89,23 +92,19 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
 
         total_saved_tokens += conversation_content_distributions.size(0)
 
-        if conversation_content_distributions.size(0) == 0:
-            print(f"Empty convo id: {conv_id}")
-            continue
-
         writer.write_data(conversation_content_distributions)
     writer.close()
     print(f"Total saved tokens: {total_saved_tokens}")
 
 
 # Main Script
-model_path = r"F:\UtopiaXL-13B"
-dataset_path = r"F:\down\data-MNHTN-standardized-ShareGPT-V3-Vicuna-Clean.jsonl"
+model_path = r"C:\Users\gololo\Desktop\text-generation-webui-main\models\DarkForest-20B-v1.0"
+dataset_path = r"F:\down\merged_Puffin_UnNatInstr_Lima.jsonl"
 distributions_save_folder = r"F:\distilled"
 context_len = 2*1024
 #batch_size = 4 # How many conversations to process in parallel #TODO
 chunk_size = 4 # How many `chunk_size_tokens` chunks to process in parallel
-chunk_size_tokens = 1*1024
+chunk_size_tokens = 2*1024
 
 set_max_token_prob = False # Set the probability of the next token to the max logit in the distribution
 next_token_prob_boost = 1.15 # Boost the probability of the next token by this factor
@@ -118,16 +117,16 @@ test_inference = False
 save_sys_range = False
 save_user_range = False
 save_assistant_range = True
-clip_distr_to_size = 32000
+crop_distr_to_size = 32000
 device = "cuda:0"
 
 prompt_format = {
-    'SYS_START': "### System:\n",
-    'USER_START': "### Instruction:\n",
-    'ASSISTANT_START': "### Response:\n",
-    'SYS_END': '\n\n',
-    'USER_END': '\n\n',
-    'ASSISTANT_END': '<eos>\n\n' # Use <eos> and <bos> for model-specific special tokens
+    'SYS_START': "<im_start>system\n",
+    'USER_START': "<im_start>user\n",
+    'ASSISTANT_START': "<im_start>assistant\n",
+    'SYS_END': '\n<im_end>\n',
+    'USER_END': '\n<im_end>\n',
+    'ASSISTANT_END': '\n<im_end>\n' # Use <eos> and <bos> for model-specific special tokens
 }
 
 model_name = os.path.basename(os.path.normpath(model_path))
@@ -145,7 +144,7 @@ config_data = {
     'save_user_range': save_user_range,
     'save_assistant_range': save_assistant_range,
     'context_len': context_len,
-    'crop_to_size': clip_distr_to_size,
+    'crop_to_size': crop_distr_to_size,
     'next_token_prob_boost': next_token_prob_boost if set_max_token_prob else 1,
     'set_max_token_prob': set_max_token_prob
 }
@@ -172,8 +171,8 @@ else:
     if sort: save_sorted_dataset(save_folder, dataset_path)
 
     dataset_tokenized, dataset_content_ranges, empty_convo_ids = tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range)
-    metadata = {**config_data, "empty_convo_ids": empty_convo_ids, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)}
+    metadata = {**config_data, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges, empty_convo_ids=empty_convo_ids)}
     save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
 
-    generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, metadata, empty_convo_ids, clip_distr_to_size)
-    print("Done!\nIf the script didn't close yet, that means its still writing to disk!\nDO NOT STOP IT MANUALLY!")
+    generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, metadata, empty_convo_ids, crop_distr_to_size)
+    print("Done!")
