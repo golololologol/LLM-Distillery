@@ -1,27 +1,38 @@
 import math
 import torch
+import os
+import subprocess
+from datetime import datetime
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import tqdm
 from utils.finetuning_utils import calculate_kl_divergence, set_optimizer, scale_temperature
 from utils.dataset_utils import H5Reader
 
+def save_intermediate(model, model_path, save_folder, epoch):
+    model_name = os.path.basename(os.path.normpath(model_path))
+    save_folder = os.path.join(save_folder, f"{model_name}_epoch_{epoch}")
+    model.save_pretrained(save_folder)
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer.save_pretrained(save_folder)
+
 def full_finetune(params):
     model = AutoModelForCausalLM.from_pretrained(
         params["model_path"],
-        device_map="cuda:1",
+        device_map=params["device"],
         torch_dtype=torch.float16 if params["load_in_half"] else torch.float32
     )
     
     model.train()
     grad_accum_steps = params["grad_accum_steps"]
-    teacher = H5Reader(params["distributions_path"], params["device"], empty_convo_ids=params["empty_convo_ids"], timeout=999999)
+    teacher = H5Reader(params["distributions_path"], params["device"], empty_convo_ids=params["empty_convo_ids"], shuffle=params["shuffle_data"])
     optimizer = set_optimizer(
         model.parameters(), 
         lr=params["lr"],
         grad_accum_steps=grad_accum_steps,
-        betas=(0.9, 0.995),
-        optimizer_name=params["optimizer_name"]
+        betas=(0.8, 0.999),
+        optimizer_name=params["optimizer_name"],
+        weight_decay=2e-2
     )
 
     dataset_len = len(params["dataset_tokenized"])
@@ -36,70 +47,68 @@ def full_finetune(params):
 
     print(f"Num Gradient Updates: {num_grad_updates}")
     recent_losses = []
+    order_list = []
+    filtered_order_list = []
     updated = False
-    logger = SummaryWriter(log_dir=params["save_folder"], comment=f"_{params['training_type']}_finetune__lr_{params['lr']}")
+
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"_{params['training_type']}_lr_{params['lr']}"
+    log_dir = os.path.join(params["save_folder"], "tensorboard_logs", run_id)
+    os.makedirs(log_dir, exist_ok=True)
+    
+    logger = SummaryWriter(log_dir=log_dir)
+    tensorboard_process = subprocess.Popen(['tensorboard', '--logdir', os.path.join(params["save_folder"], "tensorboard_logs"), '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     pbar = tqdm(total=num_training_steps, desc=f"{params['training_type']} Finetuning", unit="convo", smoothing=0.06)
     
     for step in range(num_training_steps):
         updated = False
         temp = scale_temperature(step, num_training_steps, params["temperature"])
-        idx = step % dataset_len
+        if params["shuffle_data"]:
+            if not filtered_order_list:
+                order_list = torch.randperm(params["full_dataset_len"]).tolist()
+                teacher.set_shuffle_order(order_list)
+                filtered_order_list = [i - sum(j < i for j in params["empty_convo_ids"]) for i in order_list if i not in params["empty_convo_ids"]]
+            idx = filtered_order_list.pop(0)
+        else:
+            idx = step % dataset_len
         conversation_tokenized, conversation_content_ranges = params["dataset_tokenized"][idx], params["dataset_content_ranges"][idx]
         teacher_probs = teacher.read_next()
-        min_len = min(teacher_probs.size(0), len([conversation_tokenized[:params["context_length"]][start:end] for start, end in conversation_content_ranges]))
         conversation_tokenized = conversation_tokenized.to(params["device"])[:params["context_length"]].unsqueeze(0)
-        teacher_probs = teacher_probs[:min_len]
-        
-        if params["per_token_training"]:
-            total_loss = 0
-            pbar2 = tqdm(total=min_len, desc=f"Per-Token Training", unit="token", smoothing=0.05, leave=False)
-            for current_token_id in range(min_len):
-                full_student_logits = model(conversation_tokenized).logits.squeeze(0)
-                student_logits = torch.cat([full_student_logits[start:end] for start, end in conversation_content_ranges], dim=0)[:, :params["crop_to_size"]]
-                loss = calculate_kl_divergence(student_logits[current_token_id], teacher_probs[current_token_id], temp=temp, per_token=True)
-                loss.backward()
 
-                recent_losses.append(loss.item())
-                optimizer.step()
-                optimizer.zero_grad()
-                updated = True
-                total_loss += loss.item()
-                pbar2.set_postfix({"Loss": total_loss / (current_token_id + 1)})
-                pbar2.update()
+        full_student_logits = model(conversation_tokenized).logits.squeeze(0)
+        student_logits = torch.cat([full_student_logits[start:end] for start, end in conversation_content_ranges], dim=0)[:, :params["crop_to_size"]]
+        min_len = min(student_logits.size(0), teacher_probs.size(0))
+        loss = calculate_kl_divergence(student_logits[:min_len], teacher_probs[:min_len], temp=temp)
+        loss.backward()
+
+        recent_losses.append(loss.item())
+        if (step + 1) % grad_accum_steps == 0:
+            optimizer.step()
             lr_scheduler.step()
-            pbar2.close()
-        else:
-            full_student_logits = model(conversation_tokenized).logits.squeeze(0)
-            student_logits = torch.cat([full_student_logits[start:end] for start, end in conversation_content_ranges], dim=0)[:min_len][:, :params["crop_to_size"]]
-            loss = calculate_kl_divergence(student_logits, teacher_probs, temp=temp)
-            loss.backward()
-
-            recent_losses.append(loss.item())
-            if (step + 1) % grad_accum_steps == 0:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                updated = True
+            optimizer.zero_grad()
+            updated = True
         
-        avg_loss = sum(recent_losses) / len(recent_losses)
         if len(recent_losses) > 100:
-            recent_losses = recent_losses[-99:]
+            recent_losses.pop(0)
+        avg_loss = sum(recent_losses) / len(recent_losses)
 
-        logger.add_scalar('Loss/train', avg_loss, step)
+        logger.add_scalar('Loss/train', loss.item(), step)
         logger.add_scalar('Learning Rate', lr_scheduler.get_last_lr()[0], step)
         logger.add_scalar('Temperature', temp, step)
 
         pbar.set_postfix({"Epoch": f"{(step+1) / dataset_len:.2f}/{params['num_epochs']}", "Loss": avg_loss, "LR": lr_scheduler.get_last_lr()[0]})
         pbar.update()
-    
+        
+        if (step + 1) % (params["save_interval"] * dataset_len) == 0:
+            save_intermediate(model, params["model_path"], params["save_folder"], (step + 1) // dataset_len)
+
     if not updated:
         optimizer.step()
-        optimizer.zero_grad()
 
     logger.close()
     pbar.close()
     teacher.close()
-    model.save_pretrained(params["save_folder"])
-    tokenizer = AutoTokenizer.from_pretrained(params["model_path"])
-    tokenizer.save_pretrained(params["save_folder"])
+    tensorboard_process.terminate()
+
+    save_intermediate(model, params["model_path"], params["save_folder"], "final")
+    
     print(f"Model successfully saved at {params['save_folder']}")

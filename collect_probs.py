@@ -6,7 +6,8 @@ from tqdm import tqdm
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from utils.dataset_utils import H5Writer, save_dataset_and_metadata, \
     tokenize_dataset, generate_metadata, save_metadata, \
-    good_encode, encode_prompt_format, save_sorted_dataset
+    good_encode, encode_prompt_format, save_sorted_dataset,\
+    get_special_tokens, get_vocab_family
 from utils.convert_to_safetensor import convert_model
 @torch.inference_mode()
 
@@ -35,9 +36,10 @@ def is_model_safetensors(model_path: str):
     
 def run_test_inference(model: ExLlamaV2, prompt_format, model_path, device, text=""):
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-
-    text_tokenized = good_encode(text, tokenizer=tokenizer)
-    prompt_format_encoded = encode_prompt_format(prompt_format, tokenizer=tokenizer)
+    vocab_family = get_vocab_family(tokenizer=tokenizer)
+    sp_toks = get_special_tokens(vocab_family)
+    text_tokenized = good_encode(text, sp_toks, tokenizer=tokenizer)
+    prompt_format_encoded = encode_prompt_format(prompt_format, sp_toks, tokenizer=tokenizer)
 
     formatted_text = torch.cat((prompt_format_encoded['USER_START'], text_tokenized)).to(device)
 
@@ -99,7 +101,7 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
 
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\text-generation-webui-main\models\DarkForest-20B-v1.0"
-dataset_path = r"F:\down\merged_Puffin_UnNatInstr_Lima.jsonl"
+dataset_path = r"F:\down\vsakoye\randoBS.jsonl"
 distributions_save_folder = r"F:\distilled"
 context_len = 2*1024
 #batch_size = 4 # How many conversations to process in parallel #TODO
@@ -118,7 +120,7 @@ save_sys_range = False
 save_user_range = False
 save_assistant_range = True
 crop_distr_to_size = 32000
-device = "cuda:0"
+device = "cuda:1"
 
 prompt_format = {
     'SYS_START': "<im_start>system\n",

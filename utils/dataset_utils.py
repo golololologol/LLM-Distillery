@@ -1,11 +1,13 @@
 import os
 import numpy as np
 import h5py
+import time
 import threading
 import queue
 import json
 import torch
 from transformers import AutoTokenizer
+from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
 
 class H5Writer:
     def __init__(self, save_folder: str):
@@ -20,7 +22,7 @@ class H5Writer:
         with h5py.File(self.save_path, 'a') as hdf_file:
             convo_count = 0
             while True:
-                item = self.queue.get()
+                item = self.queue.get(timeout=15)
                 if item is None:
                     break
                 dataset_name = f'convo_{convo_count}'
@@ -36,14 +38,18 @@ class H5Writer:
         self.thread.join()
 
 class H5Reader:
-    def __init__(self, model_path, device, empty_convo_ids=[], queue_size=2, timeout=15):
+    def __init__(self, model_path, device, empty_convo_ids=[], queue_size=2, timeout=15, shuffle=False):
         self.file_path = os.path.join(model_path, "distributions.hdf5")
         self.device = device
         self.timeout = timeout
         self.empty_convo_ids = empty_convo_ids
         self.queue = queue.Queue(maxsize=queue_size)
         self.stop_loading = threading.Event()
-        self.loading_thread = threading.Thread(target=self._load_data)
+        self.order_list = []
+        if shuffle:
+            self.loading_thread = threading.Thread(target=self._load_data_shuffled)
+        else:
+            self.loading_thread = threading.Thread(target=self._load_data)
         self.loading_thread.start()
 
     def _load_data(self):
@@ -58,10 +64,30 @@ class H5Reader:
                     tensor = torch.tensor(np.array(hdf_file[dataset_name]), device=self.device)
                     self.queue.put(tensor, timeout=self.timeout)
 
+    def _load_data_shuffled(self):
+        with h5py.File(self.file_path, 'r') as hdf_file:
+            while True:
+                while not self.order_list:
+                    if self.stop_loading.is_set():
+                        exit()
+                    time.sleep(0.05)
+                for id in self.order_list:
+                    if self.stop_loading.is_set():
+                        exit()
+                    if id in self.empty_convo_ids:
+                        continue
+                    dataset_name = f'convo_{id}'
+                    tensor = torch.tensor(np.array(hdf_file[dataset_name]), device=self.device)
+                    self.queue.put(tensor, timeout=self.timeout)
+                self.order_list = []
+
     def read_next(self) -> torch.Tensor:
         tensor = self.queue.get()
         self.queue.task_done()
         return tensor
+
+    def set_shuffle_order(self, order_list):
+        self.order_list = order_list
 
     def close(self):
         self.stop_loading.set()
@@ -75,25 +101,54 @@ def read_jsonl_lazy(file_path): # Generator to lazy read the dataset line-by-lin
                 data = json.loads(line)
                 yield data
 
-def good_encode(text: str, encode_special = True, replace_tokens = True, tokenizer=None, model_path="") -> torch.Tensor:
+def get_special_tokens(vocab_family):
+    if vocab_family == "LLAMA":
+        sp_toks = {
+            "bos": "<s>",
+            "bos_id": 1,
+            "eos": "</s>",
+            "eos_id": 2,
+            "pad": None,
+            "pad_id": None,
+            "unk": "<unk>",
+            "unk_id": 0
+        }
+    else:
+        raise NotImplementedError(f"{vocab_family} not yet supported")
+    return sp_toks
+
+def good_encode(text: str, sp_toks: dict, encode_special = True, replace_tokens = True, tokenizer=None, model_path="", device="cpu") -> torch.Tensor:
+    if replace_tokens:
+        text = text.replace('<bos>', sp_toks["bos"]).replace('<eos>', sp_toks["eos"])
     if tokenizer == None:
         tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
-    if replace_tokens:
-        text = text.replace('<bos>', tokenizer.bos_token).replace('<eos>', tokenizer.eos_token)
-    return tokenizer.encode("\n" + text, add_special_tokens=False, return_tensors="pt").squeeze(0)[2:] # type: ignore
 
-def encode_prompt_format(prompt_format: dict, tokenizer=None, model_path="") -> dict[str, torch.Tensor]:
+    if tokenizer.__class__.__name__ != "ExLlamaV2Tokenizer":
+        return tokenizer.encode("\n" + text, add_special_tokens=False, return_tensors="pt").to(device).squeeze(0)[2:] # type: ignore
+    else:
+        return tokenizer.encode("\n" + text, encode_special_tokens=encode_special).to(device).squeeze(0)[2:] # type: ignore
+
+def encode_prompt_format(prompt_format: dict, sp_toks: dict, tokenizer=None, model_path="", device="cpu") -> dict[str, torch.Tensor]:
     if tokenizer == None:
         tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
     for key, value in prompt_format.items():
-        prompt_format[key] = good_encode(value, tokenizer=tokenizer)
+        prompt_format[key] = good_encode(value, sp_toks, tokenizer=tokenizer, device=device)
     return prompt_format
 
 def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range):
     print("Tokenizing the dataset...")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
-    pf = encode_prompt_format(prompt_format, tokenizer)
+    try:
+        config = ExLlamaV2Config()
+        config.model_dir = model_path
+        config.prepare()
+        tokenizer = ExLlamaV2Tokenizer(config)
+    except:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
+
+    vocab_family = get_vocab_family(model_path=model_path)
+    sp_toks = get_special_tokens(vocab_family)
+    pf = encode_prompt_format(prompt_format, sp_toks, tokenizer=tokenizer, device=device)
 
     total_tokens = 0
     empty_convo_ids = []
@@ -101,9 +156,9 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, cont
     dataset_content_ranges = []
 
     for convo_id, item in enumerate(read_jsonl_lazy(dataset_path)):  # Every conversation
-        conversation_tokenized = torch.Tensor().to(device)
+        conversation_tokenized = torch.tensor([sp_toks["bos_id"]], dtype=torch.long, device=device)
         conversation_content_ranges = []
-        start_index = 0
+        start_index = 1
         num_turns = len(item["conversations"])
 
         if num_turns < 2:
@@ -117,7 +172,7 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, cont
 
         sys_content = item.get("init", "")
         if sys_content:
-            sys_content_tokenized = good_encode(sys_content.strip(), replace_tokens=False, encode_special=False, tokenizer=tokenizer)
+            sys_content_tokenized = good_encode(sys_content.strip(), sp_toks, replace_tokens=False, encode_special=False, tokenizer=tokenizer, device=device)
             sys_tokenized = torch.cat((pf['SYS_START'], sys_content_tokenized, pf['SYS_END']))
             conversation_tokenized = sys_tokenized
             if save_sys_range:
@@ -132,7 +187,7 @@ def tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, cont
 
             turn_start_tokenized = pf['ASSISTANT_START'] if assistant else pf['USER_START']
             turn_end_tokenized = pf['ASSISTANT_END'] if assistant else pf['USER_END']
-            turn_tokenized = good_encode(turn.strip(), replace_tokens=False, encode_special=False, tokenizer=tokenizer)
+            turn_tokenized = good_encode(turn.strip(), sp_toks, replace_tokens=False, encode_special=False, tokenizer=tokenizer, device=device)
 
             full_turn_tokenized = torch.cat((turn_start_tokenized, turn_tokenized, turn_end_tokenized))
             end_index = start_index + full_turn_tokenized.numel()
@@ -182,10 +237,12 @@ def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_
             content_decoded = tokenizer.decode(dataset_tokenized[0][content_start:content_end])
             first_content_decoded.append(content_decoded)
 
-    special_tokens = {tokenizer.unk_token, tokenizer.bos_token, tokenizer.eos_token, tokenizer.pad_token}
+    vocab_family = get_vocab_family(tokenizer)
+    sp_toks = get_special_tokens(vocab_family)
+
     all_added_tokens = tokenizer.get_added_vocab()
 
-    added_tokens_ids = [v for k, v in all_added_tokens.items() if k not in special_tokens]
+    added_tokens_ids = [v for k, v in all_added_tokens.items() if k not in sp_toks]
 
     vocab = {k: v for k, v in sorted(tokenizer.get_vocab().items(), key=lambda item: item[1])}
     
@@ -199,18 +256,20 @@ def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_
             "merged": False,
             "merged_models": [],
             "model_name": os.path.basename(os.path.normpath(model_path)),
-            "bos_id": tokenizer.bos_token_id,
-            "eos_id": tokenizer.eos_token_id,
-            "pad_id": tokenizer.pad_token_id,
-            "unk_id": tokenizer.unk_token_id,
+            "bos_id": sp_toks["bos_id"],
+            "eos_id": sp_toks["eos_id"],
+            "pad_id": sp_toks["pad_id"],
+            "unk_id": sp_toks["unk_id"],
             "added_tokens_ids": added_tokens_ids,
-            "vocab_family": get_vocab_family(tokenizer),
+            "vocab_family": vocab_family,
             "vocab": vocab
             }
     
     return metadata
 
-def get_vocab_family(tokenizer) -> str:
+def get_vocab_family(tokenizer=None, model_path="") -> str:
+    if tokenizer == None:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
     vocab_size_to_family = {
         30000: "GPT2",
         32000: {

@@ -4,7 +4,6 @@ import bitsandbytes as bnb
 import math
 
 def calculate_kl_divergence(student_logits, teacher_probs, temp=1, per_token=False):
-    #print(student_logits)
     student_log_probs = nn.functional.log_softmax(student_logits/temp, dim=-1)
     reduction = 'batchmean' if not per_token else 'sum'
     kl_div = nn.functional.kl_div(student_log_probs, teacher_probs, reduction=reduction)
@@ -13,7 +12,7 @@ def calculate_kl_divergence(student_logits, teacher_probs, temp=1, per_token=Fal
 def scale_temperature(current_step, num_training_steps, temperature):
     return temperature - (temperature - 1) * (current_step / num_training_steps)
 
-def set_optimizer(model_parameters, lr, grad_accum_steps, betas, optimizer_name: str):
+def set_optimizer(model_parameters, lr, grad_accum_steps, betas, optimizer_name: str, weight_decay=1e-2):
     optimizer_name = optimizer_name.lower()
     
     optimizer_classes = {
@@ -33,6 +32,6 @@ def set_optimizer(model_parameters, lr, grad_accum_steps, betas, optimizer_name:
     lr = lr * math.sqrt(grad_accum_steps)
     if optimizer_name in optimizer_classes:
         optimizer_class = optimizer_classes[optimizer_name]
-        return optimizer_class(model_parameters, lr=lr, betas=betas)
+        return optimizer_class(model_parameters, lr=lr, betas=betas, weight_decay=weight_decay)
     else:
         raise ValueError(f"Invalid optimizer name: {optimizer_name}\nAvailable optimizers: {list(optimizer_classes.keys())}")

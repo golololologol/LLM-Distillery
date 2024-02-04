@@ -1,12 +1,19 @@
+from gettext import find
 import torch
 import torch.nn as nn
 import numpy as np
 import torch
 from tqdm import tqdm
 import torch.nn.functional as F
+import math
+import os
+import threading
+import queue
+import h5py
 #import h5py
 #import queue
-from dataset_utils import H5Reader
+
+
 
 def calculate_kl_divergence(student_logits, teacher_probs, temp=1, per_token=True):
     student_log_probs = nn.functional.log_softmax(student_logits/temp, dim=-1)
@@ -47,14 +54,14 @@ def calculate_kl_divergence(student_logits, teacher_probs, temp=1, per_token=Tru
 #teacher_probs = nn.functional.softmax(torch.tensor(([0.0004, 10.3, 1.3], [1.0, 2.4, 3.5])), dim=-1)
 #loss = calculate_kl_divergence(student_logits, teacher_probs)
 
-content_ranges = [[0, 3], [5, 8]]
-tokens = [43, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-content_tokens = [tokens[start:end] for start, end in content_ranges]
-print(content_tokens)
+#content_ranges = [[0, 3], [5, 8]]
+#tokens = [43, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+#content_tokens = [tokens[start:end] for start, end in content_ranges]
+#print(content_tokens)
 #print([tokens[start:end] for start, end in content_ranges])
-content_indices = [i+1 for start, end in content_ranges for i in range(start, end)]
+#content_indices = [i+1 for start, end in content_ranges for i in range(start, end)]
 
-print(tokens[:content_indices[5]])
+#print(tokens[:content_indices[5]])
 
 #print(torch.tensor([0.00000004, 4, 1]).numel)
 #student_logits = torch.tensor([0.00000004, 4, 1])
@@ -62,3 +69,13 @@ print(tokens[:content_indices[5]])
 #student_probs_temp = student_probs ** (1 / temp)
 #student_probs_temp = student_probs_temp / torch.sum(student_probs_temp)
 #print(student_probs_temp)
+
+likes = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+dislikes = [6, 3, 2]
+filtered = [i for i in likes if i not in dislikes]
+correct = [i - sum(j < i for j in dislikes) for i in likes if i not in dislikes]
+print(filtered)
+print(correct)
+print(torch.randperm(6).tolist())
+print(torch.tensor((0, 45)))
+#[1, 3, 4, 2]

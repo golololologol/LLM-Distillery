@@ -32,27 +32,28 @@ model_path = r"C:\Users\gololo\Desktop\TinyLlama-1.1B-intermediate-step-1431k-3T
 dataset_path = r"F:\down\merged_Puffin_UnNatInstr_Lima.jsonl"
 distributions_path = r"F:\distilled\merged_Puffin_UnNatInstr_Lima\merged"
 save_folder = r"F:\trained"
-trained_model_name = "BallCrusher90005"
+trained_model_name = "BallCrusher900010"
 
 training = "full" # "full" "lora" "qlora"
 optimizer = "adamw32bit" # "adamw8bit" "adamw" "adagrad8bit" "sgd" "paged_adamw8bit"
 load_in_half = True
 context_length = 2*1024
-per_token_training = False
+shuffle_data = True
 grad_accumulation_steps = 1
-num_epochs = 5
+num_epochs = 10
 num_warmup_steps = 400
-lr = 3e-6
-lr_scheduler = "constant" # "cosine" "linear" "constant" "constant_with_warmup" "polynomial" "inverse_sqrt" "reduce_lr_on_plateau"
+lr = 1e-5
+lr_scheduler = "cosine" # "cosine" "linear" "constant" "constant_with_warmup" "polynomial" "inverse_sqrt" "reduce_lr_on_plateau"
 temperature = 1.0
 crop_distr_to_size = 32000
 device = "cuda:1"
 stop_at_convo = None
+save_every_n_epoch = 1
 
 prompt_format = {
-    'SYS_START': "#System: ",
-    'USER_START': "#User: ",
-    'ASSISTANT_START': "#Assistant: ",
+    'SYS_START': "#System:\n",
+    'USER_START': "#User:\n",
+    'ASSISTANT_START': "#Assistant:\n",
     'SYS_END': '\n',
     'USER_END': '\n',
     'ASSISTANT_END': '<eos>\n' # Use <eos> and <bos> for model-specific special tokens
@@ -73,9 +74,10 @@ if distr_metadata is not None:
         distr_metadata['save_sys_range'], distr_metadata['save_user_range'], 
         distr_metadata['save_assistant_range'])
     
-    student_metadata = {**{'crop_to_size': crop_distr_to_size}, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges)}
-
     empty_convo_ids = list(set(distr_metadata.get('empty_convo_ids', []) + empty_convo_ids))
+    
+    student_metadata = {**{'crop_to_size': crop_distr_to_size}, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges, empty_convo_ids=empty_convo_ids)}
+
     dataset_tokenized, dataset_content_ranges = filter_empty_conversations(dataset_tokenized, dataset_content_ranges, empty_convo_ids)
 
     save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, student_metadata, trained_model_folder)
@@ -90,11 +92,13 @@ if distr_metadata is not None:
         "distributions_path": distributions_path,
         "empty_convo_ids": empty_convo_ids,
         "training_type": training,
+        "save_interval": save_every_n_epoch,
         "load_in_half": load_in_half,
-        "per_token_training": per_token_training,
+        "shuffle_data": shuffle_data,
         "optimizer_name": optimizer,
         "context_length": context_length,
         "stop_at_convo": stop_at_convo,
+        "full_dataset_len": distr_metadata["dataset_len"],
         "grad_accum_steps": grad_accumulation_steps,
         "num_epochs": num_epochs,
         "num_warmup_steps": num_warmup_steps,
