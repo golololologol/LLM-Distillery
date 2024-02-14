@@ -18,8 +18,8 @@ def check_errors(model_folders_paths: list):
                
 def merge_and_save_probs(model_folders: list, device: str, output_folder: str):
     print("Initializing merging...")
-    readers = [H5Reader(folder, device) for folder in model_folders]
-    writer = H5Writer(output_folder)
+    readers = [H5Reader(folder, device, timeout=90) for folder in model_folders]
+    writer = H5Writer(output_folder, timeout=90)
 
     model_metadatas = [load_metadata(model_folder) for model_folder in model_folders]
 
@@ -58,7 +58,7 @@ def merge_and_save_probs(model_folders: list, device: str, output_folder: str):
 
 
 # Parameters
-distributions_folders_path = r"F:\distilled\merged_Puffin_UnNatInstr_Lima"
+distributions_folders_path = r"F:\distilled\soup"
 device = "cuda:0"
 
 model_folders = [os.path.join(distributions_folders_path, model_name) 

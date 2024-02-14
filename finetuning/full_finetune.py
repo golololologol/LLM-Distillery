@@ -3,14 +3,13 @@ import torch
 import os
 import subprocess
 from datetime import datetime
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import tqdm
-from utils.finetuning_utils import calculate_kl_divergence, set_optimizer, scale_temperature
+from utils.finetuning_utils import calculate_kl_divergence, set_optimizer, scale_temperature, set_lr_scheduler
 from utils.dataset_utils import H5Reader
 
-def save_intermediate(model, model_path, save_folder, epoch):
-    model_name = os.path.basename(os.path.normpath(model_path))
+def save_model(model, model_path, model_name, save_folder, epoch):
     save_folder = os.path.join(save_folder, f"{model_name}_epoch_{epoch}")
     model.save_pretrained(save_folder)
     tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -30,19 +29,20 @@ def full_finetune(params):
         model.parameters(), 
         lr=params["lr"],
         grad_accum_steps=grad_accum_steps,
-        betas=(0.8, 0.999),
+        betas=(0.9, 0.999),
         optimizer_name=params["optimizer_name"],
-        weight_decay=2e-2
+        weight_decay=6e-5
     )
 
     dataset_len = len(params["dataset_tokenized"])
     num_training_steps = params["num_epochs"] * dataset_len if not params["stop_at_convo"] else params["stop_at_convo"]
     num_grad_updates = math.ceil(num_training_steps / grad_accum_steps)
-    lr_scheduler = get_scheduler(
-        name=params["lr_scheduler_name"].lower(),
-        optimizer=optimizer, 
+    lr_scheduler = set_lr_scheduler(
+        optimizer, 
+        lr_scheduler_name=params["lr_scheduler_name"], 
         num_warmup_steps=params["num_warmup_steps"], 
-        num_training_steps=num_grad_updates
+        num_training_steps=num_training_steps, 
+        num_epoch_steps=dataset_len
     )
 
     print(f"Num Gradient Updates: {num_grad_updates}")
@@ -82,33 +82,35 @@ def full_finetune(params):
 
         recent_losses.append(loss.item())
         if (step + 1) % grad_accum_steps == 0:
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad()
+            optimizer.step() # type: ignore
+            optimizer.zero_grad() # type: ignore
             updated = True
-        
+
+        lr_scheduler.step() # type: ignore
+
         if len(recent_losses) > 100:
             recent_losses.pop(0)
         avg_loss = sum(recent_losses) / len(recent_losses)
 
         logger.add_scalar('Loss/train', loss.item(), step)
-        logger.add_scalar('Learning Rate', lr_scheduler.get_last_lr()[0], step)
+        logger.add_scalar('Learning Rate', lr_scheduler.get_last_lr()[0], step) # type: ignore
         logger.add_scalar('Temperature', temp, step)
 
-        pbar.set_postfix({"Epoch": f"{(step+1) / dataset_len:.2f}/{params['num_epochs']}", "Loss": avg_loss, "LR": lr_scheduler.get_last_lr()[0]})
+        pbar.set_postfix({"Epoch": f"{(step+1) / dataset_len:.2f}/{params['num_epochs']}", "Loss": avg_loss, "LR": lr_scheduler.get_last_lr()[0]}) # type: ignore
         pbar.update()
         
-        if (step + 1) % (params["save_interval"] * dataset_len) == 0:
-            save_intermediate(model, params["model_path"], params["save_folder"], (step + 1) // dataset_len)
+        if ((step + 1) % (params["save_interval"] * dataset_len) == 0) and (step + 1) != num_training_steps:
+            save_model(model, params["model_path"], params["model_name"], params["save_folder"], (step + 1) // dataset_len)
 
     if not updated:
-        optimizer.step()
+        optimizer.step() # type: ignore
 
+    save_model(model, params["model_path"], params["model_name"], params["save_folder"], "final")
     logger.close()
     pbar.close()
     teacher.close()
     tensorboard_process.terminate()
 
-    save_intermediate(model, params["model_path"], params["save_folder"], "final")
+    
     
     print(f"Model successfully saved at {params['save_folder']}")

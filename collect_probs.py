@@ -1,5 +1,8 @@
+from calendar import c
 import os
+from sympy import content
 import torch
+import copy
 import torch.nn.functional as F
 from transformers import AutoTokenizer
 from tqdm import tqdm
@@ -7,7 +10,7 @@ from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from utils.dataset_utils import H5Writer, save_dataset_and_metadata, \
     tokenize_dataset, generate_metadata, save_metadata, \
     good_encode, encode_prompt_format, save_sorted_dataset,\
-    get_special_tokens, get_vocab_family
+    get_special_tokens, get_vocab_family, filter_empty_conversations
 from utils.convert_to_safetensor import convert_model
 @torch.inference_mode()
 
@@ -30,7 +33,7 @@ def load_model(model_path: str, context_len: int, chunk_size: int, chunk_size_to
 def is_model_safetensors(model_path: str):
     if os.path.isdir(model_path):
         for file in os.listdir(model_path):
-            if file.endswith('.safetensors') and file.startswith('model'):
+            if file.endswith('.safetensors'):
                 return True
         return False
     
@@ -52,83 +55,125 @@ def run_test_inference(model: ExLlamaV2, prompt_format, model_path, device, text
 
     print(f"Input:\n{context_tokens}\nPredicted Next Tokens:\n{next_tokens}")
 
+def eval_ppl(ppl_dataset_path, model, model_path, device, context_len, prompt_format):
+    dataset_tokenized = []
+    empty_convo_ids = []
+    ppl_list = []
+    tokens_used = 0
+    
+    dataset_tokenized, dataset_content_ranges, empty_convo_ids = tokenize_dataset(ppl_dataset_path, device, model_path, prompt_format, context_len, False, False, True, print_stats=False)
+    dataset_tokenized, dataset_content_ranges = filter_empty_conversations(dataset_tokenized, dataset_content_ranges, empty_convo_ids)
+    pbar = tqdm(zip(dataset_tokenized, dataset_content_ranges), desc="Calculating PPL", unit="convo", smoothing=0.06, leave=False)
+    ppl_intermediate = torch.empty(len(dataset_tokenized), device=device)
 
-def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, metadata, empty_convo_ids, clip_to_size):
-    TOKEN_DISTRIBUTION_SIZE_KB = 0.001953125 * clip_to_size
-    approx_size = round((metadata['total_content_tokens'] * TOKEN_DISTRIBUTION_SIZE_KB) / 1000000, 2)
+    for i, (conv_tokenized, conv_content_ranges) in enumerate(pbar):
+        conv_tokenized_gpu = conv_tokenized.to(device)[:context_len]
+        conv_distributions = -F.log_softmax(model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0), dim=1).to(device)
+        content_indices = []
+        for start, end in conv_content_ranges:
+            if start < context_len:
+                content_indices.append(torch.arange(start, min(end, context_len), device=device))
+
+        content_indices = torch.cat(content_indices)
+        content_distributions = conv_distributions.index_select(0, content_indices)
+        conv_content_tokens = conv_tokenized_gpu.index_select(0, content_indices)
+        gathered_log_probs = torch.gather(content_distributions[:-1], 1, conv_content_tokens[1:].unsqueeze(-1)).squeeze(-1)
+        ppl_intermediate[i] = torch.exp(gathered_log_probs.mean())
+        tokens_used += content_distributions.size(0) - 1
+        pbar.set_postfix({"Tokens used": tokens_used})
+    
+    pbar.close()
+    ppl_list = ppl_intermediate.to('cpu').tolist()
+    ppl = sum(ppl_list) / len(ppl_list)
+    print("Preliminary PPL:", round(ppl, 6), "Tokens used:", tokens_used)
+
+@profile
+def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, metadata, empty_convo_ids, crop_to_size):
+    distribution_size = 0.001953125 * crop_to_size
+    approx_size = round((metadata['clean_total_content_tokens'] * distribution_size) / 1000000, 2)
     print(f"Approximate size of the final distributions: {approx_size}GB")
 
-    def modify_distributions(model_output: torch.Tensor, conversation_tokenized: torch.Tensor) -> torch.Tensor:
-        model_output = F.softmax(model_output, dim=1)
-        for i in range(conversation_tokenized.size(0) - 1):
-            next_token = conversation_tokenized[i + 1]
-            current_distribution = model_output[i]
-            if next_token == eos_token_id:
-                current_distribution[eos_token_id] = torch.max(current_distribution) * next_token_prob_boost
-            else:
-                if set_max_token_prob:
-                    current_distribution[next_token] = torch.max(current_distribution) * next_token_prob_boost
-        
-        model_output = model_output / model_output.sum(dim=-1, keepdim=True)
-        return model_output
-
-    def process_conversation(conversation_tokenized: torch.Tensor, conversation_content_ranges: list):
-        conv_tokenized_gpu = conversation_tokenized.to(device)[:context_len]
-        conv_distributions = model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0)[:, :clip_to_size]
-        conv_distributions = modify_distributions(conv_distributions, conv_tokenized_gpu)
-        conv_distributions_cpu = conv_distributions.to("cpu")
-        return [conv_distributions_cpu[start:end] for start, end in conversation_content_ranges]
-
     total_saved_tokens = 0
-    eos_token_id = metadata['eos_id']
-    writer = H5Writer(save_folder)
+    eos_id = metadata['eos_id']
+    writer = H5Writer(save_folder, timeout=90)
+    ppl_intermediate = torch.full((len(dataset_tokenized),), -1, device=device, dtype=torch.float32)
+    
+    def get_content_indices(content_ranges, context_len):
+        content_indices = []
+        for start, end in content_ranges:
+            if start < context_len:
+                content_indices.append(torch.arange(start, min(end, context_len), device=device))
+        return torch.cat(content_indices)
 
-    for conv_id, (conversation_tokenized, conversation_content_ranges) in enumerate(tqdm(zip(dataset_tokenized, dataset_content_ranges), desc="Generating Distributions", unit="convo", total=len(dataset_tokenized), smoothing=0.06)):
+    for conv_id, (conv_tokenized, conv_content_ranges) in enumerate(tqdm(zip(dataset_tokenized, dataset_content_ranges), desc="Generating Distributions", unit="convo", total=len(dataset_tokenized), smoothing=0.06)):
         if conv_id in empty_convo_ids:
-            conversation_content_distributions = torch.tensor([], device=device)
-            writer.write_data(conversation_content_distributions)
+            writer.write_data(torch.tensor([], device=device))
             continue
 
-        content_distributions = process_conversation(conversation_tokenized, conversation_content_ranges)
-        conversation_content_distributions = torch.cat(content_distributions, dim=0)
+        conv_tokenized_gpu = conv_tokenized.to(device)[:context_len]
+        conv_distributions = F.log_softmax(model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0), dim=1).to(device)
 
-        total_saved_tokens += conversation_content_distributions.size(0)
+        content_indices = get_content_indices(conv_content_ranges, context_len)
+        conv_content_distributions = conv_distributions.index_select(0, content_indices)
+        conv_content_tokens = conv_tokenized_gpu.index_select(0, content_indices)
+        gathered_probs = conv_content_distributions[-1:].gather(1, conv_content_tokens[-1:].unsqueeze(-1)).squeeze(-1)
+        ppl_intermediate[conv_id] = torch.exp(-gathered_probs.mean())
 
-        writer.write_data(conversation_content_distributions)
+        if encourage_eos:
+            for start, end in conv_content_ranges:
+                end = end - 1
+                if end > conv_content_distributions.size(0):
+                    break
+                conv_content_distributions[end][eos_id] = torch.max(conv_content_distributions[end]) * 1.1
+                conv_content_distributions[end] = conv_content_distributions[end] / conv_content_distributions[end].sum()
+
+        total_saved_tokens += conv_content_distributions.size(0)
+        writer.write_data(conv_content_distributions[:, :crop_to_size])
+
     writer.close()
-    print(f"Total saved tokens: {total_saved_tokens}")
+    perplexity_list = ppl_intermediate.to('cpu').tolist()
 
+    distributions_metadata = {
+        'avg_perplexity': sum(perplexity_list) / len([ppl for ppl in perplexity_list if ppl != -1]),
+        'total_saved_tokens': total_saved_tokens,
+        'perplexity_list': perplexity_list,
+    }
+    
+    print(f"Total saved tokens: {total_saved_tokens}")
+    return distributions_metadata
+    
 
 # Main Script
-model_path = r"C:\Users\gololo\Desktop\text-generation-webui-main\models\DarkForest-20B-v1.0"
-dataset_path = r"F:\down\vsakoye\randoBS.jsonl"
+model_path = r"C:\Users\gololo\Desktop\text-generation-webui-main\models\MegaDolphin-120b-2.9bpw-h6-exl2"
+dataset_path = r"F:\good_soup.jsonl"
+ppl_dataset_path = r"F:\ppl_test_dataset.jsonl"
 distributions_save_folder = r"F:\distilled"
 context_len = 2*1024
 #batch_size = 4 # How many conversations to process in parallel #TODO
-chunk_size = 4 # How many `chunk_size_tokens` chunks to process in parallel
-chunk_size_tokens = 2*1024
-
-set_max_token_prob = False # Set the probability of the next token to the max logit in the distribution
-next_token_prob_boost = 1.15 # Boost the probability of the next token by this factor
-sort = False # Sort by length, stops Vram spikes for some reason. Top - longest, Bottom - shortest
+chunk_size = 2 # How many `chunk_size_tokens` chunks to process in parallel
+chunk_size_tokens = 1*1024
 
 only_get_metadata = False # Won't load the model
 test_inference = False
+test_tokenization = False
+test_ppl = False
 
 # Model settings
 save_sys_range = False
 save_user_range = False
 save_assistant_range = True
+add_bos = True
+encourage_eos = True
 crop_distr_to_size = 32000
 device = "cuda:1"
 
 prompt_format = {
-    'SYS_START': "<im_start>system\n",
-    'USER_START': "<im_start>user\n",
-    'ASSISTANT_START': "<im_start>assistant\n",
-    'SYS_END': '\n<im_end>\n',
-    'USER_END': '\n<im_end>\n',
-    'ASSISTANT_END': '\n<im_end>\n' # Use <eos> and <bos> for model-specific special tokens
+    'SYS_START': "<|im_start|>system\n",
+    'USER_START': "<|im_start|>user\n",
+    'ASSISTANT_START': "<|im_start|>assistant\n",
+    'SYS_END': '<|im_end|>\n',
+    'USER_END': '<|im_end|>\n',
+    'ASSISTANT_END': '<|im_end|>\n'
 }
 
 model_name = os.path.basename(os.path.normpath(model_path))
@@ -141,14 +186,12 @@ if not os.path.exists(save_folder):
     os.makedirs(save_folder)
 
 config_data = {
-    'sorted': sort,
     'save_sys_range': save_sys_range,
     'save_user_range': save_user_range,
     'save_assistant_range': save_assistant_range,
     'context_len': context_len,
     'crop_to_size': crop_distr_to_size,
-    'next_token_prob_boost': next_token_prob_boost if set_max_token_prob else 1,
-    'set_max_token_prob': set_max_token_prob
+    'prompt_format': copy.deepcopy(prompt_format)
 }
 
 if only_get_metadata:
@@ -156,25 +199,37 @@ if only_get_metadata:
     save_sorted_dataset(save_folder, dataset_path)
     save_metadata(metadata, save_folder)
     print("Metadata saved!")
-else:
-    if not is_model_safetensors(model_path):
-        safetens_path = model_path + "_safetensors"
-        if os.path.exists(safetens_path):
-            model_path = safetens_path
-        else:
-            model_path = convert_model(model_path)
+    exit(0)
 
-    model = load_model(model_path, context_len, chunk_size, chunk_size_tokens)
-
-    if test_inference:
-        run_test_inference(model, prompt_format, model_path, device, text="Hey there, my name is")
-        exit(0)
-
-    if sort: save_sorted_dataset(save_folder, dataset_path)
-
-    dataset_tokenized, dataset_content_ranges, empty_convo_ids = tokenize_dataset(dataset_path, device, sort, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range)
-    metadata = {**config_data, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges, empty_convo_ids=empty_convo_ids)}
+if test_tokenization:
+    dataset_tokenized, dataset_content_ranges, empty_convo_ids = tokenize_dataset(dataset_path, device, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range, add_bos=add_bos)
+    metadata = {**config_data, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges, empty_convo_ids=empty_convo_ids, context_len=context_len)}
     save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
+    exit(0)
 
-    generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, metadata, empty_convo_ids, crop_distr_to_size)
-    print("Done!")
+if not is_model_safetensors(model_path):
+    safetens_path = model_path + "_safetensors"
+    if os.path.exists(safetens_path):
+        model_path = safetens_path
+    else:
+        model_path = convert_model(model_path)
+
+model = load_model(model_path, context_len, chunk_size, chunk_size_tokens)
+
+if test_inference:
+    run_test_inference(model, prompt_format, model_path, device, text="Hey there, my name is")
+    exit(0)
+
+if test_ppl:
+    eval_ppl(ppl_dataset_path, model, model_path, device, context_len, prompt_format)
+    exit(0)
+
+eval_ppl(ppl_dataset_path, model, model_path, device, context_len, prompt_format)
+dataset_tokenized, dataset_content_ranges, empty_convo_ids = tokenize_dataset(dataset_path, device, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range, add_bos=add_bos)
+metadata = {**config_data, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges, empty_convo_ids=empty_convo_ids, context_len=context_len)}
+save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
+
+distributions_metadata = generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, metadata, empty_convo_ids, crop_distr_to_size, )
+metadata = {**config_data, **distributions_metadata, **generate_metadata(model_path, dataset_tokenized, dataset_content_ranges, empty_convo_ids=empty_convo_ids, context_len=context_len)}
+save_dataset_and_metadata(dataset_tokenized, dataset_content_ranges, metadata, save_folder)
+print("Done!")

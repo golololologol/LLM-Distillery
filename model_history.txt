@@ -1,3 +1,4 @@
+SanjiWatsuki/Kunoichi-7B: Mistral
 ChuckMcSneed/WinterGoliath-123b: LLAMA
 cognitivecomputations/MegaDolphin-120b: LLAMA
 Sao10K/WinterGoddess-1.4x-70B-L2: LLAMA

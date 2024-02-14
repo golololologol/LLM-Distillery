@@ -29,10 +29,10 @@ def finetune(parameters: dict):
 
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\TinyLlama-1.1B-intermediate-step-1431k-3T"
-dataset_path = r"F:\down\merged_Puffin_UnNatInstr_Lima.jsonl"
-distributions_path = r"F:\distilled\merged_Puffin_UnNatInstr_Lima\merged"
+dataset_path = r"F:\soup.jsonl"
+distributions_path = r"F:\distilled\soup\merged"
 save_folder = r"F:\trained"
-trained_model_name = "BallCrusher900010"
+trained_model_name = "BallCrusher9000v4"
 
 training = "full" # "full" "lora" "qlora"
 optimizer = "adamw32bit" # "adamw8bit" "adamw" "adagrad8bit" "sgd" "paged_adamw8bit"
@@ -40,13 +40,13 @@ load_in_half = True
 context_length = 2*1024
 shuffle_data = True
 grad_accumulation_steps = 1
-num_epochs = 10
-num_warmup_steps = 400
-lr = 1e-5
-lr_scheduler = "cosine" # "cosine" "linear" "constant" "constant_with_warmup" "polynomial" "inverse_sqrt" "reduce_lr_on_plateau"
-temperature = 1.0
+num_epochs = 20
+num_warmup_steps = 1000
+lr = 6e-6
+lr_scheduler = "cosine_anneal" # "cosine" "linear" "constant" "constant_with_warmup" "polynomial" "inverse_sqrt" "step" "cosine_anneal" "one_cycle"
+temperature = 1
 crop_distr_to_size = 32000
-device = "cuda:1"
+device = "cuda:0"
 stop_at_convo = None
 save_every_n_epoch = 1
 
@@ -56,7 +56,7 @@ prompt_format = {
     'ASSISTANT_START': "#Assistant:\n",
     'SYS_END': '\n',
     'USER_END': '\n',
-    'ASSISTANT_END': '<eos>\n' # Use <eos> and <bos> for model-specific special tokens
+    'ASSISTANT_END': '\n' # Use <eos> and <bos> for model-specific special tokens
 }
 
 trained_model_folder = os.path.join(save_folder, trained_model_name)
@@ -70,7 +70,7 @@ print(f"Context Len: {context_length}, Num Epochs: {num_epochs}, Num Warmup Step
 
 if distr_metadata is not None:
     dataset_tokenized, dataset_content_ranges, empty_convo_ids = tokenize_dataset(
-        dataset_path, device, distr_metadata['sorted'], model_path, prompt_format, context_length, 
+        dataset_path, device, model_path, prompt_format, context_length, 
         distr_metadata['save_sys_range'], distr_metadata['save_user_range'], 
         distr_metadata['save_assistant_range'])
     
@@ -86,6 +86,7 @@ if distr_metadata is not None:
 
     parameters = {
         "model_path": model_path,
+        "model_name": trained_model_name,
         "save_folder": trained_model_folder,
         "dataset_tokenized": dataset_tokenized,
         "dataset_content_ranges": dataset_content_ranges,

@@ -1,4 +1,3 @@
-from gettext import find
 import torch
 import torch.nn as nn
 import numpy as np
@@ -10,8 +9,7 @@ import os
 import threading
 import queue
 import h5py
-#import h5py
-#import queue
+from exllamav2 import ExLlamaV2Config, ExLlamaV2Tokenizer
 
 
 
@@ -70,12 +68,21 @@ def calculate_kl_divergence(student_logits, teacher_probs, temp=1, per_token=Tru
 #student_probs_temp = student_probs_temp / torch.sum(student_probs_temp)
 #print(student_probs_temp)
 
-likes = [0, 1, 2, 3, 4, 5, 6, 7, 8]
-dislikes = [6, 3, 2]
-filtered = [i for i in likes if i not in dislikes]
-correct = [i - sum(j < i for j in dislikes) for i in likes if i not in dislikes]
-print(filtered)
-print(correct)
-print(torch.randperm(6).tolist())
-print(torch.tensor((0, 45)))
+#likes = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+#dislikes = [6, 3, 2]
+#filtered = [i for i in likes if i not in dislikes]
+#correct = [i - sum(j < i for j in dislikes) for i in likes if i not in dislikes]
+#print(filtered)
+#print(correct)
+#print(torch.randperm(6).tolist())
+#print(torch.tensor((0, 45)))
 #[1, 3, 4, 2]
+
+
+list = [0, 1, 2, 3, 4, 5, 6]
+for i in list[:4]:
+    print(i)
+
+#tensor = torch.tensor(([0.0004, 10.1, 1.2], [1.5, 2.3, 3.4]))
+#print(F.softmax(tensor, dim=-1))
+#print(torch.exp(F.log_softmax(tensor, dim=0)))
