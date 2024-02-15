@@ -6,16 +6,19 @@ import threading
 import queue
 import json
 import torch
+import logging
 from transformers import AutoTokenizer
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
+logging.getLogger("transformers").setLevel(logging.ERROR)  # Shut up transformers
+logging.getLogger("torch").setLevel(logging.ERROR) # And pytorch for good measure
 
 class H5Writer:
-    def __init__(self, save_folder: str, timeout=15):
+    def __init__(self, save_folder: str, timeout=15, queue_size=2):
         self.save_path = os.path.join(save_folder, "distributions.hdf5")
         if os.path.exists(self.save_path):
             os.remove(self.save_path)
         self.timeout = timeout
-        self.queue = queue.Queue(maxsize=2)
+        self.queue = queue.Queue(maxsize=queue_size)
         self.thread = threading.Thread(target=self._save_to_hdf5_thread)
         self.thread.start()
         
@@ -27,12 +30,12 @@ class H5Writer:
                 if item is None:
                     break
                 dataset_name = f'convo_{convo_count}'
-                hdf_file.create_dataset(dataset_name, data=item)
+                hdf_file.create_dataset(dataset_name, data=item.to('cpu'))
                 convo_count += 1
                 self.queue.task_done()
             
     def write_data(self, data: torch.Tensor):
-        self.queue.put(data.to('cpu'))
+        self.queue.put(data)
 
     def close(self):
         self.queue.put(None)
@@ -121,6 +124,7 @@ def get_special_tokens(vocab_family):
         raise NotImplementedError(f"{vocab_family} not yet supported")
     return sp_toks
 
+@torch.inference_mode()
 def good_encode(text: str, sp_toks: dict, encode_special = True, replace_tokens = True, tokenizer=None, model_path="", device="cpu") -> torch.Tensor:
     if replace_tokens:
         text = text.replace('<bos>', sp_toks["bos"]).replace('<eos>', sp_toks["eos"])
@@ -142,6 +146,7 @@ def encode_prompt_format(prompt_format: dict, sp_toks: dict, tokenizer=None, mod
         prompt_format[key] = good_encode(value, sp_toks, tokenizer=tokenizer, device=device)
     return prompt_format
 
+@torch.inference_mode()
 def tokenize_dataset(dataset_path, device, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range, add_bos=True, print_stats=True) -> tuple[list[torch.Tensor], list[list[tuple[int, int]]], list[int]]:
     if print_stats:
         print("Tokenizing the dataset...")
@@ -230,7 +235,7 @@ def tokenize_dataset(dataset_path, device, model_path, prompt_format, context_le
 
     if print_stats:
         print(f"Total processed tokens: {total_tokens}")
-        print(f"Total content tokens saved: {sum([range[1] - range[0] for ranges in dataset_content_ranges for range in ranges])}")
+        print(f"Total content tokens: {sum([range[1] - range[0] for ranges in dataset_content_ranges for range in ranges])}")
     return dataset_tokenized, dataset_content_ranges, empty_convo_ids
 
 def generate_metadata(model_path: str, dataset_tokenized: list, dataset_content_ranges: list, empty_convo_ids=[], context_len=2048) -> dict:

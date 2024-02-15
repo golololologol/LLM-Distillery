@@ -1,3 +1,4 @@
+from sympy import content
 import torch
 import torch.nn as nn
 import numpy as np
@@ -79,10 +80,27 @@ def calculate_kl_divergence(student_logits, teacher_probs, temp=1, per_token=Tru
 #[1, 3, 4, 2]
 
 
-list = [0, 1, 2, 3, 4, 5, 6]
-for i in list[:4]:
-    print(i)
-
+#list = [0, 1, 2, 3, 4, 5, 6]
+#for i in list[:4]:
+    #print(i)
+#print([256 * 1536**2] + [0] * (2 - 1))
 #tensor = torch.tensor(([0.0004, 10.1, 1.2], [1.5, 2.3, 3.4]))
 #print(F.softmax(tensor, dim=-1))
 #print(torch.exp(F.log_softmax(tensor, dim=0)))
+content_ranges = [[0, 3], [5, 8], [9, 10], [11, 14]]
+tokens = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+print([tokens[end - 1] for start, end in content_ranges]) # [2, 7, 9, 13]
+content_tokens = [token for start, end in content_ranges for token in tokens[start:end]]
+print(content_tokens) # [0, 1, 2, 5, 6, 7, 9, 11, 12, 13]
+max_len = 10
+content_ends = []
+
+current_id = -1
+for start, end in content_ranges:
+    if end > max_len:
+        break
+    content_ends.append(((end - start)) + current_id)
+    current_id = content_ends[-1]
+
+print(content_ends) # [2, 5, 6]
+print([content_tokens[end] for end in content_ends]) # [2, 7, 9] 
