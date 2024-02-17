@@ -66,6 +66,15 @@ class H5Reader:
                     if i in self.empty_convo_ids:
                         continue
                     tensor = torch.tensor(np.array(hdf_file[dataset_name]), device=self.device)
+                    time_left = self.timeout
+                    while self.queue.qsize() >= self.queue.maxsize - 1:
+                        if self.stop_loading.is_set():
+                            return
+                        time.sleep(0.05)
+                        time_left -= 0.05
+                        if time_left <= 0:
+                            return
+
                     self.queue.put(tensor, timeout=self.timeout)
 
     def _load_data_shuffled(self):
@@ -124,7 +133,6 @@ def get_special_tokens(vocab_family):
         raise NotImplementedError(f"{vocab_family} not yet supported")
     return sp_toks
 
-@torch.inference_mode()
 def good_encode(text: str, sp_toks: dict, encode_special = True, replace_tokens = True, tokenizer=None, model_path="", device="cpu") -> torch.Tensor:
     if replace_tokens:
         text = text.replace('<bos>', sp_toks["bos"]).replace('<eos>', sp_toks["eos"])
@@ -146,7 +154,6 @@ def encode_prompt_format(prompt_format: dict, sp_toks: dict, tokenizer=None, mod
         prompt_format[key] = good_encode(value, sp_toks, tokenizer=tokenizer, device=device)
     return prompt_format
 
-@torch.inference_mode()
 def tokenize_dataset(dataset_path, device, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range, add_bos=True, print_stats=True) -> tuple[list[torch.Tensor], list[list[tuple[int, int]]], list[int]]:
     if print_stats:
         print("Tokenizing the dataset...")

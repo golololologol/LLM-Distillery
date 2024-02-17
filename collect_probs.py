@@ -27,7 +27,7 @@ def load_model(model_path: str, context_len: int, chunk_size: int, chunk_size_to
     model = ExLlamaV2(config)
     cache = ExLlamaV2Cache(model, lazy=True)
 
-    model.load_autosplit(cache, reserve_vram=[192 * 2048**2, 128 * 1024**2])
+    model.load_autosplit(cache, reserve_vram=[256 * 2048**2, 128 * 1024**2])
     return model
 
 def is_model_safetensors(model_path: str):
@@ -94,7 +94,7 @@ def eval_ppl(ppl_dataset_path, model, model_path, device, context_len, prompt_fo
     print("Preliminary PPL:", round(ppl, 6), "Tokens used:", tokens_used)
 
 @torch.inference_mode()
-def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model, metadata, empty_convo_ids, crop_to_size):
+def generate_probability_distributions(dataset_tokenized, dataset_content_ranges, model: ExLlamaV2, metadata, empty_convo_ids, crop_to_size):
     distribution_size_kb = 0.001953125 * crop_to_size
     approx_size = round((metadata['clean_total_content_tokens'] * distribution_size_kb) / 1000000, 2)
     print(f"Approximate size of the final distributions: {approx_size}GB")
@@ -102,7 +102,7 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
     total_saved_tokens = 0
     eos_id = metadata['eos_id']
     writer = H5Writer(save_folder, timeout=30)
-    ppl_intermediate = torch.full((len(dataset_tokenized),), -1, device=device, dtype=torch.float32)
+    ppl_intermediate = torch.full((len(dataset_tokenized),), -1, device=device, dtype=torch.float16)
     start_time = time()
     
     def get_content_indices(content_ranges, context_len):
@@ -121,7 +121,7 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
         conv_tokenized_gpu = conv_tokenized.to(device)[:context_len]
         conv_tokens = conv_tokenized_gpu.numel()
 
-        conv_distributions = model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0)
+        conv_distributions = model.forward(conv_tokenized_gpu.unsqueeze(0)).squeeze(0) # type: ignore
         conv_distributions = F.log_softmax(conv_distributions, dim=1)
         
         content_indices = get_content_indices(conv_content_ranges, context_len)
@@ -168,8 +168,8 @@ def generate_probability_distributions(dataset_tokenized, dataset_content_ranges
     return distributions_metadata
 
 # Main Script
-model_path = r"C:\Users\gololo\Desktop\text-generation-webui-main\models\MegaDolphin-120b-2.9bpw-h6-exl2"
-dataset_path = r"F:\test.jsonl"
+model_path = r"F:\MythoMax-L2-Kimiko-v2-13b"
+dataset_path = r"F:\soup.jsonl"
 ppl_dataset_path = r"F:\ppl_test_dataset.jsonl"
 distributions_save_folder = r"F:\distilled"
 context_len = 2*1024
@@ -178,8 +178,8 @@ chunk_size = 4 # How many `chunk_size_tokens` chunks to process in parallel
 chunk_size_tokens = 1*512
 
 only_get_metadata = False # Won't load the model
-test_inference = False
 test_tokenization = False
+test_inference = False
 test_ppl = False
 ppl_before_start = True
 reuse_prompt_format = True
@@ -194,12 +194,12 @@ crop_distr_to_size = 32000
 device = "cuda:1"
 
 prompt_format = {
-    'SYS_START': "<|im_start|>system\n",
-    'USER_START': "<|im_start|>user\n",
-    'ASSISTANT_START': "<|im_start|>assistant\n",
-    'SYS_END': '<|im_end|>\n',
-    'USER_END': '<|im_end|>\n',
-    'ASSISTANT_END': '<|im_end|>\n'
+    'SYS_START': "### System:\n",
+    'USER_START': "### User:\n",
+    'ASSISTANT_START': "### Assistant:\n",
+    'SYS_END': '\n',
+    'USER_END': '\n',
+    'ASSISTANT_END': '\n'
 }
 
 

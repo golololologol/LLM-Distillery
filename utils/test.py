@@ -12,12 +12,12 @@ import queue
 import h5py
 from exllamav2 import ExLlamaV2Config, ExLlamaV2Tokenizer
 
-
-
-def calculate_kl_divergence(student_logits, teacher_probs, temp=1, per_token=True):
-    student_log_probs = nn.functional.log_softmax(student_logits/temp, dim=-1)
-    reduction = 'batchmean' if not per_token else 'sum'
-    kl_div = nn.functional.kl_div(student_log_probs, teacher_probs, reduction=reduction)
+def calculate_kl_divergence(student_logits, teacher_probs, temp=1, custom=False):
+    student_log_probs = nn.functional.log_softmax(student_logits, dim=-1)/temp
+    reduction = 'batchmean' if not custom else 'none'
+    kl_div = nn.functional.kl_div(student_log_probs, torch.log(teacher_probs)/temp, reduction=reduction, log_target=True)
+    if custom:
+        kl_div = kl_div.sum(dim=-1).mean()
     return kl_div
 
 #d1 = np.random.random(size = (10,2))
@@ -87,20 +87,33 @@ def calculate_kl_divergence(student_logits, teacher_probs, temp=1, per_token=Tru
 #tensor = torch.tensor(([0.0004, 10.1, 1.2], [1.5, 2.3, 3.4]))
 #print(F.softmax(tensor, dim=-1))
 #print(torch.exp(F.log_softmax(tensor, dim=0)))
-content_ranges = [[0, 3], [5, 8], [9, 10], [11, 14]]
-tokens = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
-print([tokens[end - 1] for start, end in content_ranges]) # [2, 7, 9, 13]
-content_tokens = [token for start, end in content_ranges for token in tokens[start:end]]
-print(content_tokens) # [0, 1, 2, 5, 6, 7, 9, 11, 12, 13]
-max_len = 10
-content_ends = []
 
-current_id = -1
-for start, end in content_ranges:
-    if end > max_len:
-        break
-    content_ends.append(((end - start)) + current_id)
-    current_id = content_ends[-1]
+#content_ranges = [[0, 3], [5, 8], [9, 10], [11, 14]]
+#tokens = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+#print([tokens[end - 1] for start, end in content_ranges]) # [2, 7, 9, 13]
+#content_tokens = [token for start, end in content_ranges for token in tokens[start:end]]
+#print(content_tokens) # [0, 1, 2, 5, 6, 7, 9, 11, 12, 13]
+#max_len = 10
+#content_ends = []
 
-print(content_ends) # [2, 5, 6]
-print([content_tokens[end] for end in content_ends]) # [2, 7, 9] 
+#current_id = -1
+#for start, end in content_ranges:
+    #if end > max_len:
+        #break
+    #content_ends.append(((end - start)) + current_id)
+    #current_id = content_ends[-1]
+
+#print(content_ends) # [2, 5, 6]
+#print([content_tokens[end] for end in content_ends]) # [2, 7, 9] 
+
+#tensor1 = torch.tensor(([0.00002, 0.00002, 0.99996], [0.00002, 0.00002, 0.99996]))
+#tensor2 = torch.tensor(([2.0004, 5.3, 1.3], [1.0, 2.4, 3.5]))
+#print(tensor1[0][0])
+#print(torch.log(tensor1))
+#print(calculate_kl_divergence(tensor1, tensor2, temp=1, custom=True))
+
+#tensor3 = torch.tensor(([1,2,3], [1,2,3]), dtype=torch.float16)
+#indices_to_select = torch.tensor(([1,2], [2,3]))
+#tensor3 = torch.index
+#print(tensor3)
+

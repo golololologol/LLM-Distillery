@@ -1,11 +1,13 @@
 metadata = {
-    'sorted': sort,
     'save_sys_range': save_sys_range,
     'save_user_range': save_user_range,
     'save_assistant_range': save_assistant_range,
     'context_len': context_len,
-    'next_token_prob_boost': next_token_prob_boost,
-    'set_max_token_prob': set_max_token_prob
+    'crop_to_size': crop_distr_to_size,
+    'prompt_format': copy.deepcopy(prompt_format)
+    'avg_perplexity': sum(perplexity_list) / len([ppl for ppl in perplexity_list if ppl != -1]),
+    'total_saved_tokens': total_saved_tokens,
+    'perplexity_list': perplexity_list,
     "first_convo_decoded": first_convo_decoded,
     "first_content_decoded": first_content_decoded,
     "empty_convo_ids": [],

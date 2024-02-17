@@ -3,6 +3,7 @@ from finetuning.full_finetune import full_finetune
 from finetuning.Lora import lora_finetune
 from finetuning.QLora import qlora_finetune
 from utils.dataset_utils import save_dataset_and_metadata, load_metadata, tokenize_dataset, generate_metadata, filter_empty_conversations
+from utils.finetuning_utils import Params
 
 def check_errors(dataset_path: str, distributions_path: str, student_metadata: dict, distr_metadata: dict):
     dataset_name = os.path.splitext(os.path.basename(dataset_path))[0]
@@ -17,7 +18,7 @@ def check_errors(dataset_path: str, distributions_path: str, student_metadata: d
         if student_metadata[flag] != distr_metadata[flag]:
             raise ValueError(f"{flag} mismatch!\nStudent metadata: {student_metadata}\nDistributions metadata: {distr_metadata}")
     
-def finetune(parameters: dict):
+def finetune(parameters):
     if training.lower() == "full":
         full_finetune(parameters)
     elif training.lower() == "lora":
@@ -30,30 +31,33 @@ def finetune(parameters: dict):
 # Main Script
 model_path = r"C:\Users\gololo\Desktop\TinyLlama-1.1B-intermediate-step-1431k-3T"
 dataset_path = r"F:\soup.jsonl"
-distributions_path = r"F:\distilled\soup\merged"
+distributions_path = r"F:\distilled\soup\MythoMax-L2-Kimiko-v2-13b"
 save_folder = r"F:\trained"
-trained_model_name = "BallCrusher9000v4"
+trained_model_name = "TinyGoblin-1.1B-V2.1"
 
 training = "full" # "full" "lora" "qlora"
-optimizer = "adamw32bit" # "adamw8bit" "adamw" "adagrad8bit" "sgd" "paged_adamw8bit"
+optimizer = "adamw" # "adamw8bit" "adamw" "adagrad8bit" "sgd" "paged_adamw8bit" "adabelief"
 load_in_half = True
 context_length = 2*1024
 shuffle_data = True
+
 grad_accumulation_steps = 1
-num_epochs = 20
-num_warmup_steps = 1000
-lr = 6e-6
-lr_scheduler = "cosine_anneal" # "cosine" "linear" "constant" "constant_with_warmup" "polynomial" "inverse_sqrt" "step" "cosine_anneal" "one_cycle"
-temperature = 1
+num_epochs = 1
+num_warmup_steps = 400
+lr = 4e-6
+lr_scheduler = "wsd" # "wsd" "cosine" "linear" "constant" "constant_with_warmup" "polynomial" "inverse_sqrt" "step" "cosine_anneal" "one_cycle"
+decay_start = 0.9 # wsd, % of total steps
+
 crop_distr_to_size = 32000
-device = "cuda:0"
+device = "cuda:1"
+custom_reduction = True
 stop_at_convo = None
 save_every_n_epoch = 1
 
 prompt_format = {
-    'SYS_START': "#System:\n",
-    'USER_START': "#User:\n",
-    'ASSISTANT_START': "#Assistant:\n",
+    'SYS_START': "#System: ",
+    'USER_START': "#User: ",
+    'ASSISTANT_START': "#Assistant: ",
     'SYS_END': '\n',
     'USER_END': '\n',
     'ASSISTANT_END': '\n' # Use <eos> and <bos> for model-specific special tokens
@@ -84,31 +88,32 @@ if distr_metadata is not None:
     
     check_errors(dataset_path, distributions_path, student_metadata, distr_metadata)
 
-    parameters = {
-        "model_path": model_path,
-        "model_name": trained_model_name,
-        "save_folder": trained_model_folder,
-        "dataset_tokenized": dataset_tokenized,
-        "dataset_content_ranges": dataset_content_ranges,
-        "distributions_path": distributions_path,
-        "empty_convo_ids": empty_convo_ids,
-        "training_type": training,
-        "save_interval": save_every_n_epoch,
-        "load_in_half": load_in_half,
-        "shuffle_data": shuffle_data,
-        "optimizer_name": optimizer,
-        "context_length": context_length,
-        "stop_at_convo": stop_at_convo,
-        "full_dataset_len": distr_metadata["dataset_len"],
-        "grad_accum_steps": grad_accumulation_steps,
-        "num_epochs": num_epochs,
-        "num_warmup_steps": num_warmup_steps,
-        "student_metadata": student_metadata,
-        "lr": lr,
-        "lr_scheduler_name": lr_scheduler,
-        "device": device,
-        "temperature": temperature,
-        "crop_to_size": crop_distr_to_size
-    }
+    params = Params()
+    params.model_path = model_path
+    params.model_name = trained_model_name
+    params.save_folder = trained_model_folder
+    params.dataset_tokenized = dataset_tokenized
+    params.dataset_content_ranges = dataset_content_ranges
+    params.distributions_path = distributions_path
+    params.empty_convo_ids = empty_convo_ids
+    params.training_type = training
+    params.save_interval = save_every_n_epoch
+    params.load_in_half = load_in_half
+    params.shuffle_data = shuffle_data
+    params.optimizer_name = optimizer
+    params.context_length = context_length
+    params.stop_at_convo = stop_at_convo
+    params.full_dataset_len = distr_metadata["dataset_len"]
+    params.grad_accum_steps = grad_accumulation_steps
+    params.num_epochs = num_epochs
+    params.num_warmup_steps = num_warmup_steps
+    params.student_metadata = student_metadata
+    params.lr = lr
+    params.decay_start = decay_start
+    params.lr_scheduler_name = lr_scheduler
+    params.custom_reduction = custom_reduction
+    params.device = device
+    params.crop_to_size = crop_distr_to_size
 
-    finetune(parameters)
+    finetune(params)
+
