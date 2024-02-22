@@ -2,7 +2,7 @@ import subprocess
 import os
 
 path_to_convert_script = r"F:/down/koboldcpp_ggml_tools_21nov/convert_llama/convert.py"
-model_path = r"C:\Users\gololo\Desktop\text-generation-webui-main\models\TinyGoblin-1.1B-V2.1_epoch_final"
+model_path = r"F:\trained\TinyGoblin-1.1B-V3.1\TinyGoblin-1.1B-V3.1_epoch_final"
 
 model_name = model_path.split(os.sep)[-1]
 base_folder = os.path.dirname(model_path)

@@ -1,24 +1,8 @@
-from sympy import content
-import torch
-import torch.nn as nn
-import numpy as np
 import torch
 from tqdm import tqdm
 import torch.nn.functional as F
-import math
-import os
-import threading
-import queue
-import h5py
-from exllamav2 import ExLlamaV2Config, ExLlamaV2Tokenizer
-
-def calculate_kl_divergence(student_logits, teacher_probs, temp=1, custom=False):
-    student_log_probs = nn.functional.log_softmax(student_logits, dim=-1)/temp
-    reduction = 'batchmean' if not custom else 'none'
-    kl_div = nn.functional.kl_div(student_log_probs, torch.log(teacher_probs)/temp, reduction=reduction, log_target=True)
-    if custom:
-        kl_div = kl_div.sum(dim=-1).mean()
-    return kl_div
+import numpy as np
+#from dataset_utils import H5Reader, H5Writer
 
 #d1 = np.random.random(size = (10,2))
 #d2 = torch.tensor(([1]), dtype=torch.float16)
@@ -117,3 +101,66 @@ def calculate_kl_divergence(student_logits, teacher_probs, temp=1, custom=False)
 #tensor3 = torch.index
 #print(tensor3)
 
+def calculate_divergence(student_logits, teacher_log_probs: torch.Tensor, temp=1.0, custom=False):
+    student_log_probs = F.log_softmax(F.log_softmax(student_logits, dim=-1).clip(-103, 88) / temp, dim=-1)
+    
+    reduction = 'batchmean' if not custom else 'none'
+    kl_div = F.kl_div(student_log_probs, F.log_softmax(F.log_softmax(teacher_log_probs, dim=-1).clip(-103, 88) / temp, dim=-1), reduction=reduction, log_target=True)
+    if custom:
+        kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).mean().log()
+
+    return kl_div*temp
+
+
+#teacher = H5Reader(r"F:\distilled\soup\MythoMax-L2-Kimiko-v2-13b\validate", "cpu")
+#teacher_tensor = teacher.read_next()
+#print(calculate_divergence(teacher_tensor, teacher_tensor, temp=1, custom=True))
+#teacher.close()
+
+#kl_div = calculate_divergence(student_logits, teacher_tensor, temp=1, custom=False)
+#print(kl_div)
+
+#print(torch.tensor(([89])).exp())
+
+# -103 tensor([1.4013e-45])
+# 88 tensor([1.6516e+38])
+
+#a = torch.tensor(([0.0004, 10.1, 1.2], [1.5, 2.3, 3.4]))
+#print(torch.exp(F.log_softmax(a, dim=-1)))
+#print(torch.exp(F.log_softmax(F.log_softmax(a, dim=-1)/2, dim=-1)))
+#print(F.softmax(a/2, dim=-1))
+
+#test tokenization
+def input_prompt_format():
+    prompt_format = {
+        'SYS_START': "### System:\n",
+        'USER_START': "### User:\n",
+        'ASSISTANT_START': "### Assistant:\n",
+        'SYS_END': '\n',
+        'USER_END': '\n',
+        'ASSISTANT_END': '\n'
+    }
+    print("Enter the prompt format")
+
+    keys = list(prompt_format.keys())
+    i = 0
+
+    while i < len(keys):
+        key = keys[i]
+        default_value = prompt_format[key].encode('unicode_escape').decode()
+        value = input(f"{key} (default: {default_value}): ")
+        
+        if value == "<":
+            i = max(0, i - 1)
+        else:
+            prompt_format[key] = value
+            i += 1
+            
+    return prompt_format
+
+#print(input_prompt_format())
+
+#print( np.concatenate(([111,333,444,555], np.array([1] * 2, dtype=np.int64))))
+# test cropping off pad tokens, if we only have the total number of pad tokens at the end of the conversation, pad token id = 0
+#print(np.array([1, 2, 3, 4, 5, 6, 7, 0, 0, 0])[:-3])
+#print(int(128 * 1000**2))

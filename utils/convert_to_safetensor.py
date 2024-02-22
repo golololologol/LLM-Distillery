@@ -87,4 +87,6 @@ def convert_model(pytorch_folder):
         convert_file(os.path.join(pytorch_folder, "pytorch_model.bin"), os.path.join(safetensors_folder, "model.safetensors"), copy_add_data=True)
     else:
         convert_files(pytorch_folder, safetensors_folder)
+
+    os.rmdir(pytorch_folder)
     return safetensors_folder
