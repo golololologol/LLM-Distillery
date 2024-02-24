@@ -164,3 +164,25 @@ def input_prompt_format():
 # test cropping off pad tokens, if we only have the total number of pad tokens at the end of the conversation, pad token id = 0
 #print(np.array([1, 2, 3, 4, 5, 6, 7, 0, 0, 0])[:-3])
 #print(int(128 * 1000**2))
+
+# cast np fp 32 array to fp 16
+#arr = np.random.random(size=(10, 10))
+#print(arr.dtype)
+#print(arr[0][0].item())
+#arrnp = arr.astype(np.float16)
+#print(arrnp.dtype)
+#print(arr[0][0].item())
+## now same but with torch
+#tensor = torch.tensor(arr)
+#print(tensor.dtype)
+#print(tensor[0][0].item())
+#tensor = tensor.half()
+#print(tensor.dtype)
+#print(tensor[0][0].item())
+#
+#batch_list_np = [np.random.random(size=(10, 10)) for i in range(10)]
+#batch_tensor = torch.tensor(batch_list_np)
+#print(batch_tensor)
+
+for i in range(10):
+    print(i)

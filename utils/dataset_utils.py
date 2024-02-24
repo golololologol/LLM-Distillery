@@ -7,6 +7,7 @@ import queue
 import json
 import torch
 import logging
+from tqdm import tqdm
 from transformers import AutoTokenizer
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
 from classes import ConvoTokenized
@@ -30,14 +31,19 @@ class H5Writer:
                 item = self.queue.get(timeout=self.timeout)
                 if item is None:
                     break
-                dataset_name = f'convo_{convo_count}'
-                #convert the item from fp32 to fp16 and move it to cpu
+                if isinstance(item, tuple):
+                    item, origin_convo_id = item
+                    dataset_name = f'convo_{origin_convo_id}'
+                else:
+                    dataset_name = f'convo_{convo_count}'
 
-                hdf_file.create_dataset(dataset_name, data=item.half().cpu())
+                hdf_file.create_dataset(dataset_name, data=item)
                 convo_count += 1
                 self.queue.task_done()
             
-    def write_data(self, data: torch.Tensor):
+    def write_data(self, data, origin_convo_id = None):
+        if origin_convo_id:
+            data = (data, origin_convo_id)
         self.queue.put(data)
 
     def close(self):
@@ -72,10 +78,23 @@ class H5Reader:
 
                     self._await()
 
-                    tensor = torch.tensor(np.array(hdf_file[dataset_name]), device=self.device, dtype=torch.float32)
+                    np_distributions = np.array(hdf_file[dataset_name]).astype(np.float32)
                     
-                    self.queue.put(tensor, timeout=self.timeout)
-    
+                    self.queue.put(np_distributions, block=False)
+
+    def _load_data_shuffled(self):
+        with h5py.File(self.file_path, 'r') as hdf_file:
+            while True:
+                self._await_order_list()
+                for id in self.order_list:
+                    if id in self.empty_convo_ids:
+                        continue
+                    self._await()
+                    dataset_name = f'convo_{id}'
+                    np_distributions = np.array(hdf_file[dataset_name]).astype(np.float32)
+                    self.queue.put(np_distributions, block=False)
+                self.order_list = []
+
     def _await(self):
         time_left = self.timeout
         while self.queue.qsize() >= self.queue.maxsize - 1:
@@ -92,19 +111,6 @@ class H5Reader:
             if self.stop_loading.is_set():
                 return
             time.sleep(0.05)
-
-    def _load_data_shuffled(self):
-        with h5py.File(self.file_path, 'r') as hdf_file:
-            while True:
-                self._await_order_list()
-                for id in self.order_list:
-                    if id in self.empty_convo_ids:
-                        continue
-                    self._await()
-                    dataset_name = f'convo_{id}'
-                    tensor = torch.tensor(np.array(hdf_file[dataset_name]), device=self.device, dtype=torch.float32)
-                    self.queue.put(tensor, timeout=self.timeout)
-                self.order_list = []
 
     def toggle_await(self):
         self.awaiting = not self.awaiting
@@ -167,25 +173,6 @@ def encode_prompt_format(prompt_format: dict, sp_toks: dict, tokenizer) -> dict[
     for key, value in prompt_format.items():
         prompt_format[key] = good_encode(value, sp_toks, tokenizer)
     return prompt_format
-
-def is_model_safetensors(model_path: str):
-    if os.path.isdir(model_path):
-        for file in os.listdir(model_path):
-            if file.endswith('.safetensors'):
-                return True
-        return False
-    
-def load_prompt_format(prompt_format_path: str) -> None|dict:
-    if not os.path.exists(prompt_format_path):
-        return None
-    
-    with open(prompt_format_path, 'r', encoding='utf-8') as file:
-        return json.load(file)
-    
-def save_prompt_format(prompt_format: dict, save_folder: str):
-    prompt_format_path = os.path.join(save_folder, "prompt_format.json")
-    with open(prompt_format_path, 'w', encoding='utf-8') as file:
-        json.dump(prompt_format, file, ensure_ascii=False, indent=4)
 
 def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, add_bos=True):
     empty = False
@@ -265,8 +252,7 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
     
     dataset = []
 
-    for convo_id, item in enumerate(read_jsonl_lazy(dataset_path)):  # Every conversation
-
+    for convo_id, item in tqdm(enumerate(read_jsonl_lazy(dataset_path)), desc="Tokenizing", unit="convo"): # Every conversation
         conversation_tokenized, conversation_content_ranges, empty = tokenize_convo(item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, add_bos=add_bos)
         
         num_pad_tokens = 0
