@@ -4,7 +4,7 @@ from utils.classes import TeacherModel, StudentModel
 import math
     
 def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb):
-    kb_per_distr_val = 0.001953125
+    kb_per_distr_val = 0.001953125 # storage of one FP16 value
     distr_size_kb = kb_per_distr_val * teacher.crop_to_size
     max_cache_size_kb = max_cache_size_gb * 1e6
     cache_size_kb = 0
@@ -16,9 +16,10 @@ def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb):
         
         if cache_size_kb >= max_cache_size_kb:
             loop_stops.append(id+1)
-            cache_size_kb = convo_kb
+            cache_size_kb = 0
     
-    loop_stops.append(len(teacher.dataset))
+    if not loop_stops or loop_stops[-1] != len(teacher.dataset):
+        loop_stops.append(len(teacher.dataset))
     
     return loop_stops
 
@@ -77,6 +78,10 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
     for teacher in teachers:
         setattr(teacher, param_name, param_value)
+
+def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map):
+    for teacher in teachers:
+        teacher.sort_dataset_by_map(sorting_map)
         
 
 def main():
@@ -97,6 +102,7 @@ def main():
     save_assistant_range = True
     crop_distr_to_size = 32000
     device = "cuda:1"
+    reserve_vram = [1.3, 0.2]
 
     # Training settings
     num_epochs = 1
@@ -115,16 +121,26 @@ def main():
     ensure_compatibility(teachers, student)
     
     # Initialization
-    teacher = teachers[0]
-    teacher.load_model()
-    teacher.sort_dataset_by_len()
-    loop_stops = calculate_loop_stops(teacher, max_cache_size_gb)
+    sorting_map = teachers[0].sort_dataset_by_len()
+    sort_datasets_by_map(teachers, sorting_map)
+    loop_stops = calculate_loop_stops(teachers[0], max_cache_size_gb)
     writer = H5Writer(cache_folder)
-    processed_convos = 0
 
+
+    # Collecting loop
     for stop_id in loop_stops:
         rewrite_teachers_param(teachers, "next_stop_id", stop_id)
-        
+        for teacher in teachers:
+            teacher.load_model()
+            while teacher.convo_id < stop_id:
+                batch_content_logprobs = teacher.get_batch_content_logprobs()
+                writer.write_or_merge_batch(batch_content_logprobs)
+
+            
+
+                    
+                
+            
 
 
      

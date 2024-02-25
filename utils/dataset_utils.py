@@ -11,6 +11,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
 from classes import ConvoTokenized
+from classes import NPDistribution
 logging.getLogger("transformers").setLevel(logging.ERROR)  # Shut up transformers
 logging.getLogger("torch").setLevel(logging.ERROR) # And pytorch for good measure
 
@@ -31,20 +32,19 @@ class H5Writer:
                 item = self.queue.get(timeout=self.timeout)
                 if item is None:
                     break
-                if isinstance(item, tuple):
-                    item, origin_convo_id = item
-                    dataset_name = f'convo_{origin_convo_id}'
-                else:
-                    dataset_name = f'convo_{convo_count}'
+                origin_convo_id = item.origin_convo_id
+                dataset_name = f'convo_{origin_convo_id}'
 
-                hdf_file.create_dataset(dataset_name, data=item)
+                hdf_file.create_dataset(dataset_name, data=item.distribution.astype(np.float16))
                 convo_count += 1
                 self.queue.task_done()
             
-    def write_data(self, data, origin_convo_id = None):
-        if origin_convo_id:
-            data = (data, origin_convo_id)
+    def write_data(self, data: NPDistribution):
         self.queue.put(data)
+
+    def write_batch(self, batch: list[NPDistribution]):
+        for item in batch:
+            self.queue.put(item)
 
     def close(self):
         self.queue.put(None)
@@ -61,10 +61,20 @@ class H5Reader:
         self.order_list = []
         self.dataset_len = 0
         self.awaiting = False
+        self.target = None
         if shuffle:
-            self.loading_thread = threading.Thread(target=self._load_data_shuffled)
+            target = self._load_data_shuffled
         else:
-            self.loading_thread = threading.Thread(target=self._load_data)
+            target = self._load_data
+        self.loading_thread = threading.Thread(target=target)
+        self.loading_thread.start()
+
+    def restart_thread(self):
+        self.stop_loading.set()
+        self.loading_thread.join()
+        self.stop_loading.clear()
+        self.queue = queue.Queue(maxsize=self.queue.maxsize)
+        self.loading_thread = threading.Thread(target=self.target)
         self.loading_thread.start()
 
     def _load_data(self):
@@ -72,15 +82,15 @@ class H5Reader:
             self.dataset_len = len(hdf_file)
             while True:
                 dataset_names = sorted(hdf_file.keys(), key=lambda x: int(x.split('_')[1]))
-                for i, dataset_name in enumerate(dataset_names):
-                    if i in self.empty_convo_ids:
+                for id, dataset_name in enumerate(dataset_names):
+                    if id in self.empty_convo_ids:
                         continue
 
                     self._await()
 
-                    np_distributions = np.array(hdf_file[dataset_name]).astype(np.float32)
+                    np_distribution = NPDistribution(np.array(hdf_file[dataset_name]).astype(np.float32), id)
                     
-                    self.queue.put(np_distributions, block=False)
+                    self.queue.put(np_distribution, block=False)
 
     def _load_data_shuffled(self):
         with h5py.File(self.file_path, 'r') as hdf_file:
@@ -91,8 +101,8 @@ class H5Reader:
                         continue
                     self._await()
                     dataset_name = f'convo_{id}'
-                    np_distributions = np.array(hdf_file[dataset_name]).astype(np.float32)
-                    self.queue.put(np_distributions, block=False)
+                    np_distribution = NPDistribution(np.array(hdf_file[dataset_name]).astype(np.float32), id)
+                    self.queue.put(np_distribution, block=False)
                 self.order_list = []
 
     def _await(self):

@@ -93,6 +93,7 @@ class NPDistribution:
     def __init__(self, distribution: ndarray, origin_convo_id: int):
         self.distribution: ndarray = distribution
         self.origin_convo_id: int = origin_convo_id
+        self.ppl: float = 0
 
 class ConvoTokenized:
     def __init__(self, tokenized: ndarray, content_ranges, padding, is_empty, cropped_end, convo_id):
@@ -165,7 +166,6 @@ class TeacherModel:
         self.dataset: list[ConvoTokenized] = []
         self.dataset_len: int = 0
         self.dataset_sorted: bool = False
-        self.num_batches: int = 0
         self.validation_dataset: list[ConvoTokenized] = []
         self.ppl_dataset: list[ConvoTokenized] = []
         self.vocab_family: str = ""
@@ -264,18 +264,21 @@ class TeacherModel:
                      
             return batch_distributions_list, batch_size
     
-    def get_batch_content_logprobs(self) -> list[NPDistribution]:
+    def get_batch_content_logprobs(self) -> tuple[list[NPDistribution], int]:
         with torch.no_grad():
             batch_distributions, batch_size = self._get_batch_logprobs()
             batch_content_distributions = []
             for i, NPdistribution in enumerate(batch_distributions):
                 content_indices = self._get_content_indices_np(self.dataset[self.convo_id + i].content_ranges, self.context_len)
                 NPdistribution.distribution = NPdistribution.distribution[content_indices]
+                content_tokens = self.dataset[self.convo_id + i].tokenized[content_indices][1:]
+                gathered_log_probs = NPdistribution.distribution[np.arange(len(content_indices) - 1), content_tokens]
+                NPdistribution.ppl = np.exp(-np.mean(gathered_log_probs))
                 batch_content_distributions.append(NPdistribution)
             
             self.convo_id += batch_size
             
-            return batch_content_distributions
+            return batch_content_distributions, batch_size
         
     def sort_dataset_by_len(self) -> dict[int, int]:
         self.dataset.sort(key=lambda convo: convo.length)
@@ -319,7 +322,7 @@ class TeacherModel:
         print(f"Unloading {self.model_name}...")
         self.model.unload()
     
-    def unload(self):
+    def unload_full(self):
         self.unload_model()
         self.model = None
         self.dataset = []
@@ -327,6 +330,13 @@ class TeacherModel:
         self.ppl_dataset = []
         self.convo_id = 0
         gc.collect()
+
+    def get_empty_convos(self) -> list[int]:
+        empty_convos = []
+        for i, convo in enumerate(self.dataset):
+            if convo.is_empty:
+                empty_convos.append(i)
+        return empty_convos
 
     def gen_prelim_ppl(self):
         print(f"Generating preliminary PPL for {self.model_name}...")
