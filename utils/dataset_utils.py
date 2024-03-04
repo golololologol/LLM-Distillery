@@ -10,8 +10,7 @@ import logging
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
-from classes import ConvoTokenized
-from classes import NPDistribution
+from classes import ConvoTokenized, Distribution
 logging.getLogger("transformers").setLevel(logging.ERROR)  # Shut up transformers
 logging.getLogger("torch").setLevel(logging.ERROR) # And pytorch for good measure
 
@@ -39,10 +38,10 @@ class H5Writer:
                 convo_count += 1
                 self.queue.task_done()
             
-    def write_data(self, data: NPDistribution):
+    def write_data(self, data: Distribution):
         self.queue.put(data)
 
-    def write_batch(self, batch: list[NPDistribution]):
+    def write_batch(self, batch: list[Distribution]):
         for item in batch:
             self.queue.put(item)
 
@@ -88,7 +87,7 @@ class H5Reader:
 
                     self._await()
 
-                    np_distribution = NPDistribution(np.array(hdf_file[dataset_name]).astype(np.float32), id)
+                    np_distribution = Distribution(np.array(hdf_file[dataset_name]).astype(np.float32), id)
                     
                     self.queue.put(np_distribution, block=False)
 
@@ -101,7 +100,7 @@ class H5Reader:
                         continue
                     self._await()
                     dataset_name = f'convo_{id}'
-                    np_distribution = NPDistribution(np.array(hdf_file[dataset_name]).astype(np.float32), id)
+                    np_distribution = Distribution(np.array(hdf_file[dataset_name]).astype(np.float32), id)
                     self.queue.put(np_distribution, block=False)
                 self.order_list = []
 
@@ -130,7 +129,7 @@ class H5Reader:
         self.queue.task_done()
         return tensor
 
-    def set_shuffle_order(self, order_list):
+    def set_loading_order(self, order_list):
         self.order_list = order_list
 
     def close(self):

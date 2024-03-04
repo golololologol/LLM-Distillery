@@ -65,15 +65,16 @@ def prepare_teacher_datasets(dataset_path, validation_dataset_path, ppl_dataset_
             ppl_dataset_path, teacher.model_path,teacher.prompt_format,context_len,
             save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos)
     
-def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size, context_len):
+def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size, context_len, temperature):
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
+        teacher.temperature = temperature
         teacher.dataset_len = len(teacher.dataset)
-        teacher.num_batches = math.ceil(teacher.dataset_len / teacher.batch_size)
 
     student.crop_to_size = crop_to_size
     student.context_len = context_len
+    student.temperature = temperature
 
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
     for teacher in teachers:
@@ -107,6 +108,7 @@ def main():
     # Training settings
     num_epochs = 1
     num_warmup_steps = 1000
+    temperature = 3
     lr = 1e-4
     lr_scheduler = "linear"
     optimizer = "adamw"
@@ -117,7 +119,7 @@ def main():
     teachers = get_teachers(teacher_models_folder)
     student = StudentModel(student_path)
     prepare_teacher_datasets(dataset_path, validation_dataset_path, ppl_dataset_path, teachers, context_len, save_sys_range, save_user_range, save_assistant_range)
-    set_params(teachers, student, crop_distr_to_size, context_len)
+    set_params(teachers, student, crop_distr_to_size, context_len, temperature)
     ensure_compatibility(teachers, student)
     
     # Initialization

@@ -184,5 +184,73 @@ def input_prompt_format():
 #batch_tensor = torch.tensor(batch_list_np)
 #print(batch_tensor)
 
-for i in range(10):
-    print(i)
+#for i in range(10):
+    #print(i)
+#
+#import numpy as np
+#import torch
+#import time
+#
+## The monstrous dimensions we're still dealing with
+#batch_size = 4
+#tokens_per_convo = 1000
+#features_per_token = 32000
+#tokens_to_crop = 200  # Number of tokens we're gonna viciously rip out from the middle
+#
+## Middle point for the cropping, keeping it fair
+#start = (tokens_per_convo - tokens_to_crop) // 2
+#end = start + tokens_to_crop
+#
+## Creating the behemoths again
+#numpy_array = np.random.rand(batch_size, tokens_per_convo, features_per_token).astype('float32')
+#torch_tensor = torch.rand((batch_size, tokens_per_convo, features_per_token), dtype=torch.float32, device='cuda:0')
+#
+#def numpy_operations():
+#    # Cropping like a boss
+#    cropped = numpy_array[:, start:end, :]
+#    # Let's do something nasty with the cropped section
+#    result = np.log(cropped + 1) * 2.5
+#    return np.max(result, axis=2)
+#
+#def torch_operations():
+#    # Cropping with style
+#    cropped = torch.index_select(torch_tensor, 1, torch.arange(start, end, device='cuda:0'))
+#    # Equivalent nasty operations in PyTorch land
+#    result = torch.log(cropped + 1) * 2.5
+#    return torch.max(result, dim=2)
+#
+## Timing NumPy
+#start_time = time.time()
+#numpy_result = numpy_operations()
+#numpy_time = time.time() - start_time
+#
+## Timing PyTorch
+#start_time = time.time()
+#torch_result = torch_operations()
+#torch_time = time.time() - start_time
+#
+#print(f"NumPy took: {numpy_time} seconds")
+#print(f"PyTorch took: {torch_time} seconds")
+#
+## Who's the slicing champ?
+#if numpy_time < torch_time:
+#    print("NumPy slices and dices faster.")
+#else:
+#    print("PyTorch cuts through the bullshit quicker.")
+
+logits = torch.tensor(([0.00004, 10.1, 1.2]), device='cuda:0', dtype=torch.float16)
+logits_temp = logits / 2
+log_probs = F.log_softmax(logits, dim=-1)
+
+print(log_probs)
+print(torch.log_softmax(logits_temp, dim=-1))
+mean = torch.mean(log_probs, dim=-1)
+print("###########")
+print(mean)
+print(mean/2)
+print((log_probs - mean))
+print((log_probs - mean)/2)
+print((log_probs/2))
+
+
+

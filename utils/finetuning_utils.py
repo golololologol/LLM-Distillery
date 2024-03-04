@@ -1,16 +1,13 @@
-from more_itertools import padded
 import numpy as np
 import torch.nn.functional as F
 import torch
 import torch.optim.lr_scheduler as lr
-import torch_optimizer
 from transformers import get_scheduler
 import subprocess
 import os
 import bitsandbytes as bnb
 import math
 import torch
-from dataset_utils import get_vocab_family, get_special_tokens, tokenize_dataset
 from torch.optim.lr_scheduler import _LRScheduler
 
 class WarmupStableDecayLR(_LRScheduler):
@@ -89,7 +86,6 @@ def launch_tensorboard(log_dir):
     tensorboard = subprocess.Popen(['tensorboard', '--logdir', os.path.join(log_dir, "tensorboard_logs"), '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return tensorboard
 
-
 def calculate_divergence(student_logits, teacher_log_probs: torch.Tensor, temp=1.0, custom=False):
     student_log_probs_temp = F.log_softmax(F.log_softmax(student_logits, dim=-1).clip(-103, 88) / temp, dim=-1)
     teacher_log_probs_temp = F.log_softmax(F.log_softmax(teacher_log_probs, dim=-1).clip(-103, 88) / temp, dim=-1)
@@ -122,7 +118,6 @@ def set_optimizer(model_parameters, lr, grad_accum_steps, betas, optimizer_name:
         "paged_adamw32bit": bnb.optim.PagedAdamW32bit,
         "sgd": torch.optim.SGD,
         "rmsprop32bit": bnb.optim.RMSprop32bit,
-        "adabelief": torch_optimizer.AdaBelief
     }
 
     if optimizer_name in optimizer_classes:
@@ -132,8 +127,6 @@ def set_optimizer(model_parameters, lr, grad_accum_steps, betas, optimizer_name:
             return optimizer_classes[optimizer_name](model_parameters, lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov)
         elif optimizer_name in ["rmsprop32bit"]:
             return optimizer_classes[optimizer_name](model_parameters, lr=lr, weight_decay=weight_decay, alpha=0.9, eps=1e-10, centered=True)
-        elif optimizer_name in ["adabelief"]:
-            return optimizer_classes[optimizer_name](model_parameters, lr=lr, eps=1e-8, betas=betas, weight_decay=weight_decay)
     else:
         raise ValueError(f"Invalid optimizer name: {optimizer_name}\nAvailable optimizers: {list(optimizer_classes.keys())}")
     
