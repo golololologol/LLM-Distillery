@@ -47,41 +47,6 @@ class WarmupStableDecayLR(_LRScheduler):
         else:
             return [self.final_lr for group in self.optimizer.param_groups]
 
-
-class Params:
-    def __init__(self):
-        self.model_path = ""
-        self.model_name = ""
-        self.save_folder = ""
-        self.dataset_tokenized = []
-        self.dataset_content_ranges = []
-        self.validation_dataset_tokenized = []
-        self.validation_dataset_content_ranges = []
-        self.distributions_path = ""
-        self.validation_distributions_path = ""
-        self.empty_convo_ids = []
-        self.validation_empty_convo_ids = []
-        self.validation_per_steps = 0
-        self.training_type = ""
-        self.save_interval = 0.0
-        self.load_in_half = False
-        self.shuffle_data = False
-        self.optimizer_name = ""
-        self.context_length = 0
-        self.stop_at_convo = None
-        self.full_dataset_len = 0
-        self.grad_accum_steps = 0
-        self.num_epochs = 0
-        self.num_warmup_steps = 0
-        self.student_metadata = {}
-        self.lr = 0.0
-        self.temperature = 0.0
-        self.decay_start = 0.0
-        self.lr_scheduler_name = ""
-        self.custom_reduction = False
-        self.device = ""
-        self.crop_to_size = 0
-
 def launch_tensorboard(log_dir):
     tensorboard = subprocess.Popen(['tensorboard', '--logdir', os.path.join(log_dir, "tensorboard_logs"), '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return tensorboard

@@ -25,5 +25,7 @@ def compare_vocabs(folder1, folder2):
         "Number of unique tokens in dict2": len(unique_tokens_dict2)
     }
     print(result)
-    
-compare_vocabs(r"F:\distilled\data-MNHTN-standardized-Puffin\Nous-Hermes-Llama2-13b", r"F:\distilled\data-MNHTN-standardized-Puffin\UtopiaXL-13B")
+
+model1 = r"F:\distilled\data-MNHTN-standardized-Puffin\Nous-Hermes-Llama2-13b"
+model2 = r"F:\distilled\data-MNHTN-standardized-Puffin\UtopiaXL-13B"
+compare_vocabs(model1, model2)
