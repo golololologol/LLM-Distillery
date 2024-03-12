@@ -1,7 +1,6 @@
 import os
-from utils.dataset_utils import tokenize_dataset, H5Reader, H5Writer
-from utils.classes import TeacherModel, StudentModel
-import math
+from utils.dataset_utils import tokenize_dataset, H5DataManager
+from utils.classes import TeacherModel, StudentModel, Paths
     
 def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb):
     kb_per_distr_val = 0.001953125 # storage of one FP16 value
@@ -83,7 +82,6 @@ def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value
 def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map):
     for teacher in teachers:
         teacher.sort_dataset_by_map(sorting_map)
-        
 
 def main():
     cache_folder = r"F:\cache"
@@ -103,7 +101,7 @@ def main():
     save_assistant_range = True
     crop_distr_to_size = 32000
     device = "cuda:1"
-    reserve_vram = [1.3, 0.2]
+    reserve_vram = [1.3, 0.2] # GB
 
     # Training settings
     num_epochs = 1
@@ -126,8 +124,9 @@ def main():
     sorting_map = teachers[0].sort_dataset_by_len()
     sort_datasets_by_map(teachers, sorting_map)
     loop_stops = calculate_loop_stops(teachers[0], max_cache_size_gb)
-    writer = H5Writer(cache_folder)
-
+    paths = Paths(cache_folder, clean_start=True)
+   
+    data_manager = H5DataManager(paths.dataset, device)
 
     # Collecting loop
     for stop_id in loop_stops:
@@ -136,7 +135,7 @@ def main():
             teacher.load_model()
             while teacher.convo_id < stop_id:
                 batch_content_logprobs = teacher.get_batch_content_logprobs()
-                writer.write_or_merge_batch(batch_content_logprobs)
+                data_manager.write_batch(batch_content_logprobs)
 
             
 

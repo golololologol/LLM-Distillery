@@ -61,6 +61,8 @@ def input_prompt_format():
         
         if value == "<":
             i = max(0, i - 1)
+        elif value == "":
+            i += 1
         else:
             prompt_format[key] = value
             i += 1
@@ -83,6 +85,8 @@ def input_config():
         
         if value == "<":
             i = max(0, i - 1)
+        elif value == "":
+            i += 1
         else:
             config[key] = value
             i += 1
@@ -90,29 +94,36 @@ def input_config():
     return config
 
 class Paths:
-    def __init__(self, cache_folder):
-        self.cache_folder: str = cache_folder
-        self.logging_folder: str = os.path.join(cache_folder, "tensorboard_logs")
-        self.dataset_folder: str = os.path.join(cache_folder, "dataset")
-        self.student_folder: str = os.path.join(cache_folder, "student")
-        self.student_states: str = os.path.join(self.student_folder, "states")
-        self.student_gguf: str = os.path.join(self.student_folder, "gguf")
-        self.student_trained: str = os.path.join(self.student_folder, "trained")
+    def __init__(self, cache, clean_start: bool = False):
+        self.cache: str = cache
+        self.logging: str = os.path.join(cache, "tensorboard_logs")
+        self.dataset: str = os.path.join(cache, "dataset")
+        self.dataset_validation = os.path.join(self.dataset, "validation")
+        self.student_root: str = os.path.join(cache, "student")
+        self.student_states: str = os.path.join(self.student_root, "states")
+        self.student_gguf: str = os.path.join(self.student_root, "gguf")
+        self.student_trained: str = os.path.join(self.student_root, "trained")
+        self.initialize_folders(clean_start)
     
-    def create_folders(self):
-        os.makedirs(self.cache_folder, exist_ok=True)
-        os.makedirs(self.logging_folder, exist_ok=True)
-        os.makedirs(self.student_folder, exist_ok=True)
+    def initialize_folders(self, clean_start):
+        if clean_start:
+            self.empty_all()
+        os.makedirs(self.cache, exist_ok=True)
+        os.makedirs(self.logging, exist_ok=True)
+        os.makedirs(self.student_root, exist_ok=True)
         os.makedirs(self.student_states, exist_ok=True)
         os.makedirs(self.student_gguf, exist_ok=True)
         os.makedirs(self.student_trained, exist_ok=True)
+
+    def create_folder(self, existing_folder, new_folder: str):
+        os.makedirs(os.path.join(existing_folder, new_folder), exist_ok=True)
 
     def empty_folder(self, folder: str):
         for file in os.listdir(folder):
             os.remove(os.path.join(folder, file))
 
     def empty_dataset(self):
-        self.empty_folder(self.dataset_folder)
+        self.empty_folder(self.dataset)
     
     def empty_student_folders(self):
         self.empty_folder(self.student_states)
@@ -120,28 +131,24 @@ class Paths:
         self.empty_folder(self.student_trained)
 
     def empty_logs(self):
-        self.empty_folder(self.logging_folder)
+        self.empty_folder(self.logging)
 
     def empty_all(self):
-        self.empty_folder(self.cache_folder)
-
+        self.empty_folder(self.cache)
 
 class Distribution:
-    def __init__(self, origin_convo_id: int, empty: bool = False, length: int = 0, padding: int = 0, ppl: float = -1):
+    def __init__(self, origin_convo_id: int, empty: bool = False, length: int = 0, ppl: float = -1):
         self.distribution: ndarray|torch.Tensor = None
         self.tokenized: ndarray = np.array([])
         self.length: int = length
         self.origin_convo_id: int = origin_convo_id
-        self.padding: int = padding
         self.ppl: float = ppl
-        self.empty: bool = empty
 
 class ConvoTokenized:
     def __init__(self, tokenized: ndarray, content_ranges, padding, is_empty, cropped_end, convo_id):
         self.tokenized: ndarray = tokenized
         self.content_ranges: list[tuple[int, int]] = content_ranges
         self.padding: int = padding
-        self.is_empty: bool = is_empty
         self.cropped_end: bool = cropped_end
         self.length: int = len(tokenized) - padding
         self.len_content: int = sum([end - start for start, end in content_ranges])
@@ -197,6 +204,7 @@ class StudentModel(BaseModel):
         self.model = None
         self.optimizer = None
         self.scheduler = None
+        self.step_span = 0
 
 class TeacherModel(BaseModel):
     def __init__(self, model_path: str):
@@ -234,35 +242,24 @@ class TeacherModel(BaseModel):
                 content_indices.append(np.arange(start, end))
         return np.concatenate(content_indices)
 
-    def _get_batch_logprobs(self) -> tuple[list[Distribution], int]:
+    def _get_batch_logprobs(self) -> list[Distribution]:
         with torch.no_grad():
             batch_tokenized: list[torch.Tensor] = []
             batch_distributions: list[Distribution] = []
-            empty_convos = []
 
             convos_to_inference = min(self.convo_id + self.batch_size, self.next_stop_id)
             batch_convos = self.dataset[self.convo_id:convos_to_inference]
-            batch_size = len(batch_convos)
 
             for convo in batch_convos:
-                if convo.is_empty:
-                    empty_convos.append(convo.origin_convo_id)
-                    continue
                 batch_distributions.append(Distribution(convo.origin_convo_id, convo.is_empty, convo.length))
                 batch_tokenized.append(convo.tokenized)
+            
+            batch_size = len(batch_distributions)
 
-            #crop to the convos to one that has the most non-padding tokens
+            #crop to the convos to one that has the least non-padding tokens
             max_non_padded_len = max([convo.length for convo in batch_convos])
             batch_tokenized = [convo_tokenized[:max_non_padded_len] for convo_tokenized in batch_tokenized]
-            
-            for distribution in batch_distributions:
-                distribution.padding = max_non_padded_len - distribution.length
-
-            if len(batch_tokenized) == 0:
-                for convo_id in empty_convos:
-                    batch_distributions.append(Distribution(convo_id, True, 0))
-                    return batch_distributions, batch_size
-            
+             
             batch_logits = self._inference(batch_tokenized)
             batch_logprobs = torch.nn.functional.log_softmax(batch_logits, dim=-1)
 
@@ -279,25 +276,26 @@ class TeacherModel(BaseModel):
                         convo_logprobs[end][eos_id] = (torch.max(convo_logprobs[end].exp()) * 1.1).log()
                         convo_logprobs[end] = (convo_logprobs[end].exp() / convo_logprobs[end].exp().sum()).log()
                     
-                batch_distributions[i].distribution = np.array(convo_logprobs.cpu())
+                batch_distributions[i].distribution = convo_logprobs[:batch_distributions[i].length].cpu().numpy()
                 
-            return batch_distributions, batch_size
+            return batch_distributions
                     
-    def get_batch_content_logprobs(self) -> tuple[list[Distribution], int]:
+    def get_batch_content_logprobs(self) -> list[Distribution]:
         with torch.no_grad():
-            batch_distributions, batch_size = self._get_batch_logprobs()
+            batch_distributions = self._get_batch_logprobs()
             batch_content_distributions = []
             for i, distribution in enumerate(batch_distributions):
                 content_indices = self._get_content_indices_np(self.dataset[self.convo_id + i].content_ranges, self.context_len)
                 distribution.distribution = distribution.distribution[content_indices] if len(content_indices) > 0 else np.array([])
                 content_tokens = self.dataset[self.convo_id + i].tokenized[content_indices][1:]
-                gathered_log_probs = distribution.distribution[np.arange(len(content_indices) - 1), content_tokens]
-                distribution.ppl = np.exp(-np.mean(gathered_log_probs))
+                gathered_log_probs = distribution.distribution[np.arange(len(content_indices)), content_tokens]
+                distribution.ppl = min(np.exp(-np.mean(gathered_log_probs)), 100)
                 batch_content_distributions.append(distribution)
             
-            self.convo_id += batch_size
-            
-            return batch_content_distributions, batch_size
+            return batch_content_distributions
+        
+    def batch_done(self, batch_size: int):
+        self.convo_id += batch_size
         
     def sort_dataset_by_len(self) -> dict[int, int]:
         self.dataset.sort(key=lambda convo: convo.length)
@@ -337,7 +335,9 @@ class TeacherModel(BaseModel):
         return model
     
     def unload_model(self):
-        assert self.model is not None, "Model has not been loaded yet."
+        if self.model is None:
+            print(f"{self.model_name} is already unloaded.")
+            return
         print(f"Unloading {self.model_name}...")
         self.model.unload()
     
@@ -363,6 +363,4 @@ class TeacherModel(BaseModel):
             total_ppl = 0
             total_tokens = 0
             
-                
-        
         return total_ppl / total_tokens

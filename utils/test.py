@@ -238,19 +238,34 @@ def input_prompt_format():
 #else:
 #    print("PyTorch cuts through the bullshit quicker.")
 
-logits = torch.tensor(([0.00004, 10.1, 1.2]), device='cuda:0', dtype=torch.float16)
-logits_temp = logits / 2
-log_probs = F.log_softmax(logits, dim=-1)
+#logits = torch.tensor(([0.00004, 10.1, 1.2]), device='cuda:0', dtype=torch.float16)
+#logits_temp = logits / 2
+#log_probs = F.log_softmax(logits, dim=-1)
+#
+#print(log_probs)
+#print(torch.log_softmax(logits_temp, dim=-1))
+#mean = torch.mean(log_probs, dim=-1)
+#print("###########")
+#print(mean)
+#print(mean/2)
+#print((log_probs - mean))
+#print((log_probs - mean)/2)
+#print((log_probs/2))
+#
+#
+tensor1 = torch.tensor(([0.02, 0.02, 0.996], [0.2, 0.2, 0.996], [1, 2, 3])).numpy()
+tensor1_len = tensor1.shape[0]
+tensor2 = torch.tensor(([2.04, 5.3, 1.3], [1.0, 2.4, 3.5])).numpy()
+tensor2_len = tensor2.shape[0]
 
-print(log_probs)
-print(torch.log_softmax(logits_temp, dim=-1))
-mean = torch.mean(log_probs, dim=-1)
-print("###########")
-print(mean)
-print(mean/2)
-print((log_probs - mean))
-print((log_probs - mean)/2)
-print((log_probs/2))
+#full_distr = np.pad(tensor1, ((0, 1), (0, 0)))
+list1 = [1,2]
+list2 = [1,1]
+full_distr = tensor1[list1, list2]
+print(np.arange(tensor1_len))
 
-
-
+#dict = {'a': 1, 'b': 2, 'c': 3}
+#print(1 in dict)
+#
+#dict["d"] = 4
+#print(dict.clear())

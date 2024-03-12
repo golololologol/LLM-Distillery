@@ -1,11 +1,9 @@
 import os
 import numpy as np
 import h5py
-import time
-import threading
+import multiprocessing
 import queue
 import json
-import torch
 import logging
 from tqdm import tqdm
 from transformers import AutoTokenizer
@@ -14,126 +12,101 @@ from classes import ConvoTokenized, Distribution
 logging.getLogger("transformers").setLevel(logging.ERROR)  # Shut up transformers
 logging.getLogger("torch").setLevel(logging.ERROR) # And pytorch for good measure
 
-class H5Writer:
-    def __init__(self, save_folder: str, timeout=15, queue_size=2):
-        self.save_path = os.path.join(save_folder, "distributions.hdf5")
-        if os.path.exists(self.save_path):
-            os.remove(self.save_path)
-        self.timeout = timeout
-        self.queue = queue.Queue(maxsize=queue_size)
-        self.thread = threading.Thread(target=self._save_to_hdf5_thread)
-        self.thread.start()
-        
-    def _save_to_hdf5_thread(self):
-        with h5py.File(self.save_path, 'a') as hdf_file:
-            convo_count = 0
-            while True:
-                item = self.queue.get(timeout=self.timeout)
-                if item is None:
-                    break
-                origin_convo_id = item.origin_convo_id
-                dataset_name = f'convo_{origin_convo_id}'
+class H5DataManager:
+    def __init__(self, dataset_path, device, max_queue_size=3):
+        self.file_path = os.path.join(dataset_path, "distributions.hdf5")
+        self.device = device
+        self.queue = multiprocessing.Queue(maxsize=max_queue_size)
+        self.result_queue = multiprocessing.Queue(maxsize=max_queue_size)
+        self.got_task = multiprocessing.Event()
+        self.stop = multiprocessing.Event()
+        self.clear_dataset = multiprocessing.Event()
+        self.loading_process = multiprocessing.Process(target=self._process_thread)
+        self.loading_process.start()
+        self.teacher_convos = []
 
-                hdf_file.create_dataset(dataset_name, data=item.distribution.astype(np.float16))
-                convo_count += 1
-                self.queue.task_done()
-            
-    def write_data(self, data: Distribution):
-        self.queue.put(data)
+    def _process_thread(self):
+        with h5py.File(self.file_path, 'a') as hdf_file:
+            while True:
+                self.got_task.wait()
+                if self.stop.is_set():
+                    break
+                
+                if self.clear_dataset.is_set():
+                    self._clear_dataset(hdf_file)
+                    continue
+                
+                while not self.queue.empty():
+                    task, data = self.queue.get()
+                    if task == 'get_id':
+                        self.result_queue.put(self._load_id(hdf_file, data))
+                    elif task == 'put_batch':
+                        self._process_distributions(hdf_file, data)
+                    self.queue.task_done()
+                
+                self.got_task.clear()
+
+    def _process_distributions(self, hdf_file, batch: list[Distribution]):
+        for distribution in batch:
+            id = distribution.origin_convo_id
+            if id in self.teacher_convos:
+                merged_data = self._merge_data(hdf_file, distribution, id)
+                self._save_data(hdf_file, merged_data, id)
+            else:
+                self._save_data(hdf_file, distribution.distribution, id)
+                self.teacher_convos.append(id)
+
+    def _merge_data(self, hdf_file, new_distribution: Distribution, id):
+        assert isinstance(new_distribution.distribution, np.ndarray), "Distribution should be a numpy array."
+        
+        ppl = new_distribution.ppl
+        assert ppl > 0, "PPL should be greater than 0."
+
+        disk_data = np.exp(self._load_id(hdf_file, id))
+        new_data = np.exp(new_distribution.distribution) / ppl
+
+        max_len = max(disk_data.shape[0], new_data.shape[0])
+        min_len = min(disk_data.shape[0], new_data.shape[0])
+        diff = max_len - min_len
+
+        merged_data = np.pad(disk_data, ((0, diff), (0, 0))) + np.pad(new_data, ((0, diff), (0, 0)))
+
+        return np.log(merged_data)
+
+    def _save_data(self, hdf_file: h5py.File, data: np.ndarray, convo_id: int):
+        dataset_name = f'convo_{convo_id}'
+        if dataset_name in hdf_file:
+            del hdf_file[dataset_name]
+        hdf_file.create_dataset(dataset_name, data=data)
+    
+    def _load_id(self, hdf_file, convo_id: int) -> np.ndarray:
+        data = np.array(hdf_file[f'convo_{convo_id}']) if f'convo_{convo_id}' in hdf_file else None
+        return data
+    
+    def _clear_dataset(self, hdf_file: h5py.File):
+        for dataset_name in hdf_file:
+            del hdf_file[dataset_name]
+        self.clear_dataset.clear()
+        self.queue = queue.Queue()
+        self.got_task.clear()
+
+    def enqueue_get_id(self, convo_id: int):
+        self.queue.put(('get', convo_id))
+        self.got_task.set()
+
+    def get_id(self, convo_id: int) -> np.ndarray:
+        self.queue.put(('get', convo_id))
+        self.got_task.set()
+        return self.result_queue.get()
 
     def write_batch(self, batch: list[Distribution]):
-        for item in batch:
-            self.queue.put(item)
+        self.queue.put(('put_batch', batch))
+        self.got_task.set()
 
     def close(self):
-        self.queue.put(None)
-        self.thread.join()
-
-class H5Reader:
-    def __init__(self, model_path, device, empty_convo_ids=[], queue_size=2, timeout=15, shuffle=False):
-        self.file_path = os.path.join(model_path, "distributions.hdf5")
-        self.device = device
-        self.timeout = timeout
-        self.empty_convo_ids = empty_convo_ids
-        self.queue = queue.Queue(maxsize=queue_size)
-        self.stop_loading = threading.Event()
-        self.order_list = []
-        self.dataset_len = 0
-        self.awaiting = False
-        self.target = None
-        if shuffle:
-            target = self._load_data_shuffled
-        else:
-            target = self._load_data
-        self.loading_thread = threading.Thread(target=target)
-        self.loading_thread.start()
-
-    def restart_thread(self):
-        self.stop_loading.set()
-        self.loading_thread.join()
-        self.stop_loading.clear()
-        self.queue = queue.Queue(maxsize=self.queue.maxsize)
-        self.loading_thread = threading.Thread(target=self.target)
-        self.loading_thread.start()
-
-    def _load_data(self):
-        with h5py.File(self.file_path, 'r') as hdf_file:
-            self.dataset_len = len(hdf_file)
-            while True:
-                dataset_names = sorted(hdf_file.keys(), key=lambda x: int(x.split('_')[1]))
-                for id, dataset_name in enumerate(dataset_names):
-                    if id in self.empty_convo_ids:
-                        continue
-
-                    self._await()
-
-                    np_distribution = Distribution(np.array(hdf_file[dataset_name]).astype(np.float32), id)
-                    
-                    self.queue.put(np_distribution, block=False)
-
-    def _load_data_shuffled(self):
-        with h5py.File(self.file_path, 'r') as hdf_file:
-            while True:
-                self._await_order_list()
-                for id in self.order_list:
-                    if id in self.empty_convo_ids:
-                        continue
-                    self._await()
-                    dataset_name = f'convo_{id}'
-                    np_distribution = Distribution(np.array(hdf_file[dataset_name]).astype(np.float32), id)
-                    self.queue.put(np_distribution, block=False)
-                self.order_list = []
-
-    def _await(self):
-        time_left = self.timeout
-        while self.queue.qsize() >= self.queue.maxsize - 1:
-            if self.stop_loading.is_set():
-                return
-            time.sleep(0.05)
-            if not self.awaiting:
-                time_left -= 0.05
-            if time_left <= 0:
-                return
-            
-    def _await_order_list(self):
-        while not self.order_list:
-            if self.stop_loading.is_set():
-                return
-            time.sleep(0.05)
-
-    def toggle_await(self):
-        self.awaiting = not self.awaiting
-
-    def read_next(self) -> torch.Tensor:
-        tensor = self.queue.get()
-        self.queue.task_done()
-        return tensor
-
-    def set_loading_order(self, order_list):
-        self.order_list = order_list
-
-    def close(self):
-        self.stop_loading.set()
+        self.stop.set()
+        self.got_task.set()
+        self.queue.join()
         self.loading_thread.join()
 
 def read_jsonl_lazy(file_path):
@@ -146,22 +119,6 @@ def read_jsonl_lazy(file_path):
                 yield data
             except json.JSONDecodeError as e:
                 print(f"Fuck up on line {line_number}: {e.msg}. Line content: {line.strip()}")
-
-def get_special_tokens(vocab_family) -> dict[str, str|int]:
-    if vocab_family == "LLAMA":
-        sp_toks = {
-            "bos": "<s>",
-            "bos_id": 1,
-            "eos": "</s>",
-            "eos_id": 2,
-            "pad": None,
-            "pad_id": None,
-            "unk": "<unk>",
-            "unk_id": 0
-        }
-    else:
-        raise NotImplementedError(f"{vocab_family} not yet supported")
-    return sp_toks
 
 def good_encode(text: str, sp_toks: dict, tokenizer, encode_special=True, replace_tokens=True):
     if replace_tokens:
@@ -264,6 +221,9 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
     for convo_id, item in tqdm(enumerate(read_jsonl_lazy(dataset_path)), desc="Tokenizing", unit="convo"): # Every conversation
         conversation_tokenized, conversation_content_ranges, empty = tokenize_convo(item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, add_bos=add_bos)
         
+        if empty:
+            continue
+
         num_pad_tokens = 0
         cropped_end = False
 
@@ -282,18 +242,34 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
                 cropped_end = True
             corrected_content_ranges.append((start, end))
 
-        conversation = ConvoTokenized(conversation_tokenized, corrected_content_ranges, num_pad_tokens, empty, cropped_end, convo_id)
+        conversation = ConvoTokenized(conversation_tokenized, corrected_content_ranges, num_pad_tokens, cropped_end, convo_id)
         dataset.append(conversation)
 
     return dataset
+
+def get_special_tokens(vocab_family) -> dict[str, str|int]:
+    if vocab_family == "llama" | vocab_family == "mistral":
+        sp_toks = {
+            "bos": "<s>",
+            "bos_id": 1,
+            "eos": "</s>",
+            "eos_id": 2,
+            "pad": None,
+            "pad_id": None,
+            "unk": "<unk>",
+            "unk_id": 0
+        }
+    else:
+        raise NotImplementedError(f"{vocab_family} not yet supported")
+    return sp_toks
 
 def get_vocab_family(tokenizer=None, model_path="") -> str:
     if tokenizer == None:
         tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
 
     token_29999_to_family = {
-        "监": "Mistral",
-        "Z": "LLAMA"
+        "监": "mistral",
+        "Z": "llama"
     }
 
     token_29999 = tokenizer.convert_ids_to_tokens(29999)
