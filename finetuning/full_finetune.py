@@ -90,7 +90,7 @@ def full_finetune(params: Params):
 
     for step in pbar:
         updated = False
-
+        pbar.update
         if params.shuffle_data:
             if not filtered_order_list:
                 order_list = torch.randperm(params.full_dataset_len).tolist()

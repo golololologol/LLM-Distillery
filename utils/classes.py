@@ -137,15 +137,14 @@ class Paths:
         self.empty_folder(self.cache)
 
 class Distribution:
-    def __init__(self, origin_convo_id: int, empty: bool = False, length: int = 0, ppl: float = -1):
+    def __init__(self, origin_convo_id: int, length: int = 0, ppl: float = -1):
         self.distribution: ndarray|torch.Tensor = None
-        self.tokenized: ndarray = np.array([])
         self.length: int = length
         self.origin_convo_id: int = origin_convo_id
         self.ppl: float = ppl
 
 class ConvoTokenized:
-    def __init__(self, tokenized: ndarray, content_ranges, padding, is_empty, cropped_end, convo_id):
+    def __init__(self, tokenized: ndarray, content_ranges, padding, cropped_end, convo_id):
         self.tokenized: ndarray = tokenized
         self.content_ranges: list[tuple[int, int]] = content_ranges
         self.padding: int = padding
@@ -218,14 +217,14 @@ class TeacherModel(BaseModel):
         self.next_stop_id: int = 0
 
     def _inference(self, batch_tokenized: list[np.ndarray]) -> torch.Tensor:
-        assert self.model is not None, "Model has not been loaded yet."
+        assert self.model is not None, f"{self.model_name}: Model has not been loaded yet."
 
         with torch.no_grad():
             batch_tensor = torch.tensor(batch_tokenized, dtype=torch.long, device=self.device)
-            batch_logits = self.model.forward(batch_tensor).float() # type: ignore
+            batch_logits = self.model.forward(batch_tensor).float()/self.temperature # type: ignore
             if not self.distr_device:
                 self.distr_device = str(batch_logits.device) # type: ignore
-            return batch_logits # type: ignore
+            return batch_logits.to(self.distr_device) # type: ignore
         
     def _get_content_indices_tensor(self, content_ranges, context_len) -> torch.Tensor:
         assert self.distr_device is not "", "Call to get content indices before distribution's device was set."
@@ -251,7 +250,7 @@ class TeacherModel(BaseModel):
             batch_convos = self.dataset[self.convo_id:convos_to_inference]
 
             for convo in batch_convos:
-                batch_distributions.append(Distribution(convo.origin_convo_id, convo.is_empty, convo.length))
+                batch_distributions.append(Distribution(convo.origin_convo_id, convo.length))
                 batch_tokenized.append(convo.tokenized)
             
             batch_size = len(batch_distributions)
@@ -280,7 +279,7 @@ class TeacherModel(BaseModel):
                 
             return batch_distributions
                     
-    def get_batch_content_logprobs(self) -> list[Distribution]:
+    def get_batch_content_logprobs(self) -> tuple[list[Distribution], int]:
         with torch.no_grad():
             batch_distributions = self._get_batch_logprobs()
             batch_content_distributions = []
@@ -291,11 +290,11 @@ class TeacherModel(BaseModel):
                 gathered_log_probs = distribution.distribution[np.arange(len(content_indices)), content_tokens]
                 distribution.ppl = min(np.exp(-np.mean(gathered_log_probs)), 100)
                 batch_content_distributions.append(distribution)
+
+            batch_size = len(batch_content_distributions)
+            self.convo_id += batch_size
             
-            return batch_content_distributions
-        
-    def batch_done(self, batch_size: int):
-        self.convo_id += batch_size
+            return batch_content_distributions, batch_size
         
     def sort_dataset_by_len(self) -> dict[int, int]:
         self.dataset.sort(key=lambda convo: convo.length)
@@ -332,7 +331,7 @@ class TeacherModel(BaseModel):
         cache = ExLlamaV2Cache(model, lazy=True)
 
         model.load_autosplit(cache, reserve_vram=reserve_vram_kb)
-        return model
+        self.model = model
     
     def unload_model(self):
         if self.model is None:

@@ -1,4 +1,5 @@
 import os
+from tqdm import tqdm
 from utils.dataset_utils import tokenize_dataset, H5DataManager
 from utils.classes import TeacherModel, StudentModel, Paths
     
@@ -129,13 +130,25 @@ def main():
     data_manager = H5DataManager(paths.dataset, device)
 
     # Collecting loop
-    for stop_id in loop_stops:
+    for stop_id in tqdm(loop_stops, desc="Chunks", position=0, smoothing=0.06, leave=False):
         rewrite_teachers_param(teachers, "next_stop_id", stop_id)
-        for teacher in teachers:
-            teacher.load_model()
+
+        for teacher in tqdm(teachers, desc="Teachers", position=1, smoothing=0.06, leave=False):
+            assert isinstance(teacher, TeacherModel)
+
+            teacher.load_model(reserve_vram_gb=reserve_vram)
+
+            total_convos = stop_id - teacher.convo_id
+            pbar_convos = tqdm(total=total_convos, desc="Convos", position=2, smoothing=0.06, leave=False)
+
             while teacher.convo_id < stop_id:
-                batch_content_logprobs = teacher.get_batch_content_logprobs()
+                batch_content_logprobs, batch_size = teacher.get_batch_content_logprobs()
                 data_manager.write_batch(batch_content_logprobs)
+                pbar_convos.update(batch_size)
+
+            pbar_convos.close()
+            teacher.unload_model()
+        
 
             
 

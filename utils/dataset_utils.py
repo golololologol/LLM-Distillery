@@ -69,7 +69,12 @@ class H5DataManager:
         min_len = min(disk_data.shape[0], new_data.shape[0])
         diff = max_len - min_len
 
-        merged_data = np.pad(disk_data, ((0, diff), (0, 0))) + np.pad(new_data, ((0, diff), (0, 0)))
+        if disk_data.shape[0] < new_data.shape[0]:
+            disk_data = np.pad(disk_data, ((0, diff), (0, 0)))
+        else:
+            new_data = np.pad(new_data, ((0, diff), (0, 0)))
+
+        merged_data = disk_data + new_data
 
         return np.log(merged_data)
 
@@ -107,7 +112,7 @@ class H5DataManager:
         self.stop.set()
         self.got_task.set()
         self.queue.join()
-        self.loading_thread.join()
+        self.loading_process.join()
 
 def read_jsonl_lazy(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -218,7 +223,7 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
     
     dataset = []
 
-    for convo_id, item in tqdm(enumerate(read_jsonl_lazy(dataset_path)), desc="Tokenizing", unit="convo"): # Every conversation
+    for convo_id, item in tqdm(enumerate(read_jsonl_lazy(dataset_path)), desc="Tokenizing", unit="convo", smoothing=0.06, leave=False): # Every conversation
         conversation_tokenized, conversation_content_ranges, empty = tokenize_convo(item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, add_bos=add_bos)
         
         if empty:
