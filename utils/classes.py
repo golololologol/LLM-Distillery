@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
+from transformers import AutoModelForCausalLM
 from numpy import ndarray
 from typing import Optional
 import gc
@@ -197,14 +198,96 @@ class BaseModel:
         self.vocab_family = get_vocab_family(self.model_path)
         self.special_tokens = get_special_tokens(self.model_path)
 
-class StudentModel(BaseModel):
-    def __init__(self, model_path: str):
-        super().__init__(model_path)
-        self.model = None
-        self.optimizer = None
-        self.scheduler = None
-        self.step_span = 0
+    def _get_content_indices_tensor(self, content_ranges) -> torch.Tensor:
+        content_indices = []
+        for start, end in content_ranges:
+            if start <= self.context_len:
+                content_indices.append(torch.arange(start, end, device=self.device))
+        return torch.cat(content_indices)
+    
+    def _get_content_indices_np(self, content_ranges) -> ndarray:
+        content_indices = []
+        for start, end in content_ranges:
+            if start <= self.context_len:
+                content_indices.append(np.arange(start, end))
+        return np.concatenate(content_indices)
 
+class StudentModel(BaseModel):
+    def __init__(self, model_path: str, paths: Paths):
+        super().__init__(model_path)
+        self.model: Optional[AutoModelForCausalLM] = None
+        self.optimizer_name = ""
+        self.optimizer = None
+        self.lr_scheduler_name = ""
+        self.lr_scheduler = None
+        self.lr = 0
+        self.grad_accum_steps = 0
+        self.num_training_steps = 0
+        self.validation_per_steps = 0
+        self.save_interval = 0
+        self.training_precision_name = ""
+        self.decay_start = 0
+        self.paths: Paths = paths
+        self.num_epochs = 0
+        self.num_warmup_steps = 0
+        self.multi_gpu = False
+        self.verbose = True
+
+    def load_model(self):
+        if self.verbose:
+            print(f"Loading {self.model_name}...")
+
+        precision_dict = {
+            "fp16": torch.float16,
+            "4bit": torch.bfloat16,
+            "fp32": torch.float32,
+            "bf16": torch.bfloat16
+        }
+        
+        train_precision = precision_dict.get(self.training_precision_name, torch.float16)
+
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            device_map="auto" if self.multi_gpu else self.device,
+            torch_dtype=train_precision,
+            load_in_4bit=self.training_precision_name == "4bit",
+            attn_implementation="flash_attention_2"
+        )
+    
+    def _inference(self, batch_tokenized: list[np.ndarray]) -> torch.Tensor:
+        assert self.model is not None, f"{self.model_name}: Model has not been loaded yet."
+
+        batch_tensor = torch.tensor(batch_tokenized, dtype=torch.long, device=self.device)
+        batch_logits = self.model(batch_tensor).logits.float() / self.temperature
+        return batch_logits
+    
+    def get_batch_logprobs(self) -> list[Distribution]:
+        with torch.no_grad():
+            batch_distributions: list[Distribution] = []
+            batch_tokenized = []
+            for convo in self.validation_dataset:
+                batch_distributions.append(Distribution(convo.origin_convo_id, convo.length))
+                batch_tokenized.append(convo.tokenized)
+            
+            batch_size = len(batch_distributions)
+            max_non_padded_len = max([convo.length for convo in self.validation_dataset])
+            batch_tokenized = [convo_tokenized[:max_non_padded_len] for convo_tokenized in batch_tokenized]
+            batch_logits = self._inference(batch_tokenized)
+            batch_logprobs = torch.nn.functional.log_softmax(batch_logits, dim=-1)
+
+            for i in range(0, batch_size):
+                convo_logprobs = batch_logprobs[i]
+                content_indices = self._get_content_indices_tensor(self.validation_dataset[i].content_ranges)
+                convo_logprobs = convo_logprobs[content_indices]
+                batch_distributions[i].distribution = convo_logprobs.cpu().numpy()
+                batch_distributions[i].ppl = min(np.exp(-np.mean(convo_logprobs)), 100)
+                
+            return batch_distributions
+        
+    def _init_logging(self):
+        self.paths.empty_logs()
+        self.paths.empty_student_folders()
+        
 class TeacherModel(BaseModel):
     def __init__(self, model_path: str):
         super().__init__(model_path)
@@ -215,8 +298,9 @@ class TeacherModel(BaseModel):
         self.ppl_dataset: list = []
         self.encourage_eos: bool = False
         self.next_stop_id: int = 0
+        self.verbose: bool = True
 
-    def _inference(self, batch_tokenized: list[np.ndarray]) -> torch.Tensor:
+    def _inference(self, batch_tokenized: list[ndarray]) -> torch.Tensor:
         assert self.model is not None, f"{self.model_name}: Model has not been loaded yet."
 
         with torch.no_grad():
@@ -225,25 +309,10 @@ class TeacherModel(BaseModel):
             if not self.distr_device:
                 self.distr_device = str(batch_logits.device) # type: ignore
             return batch_logits.to(self.distr_device) # type: ignore
-        
-    def _get_content_indices_tensor(self, content_ranges, context_len) -> torch.Tensor:
-        assert self.distr_device is not "", "Call to get content indices before distribution's device was set."
-        content_indices = []
-        for start, end in content_ranges:
-            if start <= context_len:
-                content_indices.append(torch.arange(start, end, device=self.distr_device))
-        return torch.cat(content_indices)
-    
-    def _get_content_indices_np(self, content_ranges, context_len) -> ndarray:
-        content_indices = []
-        for start, end in content_ranges:
-            if start <= context_len:
-                content_indices.append(np.arange(start, end))
-        return np.concatenate(content_indices)
 
     def _get_batch_logprobs(self) -> list[Distribution]:
         with torch.no_grad():
-            batch_tokenized: list[torch.Tensor] = []
+            batch_tokenized: list[ndarray] = []
             batch_distributions: list[Distribution] = []
 
             convos_to_inference = min(self.convo_id + self.batch_size, self.next_stop_id)
@@ -265,7 +334,7 @@ class TeacherModel(BaseModel):
             for i in range(0, batch_size):
                 convo_logprobs = batch_logprobs[i]
                 if self.encourage_eos:
-                    eos_id = self.special_tokens['eos']
+                    eos_id = self.special_tokens['eos_id']
                     content_ends = [end for start, end in self.dataset[self.convo_id + i].content_ranges]
 
                     if self.dataset[self.convo_id + i].cropped_end:
@@ -284,8 +353,8 @@ class TeacherModel(BaseModel):
             batch_distributions = self._get_batch_logprobs()
             batch_content_distributions = []
             for i, distribution in enumerate(batch_distributions):
-                content_indices = self._get_content_indices_np(self.dataset[self.convo_id + i].content_ranges, self.context_len)
-                distribution.distribution = distribution.distribution[content_indices] if len(content_indices) > 0 else np.array([])
+                content_indices = self._get_content_indices_np(self.dataset[self.convo_id + i].content_ranges)
+                distribution.distribution = distribution.distribution[content_indices]
                 content_tokens = self.dataset[self.convo_id + i].tokenized[content_indices][1:]
                 gathered_log_probs = distribution.distribution[np.arange(len(content_indices)), content_tokens]
                 distribution.ppl = min(np.exp(-np.mean(gathered_log_probs)), 100)
@@ -293,7 +362,7 @@ class TeacherModel(BaseModel):
 
             batch_size = len(batch_content_distributions)
             self.convo_id += batch_size
-            
+
             return batch_content_distributions, batch_size
         
     def sort_dataset_by_len(self) -> dict[int, int]:
@@ -301,13 +370,10 @@ class TeacherModel(BaseModel):
         self.dataset_sorted = True
         sorting_map = {convo.origin_convo_id: index for index, convo in enumerate(self.dataset)}
         return sorting_map
-    
-    def sort_dataset_by_map(self, sorting_map: dict[int, int]):
-        self.dataset.sort(key=lambda convo: sorting_map[convo.origin_convo_id])
-        self.dataset_sorted = True
                 
     def load_model(self, reserve_vram_gb: list[float] = []):
-        print(f"Loading {self.model_name}...")
+        if self.verbose:
+            print(f"Loading {self.model_name}...")
 
         num_gpus = torch.cuda.device_count()
         if num_gpus == 0:
@@ -337,7 +403,8 @@ class TeacherModel(BaseModel):
         if self.model is None:
             print(f"{self.model_name} is already unloaded.")
             return
-        print(f"Unloading {self.model_name}...")
+        if self.verbose:
+            print(f"Unloading {self.model_name}...")
         self.model.unload()
     
     def unload_full(self):
@@ -348,18 +415,3 @@ class TeacherModel(BaseModel):
         self.ppl_dataset = []
         self.convo_id = 0
         gc.collect()
-
-    def list_empty_convos(self) -> list[int]:
-        empty_convos = []
-        for i, convo in enumerate(self.dataset):
-            if convo.is_empty:
-                empty_convos.append(i)
-        return empty_convos
-
-    def gen_prelim_ppl(self):
-        print(f"Generating preliminary PPL for {self.model_name}...")
-        with torch.no_grad():
-            total_ppl = 0
-            total_tokens = 0
-            
-        return total_ppl / total_tokens

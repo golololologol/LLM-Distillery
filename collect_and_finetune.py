@@ -65,24 +65,36 @@ def prepare_teacher_datasets(dataset_path, validation_dataset_path, ppl_dataset_
             ppl_dataset_path, teacher.model_path,teacher.prompt_format,context_len,
             save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos)
     
-def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size, context_len, temperature):
+def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, verbose: bool):
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
         teacher.temperature = temperature
         teacher.dataset_len = len(teacher.dataset)
+        teacher.verbose = verbose
 
     student.crop_to_size = crop_to_size
     student.context_len = context_len
     student.temperature = temperature
+    student.verbose = verbose
+
+def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start):
+    student.num_epochs = num_epochs
+    student.num_warmup_steps = num_warmup_steps
+    student.lr = lr
+    student.lr_scheduler_name = lr_scheduler
+    student.optimizer_name = optimizer
+    student.grad_accum_steps = grad_accum_steps
+    student.training_precision_name = training_precision
+    student.decay_start = decay_start
 
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
     for teacher in teachers:
         setattr(teacher, param_name, param_value)
 
-def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map):
+def sort_datasets_by_len(teachers: list[TeacherModel]):
     for teacher in teachers:
-        teacher.sort_dataset_by_map(sorting_map)
+        teacher.sort_dataset_by_len()
 
 def main():
     cache_folder = r"F:\cache"
@@ -109,45 +121,53 @@ def main():
     num_warmup_steps = 1000
     temperature = 3
     lr = 1e-4
-    lr_scheduler = "linear"
+    lr_scheduler = "wsd"
     optimizer = "adamw"
     grad_accum_steps = 1
+    training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit"
+    multi_gpu = False
     decay_start = 0.9
 
-    # Collecting logic
+    # Misc
+    verbose = True
+
+    # Initialization
     teachers = get_teachers(teacher_models_folder)
     student = StudentModel(student_path)
     prepare_teacher_datasets(dataset_path, validation_dataset_path, ppl_dataset_path, teachers, context_len, save_sys_range, save_user_range, save_assistant_range)
-    set_params(teachers, student, crop_distr_to_size, context_len, temperature)
+    set_params(teachers, student, crop_distr_to_size, context_len, temperature, verbose)
+    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start, multi_gpu)
     ensure_compatibility(teachers, student)
-    
-    # Initialization
-    sorting_map = teachers[0].sort_dataset_by_len()
-    sort_datasets_by_map(teachers, sorting_map)
+    sort_datasets_by_len(teachers)
     loop_stops = calculate_loop_stops(teachers[0], max_cache_size_gb)
     paths = Paths(cache_folder, clean_start=True)
    
     data_manager = H5DataManager(paths.dataset, device)
 
-    # Collecting loop
-    for stop_id in tqdm(loop_stops, desc="Chunks", position=0, smoothing=0.06, leave=False):
-        rewrite_teachers_param(teachers, "next_stop_id", stop_id)
+    # Main loop
+    for epoch in tqdm(range(num_epochs), desc="Epochs", position=0, smoothing=0.06, leave=True):
 
-        for teacher in tqdm(teachers, desc="Teachers", position=1, smoothing=0.06, leave=False):
-            assert isinstance(teacher, TeacherModel)
+        for stop_id in tqdm(loop_stops, desc="Chunks", position=1, smoothing=0.06, leave=False):
+            rewrite_teachers_param(teachers, "next_stop_id", stop_id)
 
-            teacher.load_model(reserve_vram_gb=reserve_vram)
+            # Collecting loop
+            for teacher in tqdm(teachers, desc="Teachers", position=2, smoothing=0.06, leave=False):
+                assert isinstance(teacher, TeacherModel)
 
-            total_convos = stop_id - teacher.convo_id
-            pbar_convos = tqdm(total=total_convos, desc="Convos", position=2, smoothing=0.06, leave=False)
+                teacher.load_model(reserve_vram_gb=reserve_vram)
 
-            while teacher.convo_id < stop_id:
-                batch_content_logprobs, batch_size = teacher.get_batch_content_logprobs()
-                data_manager.write_batch(batch_content_logprobs)
-                pbar_convos.update(batch_size)
+                total_convos = stop_id - teacher.convo_id
+                pbar_convos = tqdm(total=total_convos, desc="Convos", position=3, smoothing=0.06, leave=False)
 
-            pbar_convos.close()
-            teacher.unload_model()
+                while teacher.convo_id < stop_id:
+                    batch_content_logprobs, batch_size = teacher.get_batch_content_logprobs()
+                    data_manager.write_batch(batch_content_logprobs)
+                    pbar_convos.update(batch_size)
+
+                pbar_convos.close()
+                teacher.unload_model()
+        
+
         
 
             
