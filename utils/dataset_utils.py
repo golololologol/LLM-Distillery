@@ -8,7 +8,8 @@ import logging
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
-from classes import ConvoTokenized, Distribution
+from utils.classes import ConvoTokenized, Distribution
+from utils.vocab_utils import get_vocab_family, get_special_tokens
 logging.getLogger("transformers").setLevel(logging.ERROR)  # Shut up transformers
 logging.getLogger("torch").setLevel(logging.ERROR) # And pytorch for good measure
 
@@ -16,14 +17,15 @@ class H5DataManager:
     def __init__(self, dataset_path, device, max_queue_size=3):
         self.file_path = os.path.join(dataset_path, "distributions.hdf5")
         self.device = device
-        self.queue = multiprocessing.Queue(maxsize=max_queue_size)
-        self.result_queue = multiprocessing.Queue(maxsize=max_queue_size)
+        self.queue = multiprocessing.Queue(max_queue_size)
+        self.result_queue = multiprocessing.Queue(max_queue_size)
         self.got_task = multiprocessing.Event()
         self.stop = multiprocessing.Event()
         self.clear_dataset = multiprocessing.Event()
         self.loading_process = multiprocessing.Process(target=self._process_thread)
-        self.loading_process.start()
         self.teacher_convos = []
+
+        self.loading_process.start()
 
     def _process_thread(self):
         with h5py.File(self.file_path, 'a') as hdf_file:
@@ -38,11 +40,15 @@ class H5DataManager:
                 
                 while not self.queue.empty():
                     task, data = self.queue.get()
-                    if task == 'get_id':
-                        self.result_queue.put(self._load_id(hdf_file, data))
-                    elif task == 'put_batch':
-                        self._process_distributions(hdf_file, data)
-                    self.queue.task_done()
+                    match task:
+                        case 'get_id':
+                            self.result_queue.put(self._load_id(hdf_file, data))
+                        case 'put_batch':
+                            self._process_distributions(hdf_file, data)
+                        case 'get_available_ids':
+                            self.result_queue.put([int(dataset_name.split('_')[1]) for dataset_name in hdf_file])
+                        case 'clear_dataset':
+                            self._clear_dataset(hdf_file)
                 
                 self.got_task.clear()
 
@@ -108,6 +114,11 @@ class H5DataManager:
         self.queue.put(('put_batch', batch))
         self.got_task.set()
 
+    def get_dataset_ids(self) -> list[int]:
+        self.queue.put(('get_available_ids', None))
+        self.got_task.set()
+        return self.result_queue.get()
+
     def close(self):
         self.stop.set()
         self.got_task.set()
@@ -158,7 +169,7 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
     conversation_content_ranges = []
     num_turns = len(json_item["conversations"])
 
-    if num_turns < 2:
+    if num_turns == 0:
         empty = True
         return conversation_tokenized, conversation_content_ranges, empty
 
@@ -238,8 +249,8 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
             num_pad_tokens = context_len - len(conversation_tokenized)
             conversation_tokenized = np.concatenate((conversation_tokenized, np.array([sp_toks["eos_id"]] * num_pad_tokens, dtype=np.int64)))
 
+        corrected_content_ranges = []
         for start, end in conversation_content_ranges:
-            corrected_content_ranges = []
             if start > context_len:
                 continue
             if end > context_len:
@@ -251,33 +262,3 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
         dataset.append(conversation)
 
     return dataset
-
-def get_special_tokens(vocab_family) -> dict[str, str|int]:
-    if vocab_family == "llama" | vocab_family == "mistral":
-        sp_toks = {
-            "bos": "<s>",
-            "bos_id": 1,
-            "eos": "</s>",
-            "eos_id": 2,
-            "pad": None,
-            "pad_id": None,
-            "unk": "<unk>",
-            "unk_id": 0
-        }
-    else:
-        raise NotImplementedError(f"{vocab_family} not yet supported")
-    return sp_toks
-
-def get_vocab_family(tokenizer=None, model_path="") -> str:
-    if tokenizer == None:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
-
-    token_29999_to_family = {
-        "监": "mistral",
-        "Z": "llama"
-    }
-
-    token_29999 = tokenizer.convert_ids_to_tokens(29999)
-    vocab_family = token_29999_to_family.get(token_29999, "Unknown") # type: ignore
-    return vocab_family
-    

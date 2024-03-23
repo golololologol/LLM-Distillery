@@ -262,10 +262,13 @@ tensor2_len = tensor2.shape[0]
 list1 = [1,2]
 list2 = [1,1]
 full_distr = tensor1[list1, list2]
-print(np.arange(tensor1_len))
+#print(np.arange(20, 40))
 
 #dict = {'a': 1, 'b': 2, 'c': 3}
 #print(1 in dict)
 #
 #dict["d"] = 4
 #print(dict.clear())
+list_int = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+for i in range(0, len(list_int), 3):
+    print(list_int[i:i+3])

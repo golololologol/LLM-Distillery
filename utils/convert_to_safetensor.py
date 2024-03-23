@@ -4,6 +4,7 @@ import shutil
 import torch
 from collections import defaultdict
 from safetensors.torch import load_file, save_file
+import shutil
 
 def shared_pointers(tensors):
     ptrs = defaultdict(list)
@@ -88,5 +89,5 @@ def convert_model(pytorch_folder):
     else:
         convert_files(pytorch_folder, safetensors_folder)
 
-    os.rmdir(pytorch_folder)
+    shutil.rmtree(pytorch_folder)  # Remove the directory and its contents
     return safetensors_folder

@@ -8,6 +8,7 @@ def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb):
     distr_size_kb = kb_per_distr_val * teacher.crop_to_size
     max_cache_size_kb = max_cache_size_gb * 1e6
     cache_size_kb = 0
+    full_collect = False
     loop_stops = []
     
     for id, convo in enumerate(teacher.dataset):
@@ -18,17 +19,17 @@ def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb):
             loop_stops.append(id+1)
             cache_size_kb = 0
     
-    if not loop_stops or loop_stops[-1] != len(teacher.dataset):
-        loop_stops.append(len(teacher.dataset))
+    if not loop_stops or loop_stops[-1] < len(teacher.dataset):
+        full_collect = True
     
-    return loop_stops
+    return loop_stops, full_collect
 
 def get_teachers(models_folder) -> list[TeacherModel]:
     teachers = []
     model_paths = [os.path.join(models_folder, model_name) for model_name in os.listdir(models_folder)]
 
     if not model_paths:
-        print("No models found in the teacher models folder")
+        print("No models found in the teacher models folder!")
         exit(0)
     
     for model_path in model_paths:
@@ -50,35 +51,35 @@ def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel):
         if value != getattr(student, key):
             raise ValueError(f"Student has {key}={getattr(student, key)} while the teachers have {key}={value}")
         
-def prepare_teacher_datasets(dataset_path, validation_dataset_path, ppl_dataset_path, teachers: list[TeacherModel], context_len, save_sys_range, save_user_range, save_assistant_range):
+def prepare_teacher_datasets(dataset_path, validation_dataset_path, teachers: list[TeacherModel], context_len, save_sys_range, save_user_range, save_assistant_range):
     for teacher in teachers:
         print(f"Preparing datasets for {teacher.model_name}...")
         teacher.dataset = tokenize_dataset(
             dataset_path, teacher.model_path, teacher.prompt_format, context_len,
             save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos)
+        teacher.dataset_len = len(teacher.dataset)
 
         teacher.validation_dataset = tokenize_dataset(
             validation_dataset_path, teacher.model_path,teacher.prompt_format,context_len,
             save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos)
-        
-        teacher.ppl_dataset = tokenize_dataset(
-            ppl_dataset_path, teacher.model_path,teacher.prompt_format,context_len,
-            save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos)
+        teacher.validation_dataset_len = len(teacher.validation_dataset)
     
-def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, verbose: bool):
+def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, verbose: bool, data_manager: H5DataManager):
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
         teacher.temperature = temperature
         teacher.dataset_len = len(teacher.dataset)
         teacher.verbose = verbose
+        teacher.data_manager = data_manager
 
     student.crop_to_size = crop_to_size
     student.context_len = context_len
     student.temperature = temperature
     student.verbose = verbose
+    student.data_manager = data_manager
 
-def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start):
+def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start, multi_gpu):
     student.num_epochs = num_epochs
     student.num_warmup_steps = num_warmup_steps
     student.lr = lr
@@ -87,6 +88,7 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.grad_accum_steps = grad_accum_steps
     student.training_precision_name = training_precision
     student.decay_start = decay_start
+    student.multi_gpu = multi_gpu
 
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
     for teacher in teachers:
@@ -100,12 +102,11 @@ def main():
     cache_folder = r"F:\cache"
     max_cache_size_gb = 200
 
-    dataset_path = r"F:\ppl_test_dataset.jsonl"
+    dataset_path = r"F:\soup.jsonl"
+    validation_dataset_path = r"F:\smol_test.jsonl"
+
     teacher_models_folder = r"F:\teacher_models"
     student_path = r"C:\Users\gololo\Desktop\TinyLlama-1.1B-intermediate-step-1431k-3T"
-
-    ppl_dataset_path = r"F:\ppl_test_dataset.jsonl"
-    validation_dataset_path = r"F:\ppl_test_dataset.jsonl"
 
     # General model settings
     context_len = 2*1024
@@ -132,19 +133,20 @@ def main():
     verbose = True
 
     # Initialization
-    teachers = get_teachers(teacher_models_folder)
-    student = StudentModel(student_path)
-    prepare_teacher_datasets(dataset_path, validation_dataset_path, ppl_dataset_path, teachers, context_len, save_sys_range, save_user_range, save_assistant_range)
-    set_params(teachers, student, crop_distr_to_size, context_len, temperature, verbose)
-    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start, multi_gpu)
-    ensure_compatibility(teachers, student)
-    sort_datasets_by_len(teachers)
-    loop_stops = calculate_loop_stops(teachers[0], max_cache_size_gb)
     paths = Paths(cache_folder, clean_start=True)
-   
     data_manager = H5DataManager(paths.dataset, device)
-
+    teachers = get_teachers(teacher_models_folder)
+    student = StudentModel(student_path, paths)
+    ensure_compatibility(teachers, student)
+    prepare_teacher_datasets(dataset_path, validation_dataset_path, teachers, context_len, save_sys_range, save_user_range, save_assistant_range)
+    set_params(teachers, student, crop_distr_to_size, context_len, temperature, verbose, data_manager)
+    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start, multi_gpu)
+    sort_datasets_by_len(teachers)
+    loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb)
+    
     # Main loop
+    print("Processing all data..." if full_collect else "Processing data in chunks...")
+
     for epoch in tqdm(range(num_epochs), desc="Epochs", position=0, smoothing=0.06, leave=True):
 
         for stop_id in tqdm(loop_stops, desc="Chunks", position=1, smoothing=0.06, leave=False):
@@ -166,7 +168,7 @@ def main():
 
                 pbar_convos.close()
                 teacher.unload_model()
-        
+
 
         
 
