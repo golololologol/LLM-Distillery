@@ -4,9 +4,9 @@ from numpy import ndarray
 from typing import Optional
 from utils.vocab_utils import get_vocab_family, get_special_tokens
 from utils.convert_to_safetensor import convert_model
-from utils.dataset_utils import H5DataManager
 from tqdm import tqdm
 import multiprocessing
+import pickle
 import torch
 import numpy as np
 import shutil
@@ -99,7 +99,6 @@ def input_config():
         # Type conversion magic here
         try:
             if isinstance(default_value, bool):
-                # Convert "true", "false" to boolean
                 config[key] = value_input.lower() in ['true', '1', 't', 'y', 'yes']
             elif isinstance(default_value, int):
                 config[key] = int(value_input)
@@ -189,7 +188,7 @@ class BaseModel:
         self.context_len: int = 0
         self.context_chunk_size: int = 0
 
-        self.data_manager: Optional[H5DataManager] = None
+        self.data_manager = None
         self.progress_bar: Optional[tqdm] = None
 
         self.dataset: list[ConvoTokenized] = []
@@ -205,9 +204,9 @@ class BaseModel:
         self.temperature: float = 1.0
         self.crop_to_size: int = 0
         self.convo_id: int = 0
-        self.prepare()
+        self._prepare()
 
-    def prepare(self):
+    def _prepare(self):
         self.model_name = os.path.basename(self.model_path)
 
         if not os.path.exists(self.model_path):
@@ -243,12 +242,6 @@ class BaseModel:
         for start, end in content_ranges:
             content_indices.append(torch.arange(start, end, device=self.device))
         return torch.cat(content_indices)
-    
-    def _get_content_indices_np(self, content_ranges) -> ndarray:
-        content_indices = []
-        for start, end in content_ranges:
-            content_indices.append(np.arange(start, end))
-        return np.concatenate(content_indices)
 
 class StudentModel(BaseModel):
     def __init__(self, model_path: str, paths: Paths):
@@ -269,11 +262,10 @@ class StudentModel(BaseModel):
         self.num_epochs = 0
         self.num_warmup_steps = 0
         self.multi_gpu = False
-        self.verbose = True
 
     def load_model(self):
-        if self.verbose:
-            print(f"Loading {self.model_name}...")
+
+        print(f"Loading {self.model_name}...")
 
         precision_dict = {
             "fp16": torch.float16,
@@ -299,7 +291,7 @@ class StudentModel(BaseModel):
         batch_logits = self.model(batch_tensor).logits.float() / self.temperature
         return batch_logits
     
-    def get_batch_logprobs(self) -> list[Distribution]:
+    def _get_batch_logprobs(self) -> list[Distribution]:
         with torch.no_grad():
             batch_distributions: list[Distribution] = []
             batch_tokenized = []
@@ -325,86 +317,14 @@ class StudentModel(BaseModel):
     def _init_logging(self):
         self.paths.empty_logs()
         self.paths.empty_student_folders()
-        
-class TeacherModel(BaseModel):
-    def __init__(self, model_path: str, max_queue_size=3):
-        super().__init__(model_path)
-        self.model: Optional[ExLlamaV2] = None
-        self.distr_device: str = ""
-        self.encourage_eos: bool = False
-        self.stop_id: int = 0
-        self.verbose: bool = True
-        self.done_chunk_prep = multiprocessing.Event()
-        self.done_chunk_writes = multiprocessing.Event()
-        self.made_tokens = multiprocessing.Event()
-        self.made_distributions = multiprocessing.Event()
-        self.inference_queue: multiprocessing.Queue = multiprocessing.Queue(max_queue_size)
-        self.result_queue: multiprocessing.Queue = multiprocessing.Queue(max_queue_size)
-        self.batch_creator = multiprocessing.Process(target=self._batch_creator_worker)
-        self.inference_worker = multiprocessing.Process(target=self._inference_worker)
-        self.result_processor = multiprocessing.Process(target=self._result_processor_worker)
 
-    def _batch_creator_worker(self):
-        while self.convo_id < self.next_stop_id:
-            batch_tokenized, batch_distributions, batch_size = self._prepare_batch_for_inference()
-            self.inference_queue.put((batch_tokenized, batch_distributions))
-            self.convo_id += batch_size
-            self.made_tokens.set()
-
-        self.done_chunk_prep.set()
-
-    def _inference_worker(self):
-        while True:
-            self.made_tokens.wait()
-            while not self.inference_queue.empty():
-                batch_tokenized, batch_distributions = self.inference_queue.get()
-                batch_logits = self._inference(batch_tokenized)
-                self.result_queue.put((batch_logits, batch_distributions))
-                self.made_distributions.set()
-            self.made_tokens.clear()
-
-    def _result_processor_worker(self):
-        while True:
-            self.made_distributions.wait()
-            while not self.result_queue.empty():
-                batch_logits, batch_distributions= self.result_queue.get()
-                batch_distributions = self.process_inference_results(batch_logits, batch_distributions)
-            self.made_distributions.clear()
-            
-            if self.done_chunk_prep.is_set():
-                self.done_chunk_writes.set()
-
-    def process_chunk(self, next_stop_id: int):
-        num_to_process = self.stop_id - next_stop_id
-        self.stop_id = next_stop_id
-        self.progress_bar = tqdm(total=num_to_process, desc=f"Convos", position=0, smoothing=0.06, leave=False)
-
-        self.load_model()
-
-        
-
-        self._start_workers()
-
-        self.done_chunk_writes.wait()
-
-        self._stop_workers()
-
-    def _inference(self, batch_tokenized: torch.Tensor) -> torch.Tensor:
-        assert self.model is not None, f"{self.model_name}: Model has not been loaded yet."
-
-        with torch.no_grad():
-            batch_logits = self.model.forward(batch_tokenized).float()/self.temperature # type: ignore
-
-            if not self.distr_device:
-                self.distr_device = str(batch_logits.device) # type: ignore
-            return batch_logits.to(self.distr_device)[:, :, :self.crop_to_size] # type: ignore
-
-    def _prepare_batch_for_inference(self) -> tuple[torch.Tensor, list[Distribution], int]:
+def _batch_creator_worker(made_tokens, inference_queue, batch_size, stop_id, dataset: list[ConvoTokenized]):
+    def _prepare_batch_for_inference(convo_id, batch_size, stop_id, dataset: list[ConvoTokenized]) -> tuple[ndarray, list[Distribution], int]:
         batch_tokenized: list[np.ndarray] = []
         batch_distributions: list[Distribution] = []
 
-        convos_to_inference = min(self.convo_id + self.batch_size, self.next_stop_id)
-        batch_convos = self.dataset[self.convo_id:convos_to_inference]
+        convos_to_inference = min(convo_id + batch_size, stop_id)
+        batch_convos = dataset[convo_id:convos_to_inference]
 
         for convo in batch_convos:
             batch_distributions.append(Distribution(convo.origin_convo_id, convo.length, convo.cropped_end, convo.content_ranges, convo.tokenized))
@@ -415,58 +335,29 @@ class TeacherModel(BaseModel):
         batch_tokenized = [convo_tokenized[:max_non_padded_len] for convo_tokenized in batch_tokenized]
 
         batch_tokenized_np = np.array(batch_tokenized)
-        batch_tensor = torch.tensor(batch_tokenized_np, dtype=torch.long, device=self.device)
         batch_size = len(batch_distributions)
 
-        return batch_tensor, batch_distributions, batch_size
-
-    def process_inference_results(self, batch_logits: torch.Tensor, batch_distributions: list[Distribution]) -> list[Distribution]:
-        with torch.no_grad():
-            batch_logprobs = torch.nn.functional.log_softmax(batch_logits, dim=-1)
-
-            for i, distribution in enumerate(batch_distributions):
-                convo_logprobs = batch_logprobs[i]
-                if self.encourage_eos:
-                    eos_id = self.special_tokens['eos_id']
-                    content_end_ids = [end-1 for start, end in distribution.content_ranges]
-
-                    if distribution.cropped_end:
-                        content_end_ids = content_end_ids[:-1]
-
-                    for end in content_end_ids:
-                        convo_logprobs[end][eos_id] = (torch.max(convo_logprobs[end].exp()) * 1.1).log()
-                        convo_logprobs[end] = (convo_logprobs[end].exp() / convo_logprobs[end].exp().sum()).log()
-
-                distribution.distribution = convo_logprobs[:distribution.length].cpu().numpy()
-
-            batch_content_distributions = self.get_batch_content_logprobs(batch_distributions)
-            H5DataManager.write_batch(batch_content_distributions)
-
-    def get_batch_content_logprobs(self, batch_distributions: list[Distribution]) -> tuple[list[Distribution], int]:
-        with torch.no_grad():
-            batch_content_distributions = []
-            for distribution in batch_distributions:
-                content_indices = self._get_content_indices_np(distribution.content_ranges)
-                distribution.distribution = distribution.distribution[content_indices]
-                content_tokens = distribution.tokenized[content_indices][1:]
-                gathered_log_probs = distribution.distribution[np.arange(len(content_indices) - 1), content_tokens]
-                distribution.ppl = min(np.exp(-np.mean(gathered_log_probs)), 100)
-                batch_content_distributions.append(distribution)
-
-            return batch_content_distributions
+        return batch_tokenized_np, batch_distributions, batch_size
         
-    def sort_dataset_by_len(self):
-        self.dataset.sort(key=lambda convo: convo.length, reverse=True)
-        self.dataset_sorted = True
-  
-    def load_model(self, reserve_vram_gb: list[float] = []):
-        if self.verbose:
-            print(f" Loading {self.model_name}...")
+    convo_id = 0
+    while convo_id < stop_id:
+        batch_tokenized, batch_distributions, batch_size = _prepare_batch_for_inference(convo_id, batch_size, stop_id, dataset)
+        inference_queue.put((batch_tokenized, batch_distributions))
+        convo_id += batch_size
+        made_tokens.set()
+    inference_queue.put((None, None))
+    made_tokens.set()
+
+def _inference_worker(inference_queue, result_queue, made_tokens, made_distributions, model_path, model_name, reserve_vram,
+                        device, temperature, crop_to_size, pbar_queue, context_len, context_chunk_size,batch_size):
+        
+    def _load_model(reserve_vram_gb: list[float] = []):
+        pbar_queue.put(("str", f"Loading {model_name}..."))
 
         num_gpus = torch.cuda.device_count()
         if num_gpus == 0:
             raise Exception("No CUDA-capable GPUs found.")
-        
+
         reserve_vram_kb = [int(128 * 1000**2)]*num_gpus # default 128MB/GPU
 
         for i, reserve_gb in enumerate(reserve_vram_gb):
@@ -474,44 +365,220 @@ class TeacherModel(BaseModel):
                 reserve_vram_kb[i] = int(reserve_gb * 1000**3)
 
         config = ExLlamaV2Config()
-        config.model_dir = self.model_path
+        config.model_dir = model_path
         config.prepare()
-        config.max_seq_len = self.context_len
-        config.max_batch_size = self.batch_size
-        config.max_input_len = self.context_chunk_size * self.batch_size
-        config.max_attention_size = self.context_chunk_size * self.batch_size
+        config.max_seq_len = context_len
+        config.max_batch_size = batch_size
+        config.max_input_len = context_len
+        config.max_attention_size = context_len ** 2 
 
         model = ExLlamaV2(config)
         cache = ExLlamaV2Cache(model, lazy=True)
 
         model.load_autosplit(cache, reserve_vram=reserve_vram_kb)
-        self.model = model
-    
-    def unload_model(self):
-        if self.model is None:
-            print(f" {self.model_name} is already unloaded.")
+        return model
+
+    def _unload_model(model: ExLlamaV2):
+        if model is None:
+            print(f"{model_name} is already unloaded, genius.")
             return
-        if self.verbose:
-            print(f" Unloading {self.model_name}...")
-        self.model.unload()
+
+        model.unload()
+
+        del model
+        torch.cuda.empty_cache()
+
+    def _inference(model: ExLlamaV2, batch_tokenized: torch.Tensor) -> ndarray:
+        assert model is not None, f"{model_name}: Model has not been loaded yet."
+
+        with torch.no_grad():
+            batch_logprobs: torch.Tensor = torch.nn.functional.log_softmax(model.forward(batch_tokenized).float()/temperature, dim=-1)
+
+            return batch_logprobs.cpu().numpy()[:, :, :crop_to_size]
+        
+    model = _load_model(reserve_vram)
+
+    pbar_queue.put(("str", f"Generating..."))
+
+    exit_flag = False
+
+    while True:
+        made_tokens.wait()
+        while not inference_queue.empty():
+            batch_tokenized_np, batch_distributions = inference_queue.get()
+
+            if batch_tokenized_np is None:
+                _unload_model(model)
+                result_queue.put((None, None))
+                made_distributions.set()
+                exit_flag = True
+                break
+            
+            batch_tensor = torch.tensor(batch_tokenized_np, dtype=torch.long, device=device)
+            batch_logprobs_np = _inference(model, batch_tensor)
+            result_queue.put((batch_logprobs_np, batch_distributions))
+            made_distributions.set()
+
+        made_tokens.clear()
+        if exit_flag:
+            break
+
+def _result_processor_worker(result_queue, made_distributions, done_chunk_writes, disk_queue, encourage_eos, special_tokens, pbar_queue: tqdm):
+    def _get_content_indices_np(content_ranges) -> ndarray:
+        content_indices = []
+        for start, end in content_ranges:
+            content_indices.append(np.arange(start, end))
+        return np.concatenate(content_indices)
+        
+    def _get_batch_content_logprobs(batch_distributions: list[Distribution]) -> list[Distribution]:
+        with torch.no_grad():
+            batch_content_distributions = []
+
+            for distribution in batch_distributions:
+                content_indices = _get_content_indices_np(distribution.content_ranges)
+                distribution.distribution = distribution.distribution[content_indices]
+                content_tokens = distribution.tokenized[content_indices][1:]
+                gathered_log_probs = distribution.distribution[np.arange(len(content_indices) - 1), content_tokens]
+                distribution.ppl = min(np.exp(-np.mean(gathered_log_probs)), 100)
+                batch_content_distributions.append(distribution)
+
+            return batch_content_distributions
+
+    def _process_inference_results(batch_logprobs_np: ndarray, batch_distributions: list[Distribution]) -> int:
+        with torch.no_grad():
+
+            for i, distribution in enumerate(batch_distributions):
+                convo_logprobs = batch_logprobs_np[i]
+                if encourage_eos:
+                    eos_id = special_tokens['eos_id']
+                    content_end_ids = [end-1 for start, end in distribution.content_ranges]
+
+                    if distribution.cropped_end:
+                        content_end_ids = content_end_ids[:-1]
+
+                    for end in content_end_ids:
+                        convo_logprobs[end, eos_id] = np.log((np.max(np.exp(convo_logprobs[end])) * 1.1))
+                        convo_logprobs[end] = np.log((np.exp(convo_logprobs[end]) / np.sum(np.exp(convo_logprobs[end]))))
+
+                distribution.distribution = convo_logprobs[:distribution.length]
+
+            batch_content_distributions = _get_batch_content_logprobs(batch_distributions)
+            disk_queue.put(batch_content_distributions)
+            return len(batch_content_distributions)
+
+    exit_flag = False
+
+    while True:
+        made_distributions.wait()
+        while not result_queue.empty():
+            batch_logprobs_np, batch_distributions = result_queue.get()
+                
+            if batch_distributions is None:
+                exit_flag = True
+                done_chunk_writes.set()
+                break
+
+            batch_distributions_len = _process_inference_results(batch_logprobs_np, batch_distributions)
+            pbar_queue.put(("increment", batch_distributions_len))
+        
+        made_distributions.clear()
+        if exit_flag:
+            break
+
+class TeacherModel(BaseModel):
+    def __init__(self, model_path: str, max_queue_size=3):
+        super().__init__(model_path)
+        self.distr_device: str = ""
+        self.encourage_eos: bool = False
+        self.stop_id: int = 0
+        self.reserve_vram = []
+        self.max_queue_size = max_queue_size
+
+    def process_chunk(self, reserve_vram_gb: list[float] = [], next_stop_id: int = 1, data_manager = None, full_collect: bool = False, validation: bool = False):
+        with multiprocessing.Manager() as manager:
+            if full_collect:
+                num_to_process = self.validation_dataset_len if validation else self.dataset_len
+                self.stop_id = self.validation_dataset_len if validation else self.dataset_len
+            else:
+                num_to_process = self.stop_id - next_stop_id
+                self.stop_id = next_stop_id
+
+            done_chunk_writes = manager.Event()
+            made_tokens = manager.Event()
+            made_distributions = manager.Event()
+            inference_queue = manager.Queue(self.max_queue_size)
+            result_queue = manager.Queue(self.max_queue_size)
+            disk_queue = manager.Queue(self.max_queue_size)
+            pbar_queue = manager.Queue(self.max_queue_size)
+            dataset = self.validation_dataset if validation else self.dataset
+
+            self.progress_bar = tqdm(total=num_to_process, desc=f"Convos", smoothing=0.06, leave=False)
+            self.dataset_len = len(self.dataset)
+            self.data_manager = data_manager
+            self.reserve_vram = reserve_vram_gb
+            
+            batch_creator, inference_worker, result_processor = self._start_workers(done_chunk_writes, made_tokens, made_distributions, inference_queue, result_queue, disk_queue, pbar_queue, dataset)
+
+            while not done_chunk_writes.is_set():
+                while not disk_queue.empty():
+                    batch_content_distributions = disk_queue.get()
+                    self.data_manager.write_batch(batch_content_distributions)
+                    self.progress_bar.update(len(batch_content_distributions))
+                    while not pbar_queue.empty():
+                        action, value = pbar_queue.get()
+                        self._pbar_actions(action, value)
+
+                while not pbar_queue.empty():
+                    action, value = pbar_queue.get()
+                    self._pbar_actions(action, value)
+                
+            self._stop_workers(batch_creator, inference_worker, result_processor)
+
+            self.progress_bar.close()
+
+            self.convo_id = self.stop_id-1
+
+    def sort_dataset_by_len(self):
+        self.dataset.sort(key=lambda convo: convo.length, reverse=True)
+        self.dataset_sorted = True
+
+    def _pbar_actions(self, action: str, value: int):
+        if action == "increment":
+            self.progress_bar.update(value)
+        elif action == "str":
+            self.progress_bar.set_postfix_str(value)
     
-    def unload_full(self):
-        self.unload_model()
-        self.model = None
+    def _unload_full(self):
+        self.progress_bar.set_postfix_str(f"Fully unloading {self.model_name}...")
+        self._stop_workers()
         self.dataset = []
+        self.dataset_len = 0
         self.validation_dataset = []
         self.convo_id = 0
+        self.stop_id = 0
+        self.dataset_sorted = False
+        self.validation_dataset_sorted = False
         gc.collect()
-
-    def _start_workers(self):
-        self.batch_creator.start()
-        self.inference_worker.start()
-        self.result_processor.start()
     
-    def _stop_workers(self):
-        self.batch_creator.terminate()
-        self.inference_worker.terminate()
-        self.result_processor.terminate()
+    def _start_workers(self, done_chunk_writes, made_tokens, made_distributions, inference_queue, result_queue, disk_queue, pbar_queue, dataset: list[ConvoTokenized]):
+        self.progress_bar.set_postfix_str(f"Starting workers for {self.model_name}...")
+
+        batch_creator = multiprocessing.Process(target=_batch_creator_worker, args=(made_tokens, inference_queue, self.batch_size, self.stop_id, dataset))
+        inference_worker = multiprocessing.Process(target=_inference_worker, args=(inference_queue, result_queue, made_tokens, made_distributions, self.model_path, self.model_name, self.reserve_vram,
+                                                                                         self.device, self.temperature, self.crop_to_size, pbar_queue, self.context_len, self.context_chunk_size, self.batch_size))
+        result_processor = multiprocessing.Process(target=_result_processor_worker, args=(result_queue, made_distributions, done_chunk_writes, disk_queue, self.encourage_eos, self.special_tokens, pbar_queue))
+
+        batch_creator.start()
+        inference_worker.start()
+        result_processor.start()
+
+        return batch_creator, inference_worker, result_processor
+    
+    def _stop_workers(self, batch_creator: multiprocessing.Process, inference_worker: multiprocessing.Process, result_processor: multiprocessing.Process):
+        self.progress_bar.set_postfix_str(f"Stopping workers for {self.model_name}...")
+        batch_creator.join()
+        inference_worker.join()
+        result_processor.join()
     
     def write_dataset_to_file(self, folder: str):
         tokenizer = AutoTokenizer.from_pretrained(self.model_path)

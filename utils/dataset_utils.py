@@ -47,8 +47,6 @@ class H5DataManager:
                             self._process_distributions(hdf_file, data)
                         case 'get_available_ids':
                             self.result_queue.put([int(dataset_name.split('_')[1]) for dataset_name in hdf_file])
-                        case 'clear_dataset':
-                            self._clear_dataset(hdf_file)
                 
                 self.got_task.clear()
 
@@ -93,13 +91,6 @@ class H5DataManager:
     def _load_id(self, hdf_file, convo_id: int) -> np.ndarray:
         data = np.array(hdf_file[f'convo_{convo_id}']) if f'convo_{convo_id}' in hdf_file else None
         return data
-    
-    def _clear_dataset(self, hdf_file: h5py.File):
-        for dataset_name in hdf_file:
-            del hdf_file[dataset_name]
-        self.clear_dataset.clear()
-        self.queue = queue.Queue()
-        self.got_task.clear()
 
     def enqueue_get_id(self, convo_id: int):
         self.queue.put(('get', convo_id))
@@ -122,7 +113,6 @@ class H5DataManager:
     def close(self):
         self.stop.set()
         self.got_task.set()
-        self.queue.join()
         self.loading_process.join()
 
 def read_jsonl_lazy(file_path):

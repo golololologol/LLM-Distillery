@@ -21,7 +21,7 @@ def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb):
     
     if not loop_stops or loop_stops[-1] < len(teacher.dataset):
         full_collect = True
-    
+
     return loop_stops, full_collect
 
 def get_teachers(models_folder) -> list[TeacherModel]:
@@ -64,20 +64,15 @@ def prepare_teacher_datasets(dataset_path, validation_dataset_path, teachers: li
             save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos)
         teacher.validation_dataset_len = len(teacher.validation_dataset)
     
-def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, verbose: bool, data_manager: H5DataManager):
+def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float):
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
         teacher.temperature = temperature
-        teacher.dataset_len = len(teacher.dataset)
-        teacher.verbose = verbose
-        teacher.data_manager = data_manager
 
     student.crop_to_size = crop_to_size
     student.context_len = context_len
     student.temperature = temperature
-    student.verbose = verbose
-    student.data_manager = data_manager
 
 def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start, multi_gpu):
     student.num_epochs = num_epochs
@@ -94,15 +89,11 @@ def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value
     for teacher in teachers:
         setattr(teacher, param_name, param_value)
 
-def sort_datasets_by_len(teachers: list[TeacherModel]):
-    for teacher in teachers:
-        teacher.sort_dataset_by_len()
-
 def main():
     cache_folder = r"F:\cache"
     max_cache_size_gb = 200
 
-    dataset_path = r"F:\soup.jsonl"
+    dataset_path = r"F:\ppl_test_dataset.jsonl"
     validation_dataset_path = r"F:\smol_test.jsonl"
 
     teacher_models_folder = r"F:\teacher_models"
@@ -129,48 +120,43 @@ def main():
     multi_gpu = False
     decay_start = 0.9
 
-    # Misc
-    verbose = True
-
     # Initialization
     paths = Paths(cache_folder, clean_start=True)
-    data_manager = H5DataManager(paths.dataset, device)
     teachers = get_teachers(teacher_models_folder)
     student = StudentModel(student_path, paths)
     ensure_compatibility(teachers, student)
     prepare_teacher_datasets(dataset_path, validation_dataset_path, teachers, context_len, save_sys_range, save_user_range, save_assistant_range)
-    set_params(teachers, student, crop_distr_to_size, context_len, temperature, verbose, data_manager)
+    set_params(teachers, student, crop_distr_to_size, context_len, temperature)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start, multi_gpu)
-    sort_datasets_by_len(teachers)
     loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb)
     
     # Main loop
+
+    ## Validation collecting loop
+    print("Processing validation data...")
+    validation_data_manager = H5DataManager(paths.dataset_validation, device)
+
+    for teacher in teachers:
+        teacher.process_chunk(reserve_vram, full_collect=True, data_manager=validation_data_manager, validation=True)
+
+    validation_data_manager.close()
+
+    ## Training collecting loop
     print("Processing all data..." if full_collect else "Processing data in chunks...")
+    data_manager = H5DataManager(paths.dataset, device)
 
-    for epoch in tqdm(range(num_epochs), desc="Epochs", position=0, smoothing=0.06, leave=True):
-
-        for stop_id in tqdm(loop_stops, desc="Chunks", position=1, smoothing=0.06, leave=False):
-            rewrite_teachers_param(teachers, "next_stop_id", stop_id)
-
-            # Collecting loop
-            for teacher in tqdm(teachers, desc="Teachers", position=2, smoothing=0.06, leave=False):
-                assert isinstance(teacher, TeacherModel)
-
-                teacher.load_model(reserve_vram_gb=reserve_vram)
-
-                total_convos = stop_id - teacher.convo_id
-                pbar_convos = tqdm(total=total_convos, desc="Convos", position=3, smoothing=0.06, leave=False)
-
-                while teacher.convo_id < stop_id:
-                    batch_content_logprobs, batch_size = teacher.get_batch_content_logprobs()
-                    data_manager.write_batch(batch_content_logprobs)
-                    pbar_convos.update(batch_size)
-
-                pbar_convos.close()
-                teacher.unload_model()
-
-
+    if full_collect:
+        for teacher in teachers:
+            teacher.process_chunk(reserve_vram, full_collect=True, data_manager=data_manager)
         
+    else:
+        pbar = tqdm(total=len(loop_stops), desc="Stops", smoothing=0.06)
+        for stop in loop_stops:
+            for teacher in teachers:
+                print(f"Collecting data for {teacher.model_name}...")
+                teacher.process_chunk(reserve_vram, next_stop_id=stop)
+
+            student.train_chunk()
 
             
 

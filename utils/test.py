@@ -1,6 +1,10 @@
 import torch
 from tqdm import tqdm
 import torch.nn.functional as F
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 #from dataset_utils import H5Reader, H5Writer
 
@@ -253,15 +257,15 @@ def input_prompt_format():
 #print((log_probs/2))
 #
 #
-tensor1 = torch.tensor(([0.02, 0.02, 0.996], [0.2, 0.2, 0.996], [1, 2, 3])).numpy()
-tensor1_len = tensor1.shape[0]
-tensor2 = torch.tensor(([2.04, 5.3, 1.3], [1.0, 2.4, 3.5])).numpy()
-tensor2_len = tensor2.shape[0]
+#tensor1 = torch.tensor(([0.02, 0.02, 0.996], [0.2, 0.2, 0.996], [1, 2, 3])).numpy()
+#tensor1_len = tensor1.shape[0]
+#tensor2 = torch.tensor(([2.04, 5.3, 1.3], [1.0, 2.4, 3.5])).numpy()
+#tensor2_len = tensor2.shape[0]
 
 #full_distr = np.pad(tensor1, ((0, 1), (0, 0)))
-list1 = [1,2]
-list2 = [1,1]
-full_distr = tensor1[list1, list2]
+#list1 = [1,2]
+#list2 = [1,1]
+#full_distr = tensor1[list1, list2]
 #print(np.arange(20, 40))
 
 #dict = {'a': 1, 'b': 2, 'c': 3}
@@ -269,6 +273,12 @@ full_distr = tensor1[list1, list2]
 #
 #dict["d"] = 4
 #print(dict.clear())
-list_int = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
-for i in range(0, len(list_int), 3):
-    print(list_int[i:i+3])
+#list_int = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+#for i in range(0, len(list_int), 3):
+    #print(list_int[i:i+3])
+
+tensor = F.softmax(torch.tensor(([0.04, 10.1, 1.2], [1.5, 2.3, 3.4])), dim=-1)
+# calculate entropy for each distribution
+print(tensor)
+for i in range(tensor.size(0)):
+    print(-torch.sum(tensor[i] * torch.log(tensor[i])))
