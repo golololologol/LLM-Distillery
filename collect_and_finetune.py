@@ -89,6 +89,10 @@ def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value
     for teacher in teachers:
         setattr(teacher, param_name, param_value)
 
+def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, int]):
+    for teacher in teachers:
+        teacher.sort_dataset_by_map(sorting_map)
+
 def main():
     cache_folder = r"F:\cache"
     max_cache_size_gb = 200
@@ -128,6 +132,9 @@ def main():
     prepare_teacher_datasets(dataset_path, validation_dataset_path, teachers, context_len, save_sys_range, save_user_range, save_assistant_range)
     set_params(teachers, student, crop_distr_to_size, context_len, temperature)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start, multi_gpu)
+    sorting_map = teachers[0].sort_dataset_by_len()
+    sort_datasets_by_map(teachers, sorting_map)
+
     loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb)
     
     # Main loop

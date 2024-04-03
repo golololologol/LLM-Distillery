@@ -1,14 +1,14 @@
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from numpy import ndarray
 from typing import Optional
 from utils.vocab_utils import get_vocab_family, get_special_tokens
 from utils.convert_to_safetensor import convert_model
 from tqdm import tqdm
-import multiprocessing
-import pickle
-import torch
 import numpy as np
+from numpy import ndarray
+import multiprocessing
+import math
+import torch
 import shutil
 import gc
 import os
@@ -318,13 +318,12 @@ class StudentModel(BaseModel):
         self.paths.empty_logs()
         self.paths.empty_student_folders()
 
-def _batch_creator_worker(made_tokens, inference_queue, batch_size, stop_id, dataset: list[ConvoTokenized]):
-    def _prepare_batch_for_inference(convo_id, batch_size, stop_id, dataset: list[ConvoTokenized]) -> tuple[ndarray, list[Distribution], int]:
-        batch_tokenized: list[np.ndarray] = []
+def _batch_creator_worker(made_tokens, inference_queue, batch_size, dataset_chunk: list[ConvoTokenized]):
+    def _prepare_batch_for_inference(convo_id, batch_size, dataset_chunk: list[ConvoTokenized]) -> tuple[ndarray, list[Distribution], int]:
+        batch_tokenized: list[ndarray] = []
         batch_distributions: list[Distribution] = []
 
-        convos_to_inference = min(convo_id + batch_size, stop_id)
-        batch_convos = dataset[convo_id:convos_to_inference]
+        batch_convos = dataset_chunk[convo_id:convo_id+batch_size]
 
         for convo in batch_convos:
             batch_distributions.append(Distribution(convo.origin_convo_id, convo.length, convo.cropped_end, convo.content_ranges, convo.tokenized))
@@ -340,8 +339,10 @@ def _batch_creator_worker(made_tokens, inference_queue, batch_size, stop_id, dat
         return batch_tokenized_np, batch_distributions, batch_size
         
     convo_id = 0
-    while convo_id < stop_id:
-        batch_tokenized, batch_distributions, batch_size = _prepare_batch_for_inference(convo_id, batch_size, stop_id, dataset)
+    num_batches = math.ceil(len(dataset_chunk) / batch_size)
+
+    for i in range(num_batches):
+        batch_tokenized, batch_distributions, batch_size = _prepare_batch_for_inference(convo_id, batch_size, dataset_chunk)
         inference_queue.put((batch_tokenized, batch_distributions))
         convo_id += batch_size
         made_tokens.set()
@@ -349,7 +350,7 @@ def _batch_creator_worker(made_tokens, inference_queue, batch_size, stop_id, dat
     made_tokens.set()
 
 def _inference_worker(inference_queue, result_queue, made_tokens, made_distributions, model_path, model_name, reserve_vram,
-                        device, temperature, crop_to_size, pbar_queue, context_len, context_chunk_size,batch_size):
+                        device, temperature, crop_to_size, pbar_queue, context_len, batch_size):
         
     def _load_model(reserve_vram_gb: list[float] = []):
         pbar_queue.put(("str", f"Loading {model_name}..."))
@@ -392,9 +393,9 @@ def _inference_worker(inference_queue, result_queue, made_tokens, made_distribut
         assert model is not None, f"{model_name}: Model has not been loaded yet."
 
         with torch.no_grad():
-            batch_logprobs: torch.Tensor = torch.nn.functional.log_softmax(model.forward(batch_tokenized).float()/temperature, dim=-1)
+            batch_logprobs: torch.Tensor = torch.nn.functional.log_softmax(model.forward(batch_tokenized)[:, :, :crop_to_size].float()/temperature, dim=-1)
 
-            return batch_logprobs.cpu().numpy()[:, :, :crop_to_size]
+            return batch_logprobs.cpu().numpy()
         
     model = _load_model(reserve_vram)
 
@@ -510,14 +511,18 @@ class TeacherModel(BaseModel):
             result_queue = manager.Queue(self.max_queue_size)
             disk_queue = manager.Queue(self.max_queue_size)
             pbar_queue = manager.Queue(self.max_queue_size)
-            dataset = self.validation_dataset if validation else self.dataset
+            
+            if validation:
+                dataset_chunk = self.validation_dataset[self.convo_id:self.stop_id]
+            else:
+                dataset_chunk = self.dataset[self.convo_id:self.stop_id]
 
             self.progress_bar = tqdm(total=num_to_process, desc=f"Convos", smoothing=0.06, leave=False)
-            self.dataset_len = len(self.dataset)
             self.data_manager = data_manager
             self.reserve_vram = reserve_vram_gb
             
-            batch_creator, inference_worker, result_processor = self._start_workers(done_chunk_writes, made_tokens, made_distributions, inference_queue, result_queue, disk_queue, pbar_queue, dataset)
+            batch_creator, inference_worker, result_processor = self._start_workers(done_chunk_writes, made_tokens, made_distributions,
+                                                                                     inference_queue, result_queue, disk_queue, pbar_queue, dataset_chunk)
 
             while not done_chunk_writes.is_set():
                 while not disk_queue.empty():
@@ -541,6 +546,12 @@ class TeacherModel(BaseModel):
     def sort_dataset_by_len(self):
         self.dataset.sort(key=lambda convo: convo.length, reverse=True)
         self.dataset_sorted = True
+        sorting_map = {convo.origin_convo_id: i for i, convo in enumerate(self.dataset)}
+        return sorting_map
+    
+    def sort_dataset_by_map(self, sorting_map: dict[int, int]):
+        self.dataset.sort(key=lambda convo: sorting_map[convo.origin_convo_id])
+        self.dataset_sorted = True
 
     def _pbar_actions(self, action: str, value: int):
         if action == "increment":
@@ -560,12 +571,12 @@ class TeacherModel(BaseModel):
         self.validation_dataset_sorted = False
         gc.collect()
     
-    def _start_workers(self, done_chunk_writes, made_tokens, made_distributions, inference_queue, result_queue, disk_queue, pbar_queue, dataset: list[ConvoTokenized]):
+    def _start_workers(self, done_chunk_writes, made_tokens, made_distributions, inference_queue, result_queue, disk_queue, pbar_queue, dataset_chunk: list[ConvoTokenized]):
         self.progress_bar.set_postfix_str(f"Starting workers for {self.model_name}...")
 
-        batch_creator = multiprocessing.Process(target=_batch_creator_worker, args=(made_tokens, inference_queue, self.batch_size, self.stop_id, dataset))
+        batch_creator = multiprocessing.Process(target=_batch_creator_worker, args=(made_tokens, inference_queue, self.batch_size, dataset_chunk))
         inference_worker = multiprocessing.Process(target=_inference_worker, args=(inference_queue, result_queue, made_tokens, made_distributions, self.model_path, self.model_name, self.reserve_vram,
-                                                                                         self.device, self.temperature, self.crop_to_size, pbar_queue, self.context_len, self.context_chunk_size, self.batch_size))
+                                                                                         self.device, self.temperature, self.crop_to_size, pbar_queue, self.context_len, self.batch_size))
         result_processor = multiprocessing.Process(target=_result_processor_worker, args=(result_queue, made_distributions, done_chunk_writes, disk_queue, self.encourage_eos, self.special_tokens, pbar_queue))
 
         batch_creator.start()

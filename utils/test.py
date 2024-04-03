@@ -277,8 +277,9 @@ def input_prompt_format():
 #for i in range(0, len(list_int), 3):
     #print(list_int[i:i+3])
 
-tensor = F.softmax(torch.tensor(([0.04, 10.1, 1.2], [1.5, 2.3, 3.4])), dim=-1)
+#tensor = F.softmax(torch.tensor(([0.04, 10.1, 1.2], [1.5, 2.3, 3.4])), dim=-1)
 # calculate entropy for each distribution
-print(tensor)
-for i in range(tensor.size(0)):
-    print(-torch.sum(tensor[i] * torch.log(tensor[i])))
+#print(tensor)
+#for i in range(tensor.size(0)):
+    #print(-torch.sum(tensor[i] * torch.log(tensor[i])))
+

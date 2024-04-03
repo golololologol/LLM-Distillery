@@ -67,7 +67,7 @@ class H5DataManager:
         assert ppl > 0, "PPL should be greater than 0."
 
         disk_data = np.exp(self._load_id(hdf_file, id))
-        new_data = np.exp(new_distribution.distribution) / ppl
+        new_data = np.exp(new_distribution.distribution) / np.log(ppl)
 
         max_len = max(disk_data.shape[0], new_data.shape[0])
         min_len = min(disk_data.shape[0], new_data.shape[0])
@@ -75,7 +75,7 @@ class H5DataManager:
 
         if disk_data.shape[0] < new_data.shape[0]:
             disk_data = np.pad(disk_data, ((0, diff), (0, 0)))
-        else:
+        elif disk_data.shape[0] > new_data.shape[0]:
             new_data = np.pad(new_data, ((0, diff), (0, 0)))
 
         merged_data = disk_data + new_data
@@ -89,8 +89,13 @@ class H5DataManager:
         hdf_file.create_dataset(dataset_name, data=data)
     
     def _load_id(self, hdf_file, convo_id: int) -> np.ndarray:
-        data = np.array(hdf_file[f'convo_{convo_id}']) if f'convo_{convo_id}' in hdf_file else None
+        data = np.array(hdf_file[f'convo_{convo_id}']).astype(np.float32) if f'convo_{convo_id}' in hdf_file else None
         return data
+
+    def _clear_dataset(self, hdf_file: h5py.File):
+        for dataset_name in hdf_file:
+            del hdf_file[dataset_name]
+        self.teacher_convos = []
 
     def enqueue_get_id(self, convo_id: int):
         self.queue.put(('get', convo_id))
@@ -109,6 +114,10 @@ class H5DataManager:
         self.queue.put(('get_available_ids', None))
         self.got_task.set()
         return self.result_queue.get()
+
+    def purge_dataset(self):
+        self.clear_dataset.set()
+        self.got_task.set()
 
     def close(self):
         self.stop.set()
