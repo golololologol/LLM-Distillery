@@ -34,29 +34,15 @@ class WarmupStableDecayLR(_LRScheduler):
         else:
             return [self.final_lr for group in self.optimizer.param_groups]
 
-    def _get_closed_form_lr(self):
-        if self.last_epoch < self.warmup_steps:
-            progress = self.last_epoch / self.warmup_steps
-            cosine = 0.5 * (1 + math.cos(math.pi + progress * math.pi))
-            return [self.constant_lr * cosine for group in self.optimizer.param_groups]
-        elif self.warmup_steps <= self.last_epoch <= self.decay_start_step:
-            return [self.constant_lr for group in self.optimizer.param_groups]
-        elif self.decay_start_step < self.last_epoch < self.total_steps:
-            lr_scale = 1 - ((self.last_epoch - self.decay_start_step) / self.decay_steps) * (1 - self.final_lr / self.constant_lr)
-            return [self.constant_lr * lr_scale for group in self.optimizer.param_groups]
-        else:
-            return [self.final_lr for group in self.optimizer.param_groups]
-
 def launch_tensorboard(log_dir):
-    tensorboard = subprocess.Popen(['tensorboard', '--logdir', os.path.join(log_dir, "tensorboard_logs"), '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    tensorboard = subprocess.Popen(['tensorboard', '--logdir', log_dir, '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return tensorboard
 
-def calculate_divergence(student_logits, teacher_log_probs: torch.Tensor, temp=1.0, custom=False):
-    student_log_probs_temp = F.log_softmax(F.log_softmax(student_logits, dim=-1).clip(-103, 88) / temp, dim=-1)
-    teacher_log_probs_temp = F.log_softmax(F.log_softmax(teacher_log_probs, dim=-1).clip(-103, 88) / temp, dim=-1)
+def calculate_divergence(student_logits, teacher_log_probs: torch.Tensor, custom=False):
+    student_log_probs = F.log_softmax(student_logits, dim=-1)
 
-    reduction = 'batchmean' if not custom else 'none'
-    kl_div = F.kl_div(student_log_probs_temp, teacher_log_probs_temp, reduction=reduction, log_target=True)
+    reduction = 'none' if custom else 'batchmean'
+    kl_div = F.kl_div(student_log_probs, teacher_log_probs, reduction=reduction, log_target=True)
     if custom:
         kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).mean().log()
 

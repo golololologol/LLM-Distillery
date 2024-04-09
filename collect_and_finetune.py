@@ -19,7 +19,7 @@ def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb):
             loop_stops.append(id+1)
             cache_size_kb = 0
     
-    if not loop_stops or loop_stops[-1] < len(teacher.dataset):
+    if not loop_stops:
         full_collect = True
 
     return loop_stops, full_collect
@@ -49,7 +49,7 @@ def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel):
     
     for key, value in checklist.items():
         if value != getattr(student, key):
-            raise ValueError(f"Student has {key}={getattr(student, key)} while the teachers have {key}={value}")
+            raise ValueError(f"Student has {key} = {getattr(student, key)} while the teachers have {key} = {value}")
         
 def prepare_teacher_datasets(dataset_path, validation_dataset_path, teachers: list[TeacherModel], context_len, save_sys_range, save_user_range, save_assistant_range):
     for teacher in teachers:
@@ -89,18 +89,22 @@ def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value
     for teacher in teachers:
         setattr(teacher, param_name, param_value)
 
-def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, int]):
+def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, int], validation_sorting_map: dict[int, int]):
     for teacher in teachers:
-        teacher.sort_dataset_by_map(sorting_map)
+        if not teacher.dataset_sorted:
+           teacher.sort_dataset_by_map(sorting_map)
+        
+        if not teacher.validation_dataset_sorted:
+            teacher.sort_dataset_by_map(validation_sorting_map, validation=True)
 
 def main():
-    cache_folder = r"F:\cache"
-    max_cache_size_gb = 200
+    cache_folder = r"C:\Users\gololo\Desktop\pipeline\cache"
+    max_cache_size_gb = 2
 
-    dataset_path = r"F:\ppl_test_dataset.jsonl"
-    validation_dataset_path = r"F:\smol_test.jsonl"
+    dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filtered.jsonl"
+    validation_dataset_path = r"C:\Users\gololo\Documents\janny\janny_Filtered.jsonl"
 
-    teacher_models_folder = r"F:\teacher_models"
+    teacher_models_folder = r"C:\Users\gololo\Desktop\pipeline\teacher_models"
     student_path = r"C:\Users\gololo\Desktop\TinyLlama-1.1B-intermediate-step-1431k-3T"
 
     # General model settings
@@ -115,7 +119,7 @@ def main():
     # Training settings
     num_epochs = 1
     num_warmup_steps = 1000
-    temperature = 3
+    temperature = 2
     lr = 1e-4
     lr_scheduler = "wsd"
     optimizer = "adamw"
@@ -130,24 +134,27 @@ def main():
     student = StudentModel(student_path, paths)
     ensure_compatibility(teachers, student)
     prepare_teacher_datasets(dataset_path, validation_dataset_path, teachers, context_len, save_sys_range, save_user_range, save_assistant_range)
+
     set_params(teachers, student, crop_distr_to_size, context_len, temperature)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start, multi_gpu)
-    sorting_map = teachers[0].sort_dataset_by_len()
-    sort_datasets_by_map(teachers, sorting_map)
+
+    sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
+    sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
 
     loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb)
     
     # Main loop
-
+    """
     ## Validation collecting loop
     print("Processing validation data...")
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
 
     for teacher in teachers:
         teacher.process_chunk(reserve_vram, full_collect=True, data_manager=validation_data_manager, validation=True)
-
+    
     validation_data_manager.close()
 
+    exit(0)"""
     ## Training collecting loop
     print("Processing all data..." if full_collect else "Processing data in chunks...")
     data_manager = H5DataManager(paths.dataset, device)
@@ -155,30 +162,20 @@ def main():
     if full_collect:
         for teacher in teachers:
             teacher.process_chunk(reserve_vram, full_collect=True, data_manager=data_manager)
-        
-    else:
+        #student.train_chunk() #TODO
+    else: #TODO
         pbar = tqdm(total=len(loop_stops), desc="Stops", smoothing=0.06)
         for stop in loop_stops:
             for teacher in teachers:
                 print(f"Collecting data for {teacher.model_name}...")
-                teacher.process_chunk(reserve_vram, next_stop_id=stop)
+                teacher.process_chunk(reserve_vram, next_stop_id=stop, data_manager=data_manager)
 
-            student.train_chunk()
+            #student.train_chunk() #TODO
 
             
 
                     
                 
-            
-
-
-     
-
-
-
-        
-
-
 
 if __name__ == "__main__":
     main()

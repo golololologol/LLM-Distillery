@@ -2,13 +2,14 @@ import os
 import numpy as np
 import h5py
 import multiprocessing
-import queue
 import json
 import logging
+import time
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
 from utils.classes import ConvoTokenized, Distribution
+from multiprocessing import shared_memory
 from utils.vocab_utils import get_vocab_family, get_special_tokens
 logging.getLogger("transformers").setLevel(logging.ERROR)  # Shut up transformers
 logging.getLogger("torch").setLevel(logging.ERROR) # And pytorch for good measure
@@ -20,8 +21,6 @@ class H5DataManager:
         self.queue = multiprocessing.Queue(max_queue_size)
         self.result_queue = multiprocessing.Queue(max_queue_size)
         self.got_task = multiprocessing.Event()
-        self.stop = multiprocessing.Event()
-        self.clear_dataset = multiprocessing.Event()
         self.loading_process = multiprocessing.Process(target=self._process_thread)
         self.teacher_convos = []
 
@@ -31,13 +30,6 @@ class H5DataManager:
         with h5py.File(self.file_path, 'a') as hdf_file:
             while True:
                 self.got_task.wait()
-                if self.stop.is_set():
-                    break
-                
-                if self.clear_dataset.is_set():
-                    self._clear_dataset(hdf_file)
-                    continue
-                
                 while not self.queue.empty():
                     task, data = self.queue.get()
                     match task:
@@ -47,11 +39,20 @@ class H5DataManager:
                             self._process_distributions(hdf_file, data)
                         case 'get_available_ids':
                             self.result_queue.put([int(dataset_name.split('_')[1]) for dataset_name in hdf_file])
-                
+                        case 'clear_dataset':
+                            self._clear_dataset(hdf_file)
+                        case 'exit':
+                            print(f"Total time taken for writing to disk: {np.sum(self.performance):.2f}s")
+                            self.got_task.clear()
+                            return
                 self.got_task.clear()
 
     def _process_distributions(self, hdf_file, batch: list[Distribution]):
         for distribution in batch:
+
+            distr_shd_mem = shared_memory.SharedMemory(name=distribution.shd_mem_name)
+            distribution.distribution = np.ndarray(distribution.distr_shape, dtype=distribution.distr_dtype, buffer=distr_shd_mem.buf)
+
             id = distribution.origin_convo_id
             if id in self.teacher_convos:
                 merged_data = self._merge_data(hdf_file, distribution, id)
@@ -59,6 +60,8 @@ class H5DataManager:
             else:
                 self._save_data(hdf_file, distribution.distribution, id)
                 self.teacher_convos.append(id)
+            distr_shd_mem.close()
+            distr_shd_mem.unlink()
 
     def _merge_data(self, hdf_file, new_distribution: Distribution, id):
         assert isinstance(new_distribution.distribution, np.ndarray), "Distribution should be a numpy array."
@@ -96,6 +99,7 @@ class H5DataManager:
         for dataset_name in hdf_file:
             del hdf_file[dataset_name]
         self.teacher_convos = []
+        self.result_queue.put(True)
 
     def enqueue_get_id(self, convo_id: int):
         self.queue.put(('get', convo_id))
@@ -116,11 +120,12 @@ class H5DataManager:
         return self.result_queue.get()
 
     def purge_dataset(self):
-        self.clear_dataset.set()
+        self.queue.put(('clear_dataset', None))
         self.got_task.set()
+        return self.result_queue.get()
 
     def close(self):
-        self.stop.set()
+        self.queue.put(('exit', None))
         self.got_task.set()
         self.loading_process.join()
 
@@ -184,6 +189,11 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
         start_index = len(sys_tokenized) - 1
 
     for i, turn in enumerate(json_item["conversations"]):
+
+        if turn == "":
+            empty = True
+            return conversation_tokenized, conversation_content_ranges, empty
+
         if reversed:
             assistant = (i + 1) % 2
         else:
