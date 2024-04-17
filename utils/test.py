@@ -283,3 +283,8 @@ def input_prompt_format():
 #for i in range(tensor.size(0)):
     #print(-torch.sum(tensor[i] * torch.log(tensor[i])))
 
+set1 = {1, 2, 3}
+set2 = {2, 3, 4}
+
+# combine into one set with all unique elements
+print(set1.union(set2))

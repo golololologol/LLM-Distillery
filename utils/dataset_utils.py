@@ -15,11 +15,12 @@ logging.getLogger("transformers").setLevel(logging.ERROR)  # Shut up transformer
 logging.getLogger("torch").setLevel(logging.ERROR) # And pytorch for good measure
 
 class H5DataManager:
-    def __init__(self, dataset_path, device, max_queue_size=3):
+    def __init__(self, dataset_path, device, max_queue_size=3, done_everything=multiprocessing.Event()):
         self.file_path = os.path.join(dataset_path, "distributions.hdf5")
         self.device = device
         self.queue = multiprocessing.Queue(max_queue_size)
         self.result_queue = multiprocessing.Queue(max_queue_size)
+        self.done_everything = done_everything
         self.got_task = multiprocessing.Event()
         self.loading_process = multiprocessing.Process(target=self._process_thread)
         self.teacher_convos = []
@@ -30,11 +31,16 @@ class H5DataManager:
         with h5py.File(self.file_path, 'a') as hdf_file:
             while True:
                 self.got_task.wait()
+                self.done_everything.clear()
+
                 while not self.queue.empty():
                     task, data = self.queue.get()
                     match task:
-                        case 'get_id':
-                            self.result_queue.put(self._load_id(hdf_file, data))
+                        case 'get_batch':
+                            self.result_queue.put([self._load_id(hdf_file, convo_id) for convo_id in data])
+                        case 'get_batches':
+                            for batch in data:
+                                self.result_queue.put(np.array([self._load_id(hdf_file, convo_id) for convo_id in batch]))
                         case 'put_batch':
                             self._process_distributions(hdf_file, data)
                         case 'get_available_ids':
@@ -42,9 +48,10 @@ class H5DataManager:
                         case 'clear_dataset':
                             self._clear_dataset(hdf_file)
                         case 'exit':
-                            print(f"Total time taken for writing to disk: {np.sum(self.performance):.2f}s")
                             self.got_task.clear()
                             return
+                        
+                self.done_everything.set()
                 self.got_task.clear()
 
     def _process_distributions(self, hdf_file, batch: list[Distribution]):
@@ -89,7 +96,7 @@ class H5DataManager:
         dataset_name = f'convo_{convo_id}'
         if dataset_name in hdf_file:
             del hdf_file[dataset_name]
-        hdf_file.create_dataset(dataset_name, data=data)
+        hdf_file.create_dataset(dataset_name, data=data.astype(np.float16))
     
     def _load_id(self, hdf_file, convo_id: int) -> np.ndarray:
         data = np.array(hdf_file[f'convo_{convo_id}']).astype(np.float32) if f'convo_{convo_id}' in hdf_file else None
@@ -100,14 +107,17 @@ class H5DataManager:
             del hdf_file[dataset_name]
         self.teacher_convos = []
         self.result_queue.put(True)
-
-    def enqueue_get_id(self, convo_id: int):
-        self.queue.put(('get', convo_id))
+    
+    def get_batch(self, convo_ids: list[int]) -> np.ndarray:
+        self.queue.put(('get_batch', convo_ids))
         self.got_task.set()
-
-    def get_id(self, convo_id: int) -> np.ndarray:
-        self.queue.put(('get', convo_id))
+        return self.result_queue.get()
+    
+    def enqueue_get_batches(self, batches: list[list[int]]):
+        self.queue.put(('get_batches', batches))
         self.got_task.set()
+    
+    def read_next_batch(self) -> np.ndarray:
         return self.result_queue.get()
 
     def write_batch(self, batch: list[Distribution]):
@@ -228,7 +238,7 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
 
     return conversation_tokenized, conversation_content_ranges, empty
 
-def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range, add_bos=True) -> list[ConvoTokenized]:
+def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range, add_bos=True) -> tuple[list[ConvoTokenized], set[int]]:
     try:
         config = ExLlamaV2Config()
         config.model_dir = model_path
@@ -242,6 +252,7 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
     pf = encode_prompt_format(prompt_format, sp_toks, tokenizer)
     
     dataset = []
+    ids = set()
 
     for convo_id, item in tqdm(enumerate(read_jsonl_lazy(dataset_path)), desc="Tokenizing", unit="convo", smoothing=0.06, leave=False): # Every conversation
         conversation_tokenized, conversation_content_ranges, empty = tokenize_convo(item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, add_bos=add_bos)
@@ -261,13 +272,14 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
         corrected_content_ranges = []
         for start, end in conversation_content_ranges:
             if start > context_len:
-                continue
+                break
             if end > context_len:
                 end = context_len
                 cropped_end = True
             corrected_content_ranges.append((start, end))
 
         conversation = ConvoTokenized(conversation_tokenized, corrected_content_ranges, num_pad_tokens, cropped_end, convo_id)
+        ids.add(convo_id)
         dataset.append(conversation)
 
-    return dataset
+    return dataset, ids

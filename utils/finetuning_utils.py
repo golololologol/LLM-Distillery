@@ -5,7 +5,10 @@ import torch.optim.lr_scheduler as lr
 from transformers import get_scheduler
 import subprocess
 import os
+import sys
+sys.stderr = open(os.devnull, 'w')
 import bitsandbytes as bnb
+sys.stderr = sys.__stderr__
 import math
 import torch
 from torch.optim.lr_scheduler import _LRScheduler

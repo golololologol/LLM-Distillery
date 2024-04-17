@@ -45,31 +45,12 @@ def full_finetune(params: Params):
         decay_start=params.decay_start
     )
 
-    #val_teacher = H5Reader(params.validation_distributions_path, device, empty_convo_ids=params.validation_empty_convo_ids, shuffle=False)
-    #val_tensors = [val_teacher.read_next() for i in range(val_teacher.dataset_len - len(params.validation_empty_convo_ids))]
-    #val_teacher.close()
-    
     def get_content_indices(content_ranges, context_len):
         content_indices = []
         for start, end in content_ranges:
             if start <= context_len:
                 content_indices.append(torch.arange(start, min(end, context_len), device=device))
         return torch.cat(content_indices)
-    
-    #def validate(model, dataset_tokenized, dataset_content_ranges, device, teacher_loader: H5Reader, custom=False, val_tensors=val_tensors):
-        val_loss = 0
-        teacher_loader.toggle_await()
-        with torch.no_grad():
-            for convo_tokenized, convo_content_ranges, val_tensor in zip(dataset_tokenized, dataset_content_ranges, val_tensors):
-                convo_tokenized = convo_tokenized.to(device)[:params.context_length].unsqueeze(0)
-                content_indices = get_content_indices(convo_content_ranges, params.context_length)
-                full_student_logits = model(convo_tokenized).logits.squeeze(0).float()
-                student_logits = torch.index_select(full_student_logits, 0, content_indices)[:, :params.crop_to_size]
-                min_len = min(student_logits.size(0), val_tensors[0].size(0))
-                val_loss += calculate_divergence(student_logits[:min_len], val_tensor[:min_len], custom=params.custom_reduction, temp=1).item()
-
-        teacher_loader.toggle_await()
-        return val_loss / len(val_tensors)
         
     teacher = H5Reader(params.distributions_path, device, empty_convo_ids=params.empty_convo_ids, shuffle=params.shuffle_data, timeout=90)
     print(f"Num Gradient Updates: {num_grad_updates}")
