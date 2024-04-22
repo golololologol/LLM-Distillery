@@ -1,7 +1,7 @@
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from utils.vocab_utils import get_vocab_family, get_special_tokens
-#from utils.finetuning_utils import set_optimizer
+from utils.finetuning_utils import set_optimizer
 from utils.convert_to_safetensor import convert_model
 from multiprocessing import shared_memory
 from typing import Optional
@@ -253,7 +253,7 @@ class BaseModel:
         self.add_bos = config.get('add_bos', True)
         self.seq_chunk_len = config.get('seq_chunk_len', 256)
         self.vocab_family = get_vocab_family(model_path=self.model_path)
-        self.special_tokens = get_special_tokens(self.vocab_family)
+        self.special_tokens = get_special_tokens(model_path=self.model_path)
 
     def _get_content_indices_tensor(self, content_ranges) -> torch.Tensor:
         content_indices = []
@@ -420,11 +420,11 @@ def _inference_worker(inference_queue, result_queue, made_distributions, done_ch
         if num_gpus == 0:
             raise Exception("No CUDA-capable GPUs found.")
 
-        reserve_vram_kb = [int(128 * 1000**2)]*num_gpus # default 128MB/GPU
+        reserve_vram_kb = [int(128 * 1024**2)]*num_gpus # default 128MB/GPU
 
         for i, reserve_gb in enumerate(reserve_vram_gb):
             if reserve_gb > 0 and i < num_gpus:
-                reserve_vram_kb[i] = int(reserve_gb * 1000**3)
+                reserve_vram_kb[i] = int(reserve_gb * 1024**3)
 
         config = ExLlamaV2Config()
         config.model_dir = model_path
@@ -469,6 +469,9 @@ def _inference_worker(inference_queue, result_queue, made_distributions, done_ch
     def _enqueue_batch_tensor():
         batch_tokenized_np, batch_distributions = inference_queue.get()
 
+        if batch_tokenized_np.sum() == 0:
+            raise Exception("All tokens are 0s")
+
         if batch_tokenized_np is None:
             tokenized_batches.append((None, None))
             return
@@ -506,7 +509,7 @@ def _inference_worker(inference_queue, result_queue, made_distributions, done_ch
         if not inference_queue.empty():
             _enqueue_batch_tensor()
 
-def _result_processor_worker(result_queue, made_distributions, done_chunk_writes, disk_queue, encourage_eos, special_tokens, pbar_queue: tqdm, max_queue_size: int, batch_size: int):
+def _result_processor_worker(result_queue, made_distributions, done_chunk_writes, disk_queue, encourage_eos, student_eos_id, pbar_queue: tqdm, max_queue_size: int, batch_size: int):
     def _get_content_indices_np(content_ranges) -> ndarray:
         content_indices = []
         for start, end in content_ranges:
@@ -541,14 +544,13 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
         for i, distribution in enumerate(batch_distributions):
             convo_logprobs = batch_logprobs_np[i]
             if encourage_eos:
-                eos_id = special_tokens['eos_id']
                 content_end_ids = [end-1 for start, end in distribution.content_ranges]
 
                 if distribution.cropped_end:
                     content_end_ids = content_end_ids[:-1]
 
                 for end in content_end_ids:
-                    convo_logprobs[end, eos_id] = np.log((np.max(np.exp(convo_logprobs[end])) * 1.1))
+                    convo_logprobs[end, student_eos_id] = np.log((np.max(np.exp(convo_logprobs[end])) * 1.1))
                     convo_logprobs[end] = np.log((np.exp(convo_logprobs[end]) / np.sum(np.exp(convo_logprobs[end]))))
 
             distribution.distribution = convo_logprobs[:distribution.length]
@@ -593,6 +595,7 @@ class TeacherModel(BaseModel):
         self.distr_device: str = ""
         self.encourage_eos: bool = False
         self.stop_id: int = 0
+        self.student_eos_id: int = 0
         self.reserve_vram = []
         self.max_queue_size = max_queue_size
 
@@ -677,7 +680,7 @@ class TeacherModel(BaseModel):
         batch_creator = multiprocessing.Process(target=_batch_creator_worker, args=(inference_queue, self.batch_size, dataset_chunk))
         inference_worker = multiprocessing.Process(target=_inference_worker, args=(inference_queue, result_queue, made_distributions, done_chunk, self.model_path, self.model_name, self.reserve_vram,
                                                                                          self.device, self.temperature, self.crop_to_size, pbar_queue, self.context_len, self.batch_size, self.max_queue_size, self.seq_chunk_len))
-        result_processor = multiprocessing.Process(target=_result_processor_worker, args=(result_queue, made_distributions, done_chunk, disk_queue, self.encourage_eos, self.special_tokens, pbar_queue, self.max_queue_size, self.batch_size))
+        result_processor = multiprocessing.Process(target=_result_processor_worker, args=(result_queue, made_distributions, done_chunk, disk_queue, self.encourage_eos, self.student_eos_id, pbar_queue, self.max_queue_size, self.batch_size))
 
         batch_creator.start()
         inference_worker.start()

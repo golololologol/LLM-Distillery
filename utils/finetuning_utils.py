@@ -6,9 +6,12 @@ from transformers import get_scheduler
 import subprocess
 import os
 import sys
-sys.stderr = open(os.devnull, 'w')
+
+# shut the fuck up bnb with its `bin ..bitsandbytes\libbitsandbytes_cuda121.dll`
+sys.stdout = open(os.devnull, 'w')
 import bitsandbytes as bnb
-sys.stderr = sys.__stderr__
+sys.stdout = sys.__stdout__
+
 import math
 import torch
 from torch.optim.lr_scheduler import _LRScheduler
@@ -41,11 +44,12 @@ def launch_tensorboard(log_dir):
     tensorboard = subprocess.Popen(['tensorboard', '--logdir', log_dir, '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return tensorboard
 
-def calculate_divergence(student_logits, teacher_log_probs: torch.Tensor, custom=False):
-    student_log_probs = F.log_softmax(student_logits, dim=-1)
-
+def calculate_divergence(student_logits_batch, teacher_logprobs_batch: torch.Tensor, custom=False):
+    assert teacher_logprobs_batch[0].sum() != 0, "Teacher logprobs are all zeros"
+    student_logprobs_batch = F.log_softmax(student_logits_batch, dim=-1)
+    
     reduction = 'none' if custom else 'batchmean'
-    kl_div = F.kl_div(student_log_probs, teacher_log_probs, reduction=reduction, log_target=True)
+    kl_div = F.kl_div(student_logprobs_batch, teacher_logprobs_batch, reduction=reduction, log_target=True)
     if custom:
         kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).mean().log()
 
@@ -59,7 +63,7 @@ def scale_temperature(current_step, num_training_steps, temperature):
     else:
         return 1
 
-def set_optimizer(model_parameters, lr, grad_accum_steps, betas, optimizer_name: str, weight_decay=1e-2, momentum=0.9, nesterov=True):
+def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay=1e-2, momentum=0.9, nesterov=True):
     optimizer_name = optimizer_name.lower()
     
     optimizer_classes = {
@@ -88,18 +92,11 @@ def set_lr_scheduler(optimizer, lr_scheduler_name, num_warmup_steps, num_trainin
     lr_scheduler_name = lr_scheduler_name.lower()
     
     lr_scheduler_classes = {
-        "cosine_anneal": lr.CosineAnnealingLR,
-        "cosine_anneal_warm": lr.CosineAnnealingWarmRestarts,
-        "one_cycle": lr.OneCycleLR,
         "wsd": WarmupStableDecayLR
     }
     
     if lr_scheduler_name in lr_scheduler_classes:
-        if lr_scheduler_name == "cosine_anneal":
-            return lr_scheduler_classes[lr_scheduler_name](optimizer, T_0=num_epoch_steps, eta_min=5e-7)
-        elif lr_scheduler_name == "one_cycle":
-            return lr_scheduler_classes[lr_scheduler_name](optimizer, max_lr=5e-5, total_steps=num_training_steps)
-        elif lr_scheduler_name == "wsd":
+        if lr_scheduler_name == "wsd":
             return lr_scheduler_classes[lr_scheduler_name](optimizer, num_training_steps, num_warmup_steps, decay_start, final_lr)
     else:
         return get_scheduler(lr_scheduler_name, optimizer, num_warmup_steps, num_training_steps)

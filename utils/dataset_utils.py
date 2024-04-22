@@ -10,7 +10,7 @@ from transformers import AutoTokenizer
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
 from utils.classes import ConvoTokenized, Distribution
 from multiprocessing import shared_memory
-from utils.vocab_utils import get_vocab_family, get_special_tokens
+from utils.vocab_utils import get_special_tokens
 logging.getLogger("transformers").setLevel(logging.ERROR)  # Shut up transformers
 logging.getLogger("torch").setLevel(logging.ERROR) # And pytorch for good measure
 
@@ -79,14 +79,12 @@ class H5DataManager:
         disk_data = np.exp(self._load_id(hdf_file, id))
         new_data = np.exp(new_distribution.distribution) / np.log(ppl)
 
-        max_len = max(disk_data.shape[0], new_data.shape[0])
-        min_len = min(disk_data.shape[0], new_data.shape[0])
-        diff = max_len - min_len
+        raw_diff = disk_data.shape[0] - new_data.shape[0]
 
-        if disk_data.shape[0] < new_data.shape[0]:
-            disk_data = np.pad(disk_data, ((0, diff), (0, 0)))
-        elif disk_data.shape[0] > new_data.shape[0]:
-            new_data = np.pad(new_data, ((0, diff), (0, 0)))
+        if raw_diff < 0:
+            disk_data = np.pad(disk_data, ((0, -raw_diff), (0, 0)))
+        elif raw_diff > 0:
+            new_data = np.pad(new_data, ((0, raw_diff), (0, 0)))
 
         merged_data = disk_data + new_data
 
@@ -247,8 +245,7 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
     except:
         tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
 
-    vocab_family = get_vocab_family(model_path=model_path)
-    sp_toks = get_special_tokens(vocab_family)
+    sp_toks = get_special_tokens(model_path=model_path)
     pf = encode_prompt_format(prompt_format, sp_toks, tokenizer)
     
     dataset = []

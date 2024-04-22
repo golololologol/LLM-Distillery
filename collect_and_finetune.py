@@ -99,6 +99,7 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
         teacher.temperature = temperature
+        teacher.student_eos_id = student.special_tokens["eos_id"]
 
     student.crop_to_size = crop_to_size
     student.context_len = context_len

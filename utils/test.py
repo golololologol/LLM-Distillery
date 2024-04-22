@@ -283,8 +283,17 @@ def input_prompt_format():
 #for i in range(tensor.size(0)):
     #print(-torch.sum(tensor[i] * torch.log(tensor[i])))
 
-set1 = {1, 2, 3}
-set2 = {2, 3, 4}
+#set1 = {1, 2, 3}
+#set2 = {2, 3, 4}
 
-# combine into one set with all unique elements
-print(set1.union(set2))
+total_gpus = torch.cuda.device_count()
+for i in range(total_gpus):
+    gpu = {}
+    gpu["name"] = torch.cuda.get_device_name(i) + f" ({i})"
+    gpu["memory_total"] = torch.cuda.get_device_properties(i).total_memory/1024**2
+    gpu["memory_used"] = torch.cuda.memory_allocated(i)/1024**2
+    gpu["memory_free"] = torch.cuda.mem_get_info(i)[1]/1024**2
+    print(gpu["name"])
+    print(gpu["memory_total"])
+    print(gpu["memory_used"])
+    print(gpu["memory_free"])
