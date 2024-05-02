@@ -24,6 +24,7 @@ class H5DataManager:
         self.got_task = multiprocessing.Event()
         self.loading_process = multiprocessing.Process(target=self._process_thread)
         self.teacher_convos = []
+        self.shared_batches = []
 
         self.loading_process.start()
 
@@ -32,15 +33,16 @@ class H5DataManager:
             while True:
                 self.got_task.wait()
                 self.done_everything.clear()
-
+                self.shared_batches = []
+                
                 while not self.queue.empty():
                     task, data = self.queue.get()
                     match task:
                         case 'get_batch':
-                            self.result_queue.put([self._load_id(hdf_file, convo_id) for convo_id in data])
+                            self.result_queue.put(self._make_outgoing_batch(hdf_file, data))
                         case 'get_batches':
-                            for batch in data:
-                                self.result_queue.put(np.array([self._load_id(hdf_file, convo_id) for convo_id in batch]))
+                            for batch_ids in data:
+                                self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
                         case 'put_batch':
                             self._process_distributions(hdf_file, data)
                         case 'get_available_ids':
@@ -99,6 +101,19 @@ class H5DataManager:
     def _load_id(self, hdf_file, convo_id: int) -> np.ndarray:
         data = np.array(hdf_file[f'convo_{convo_id}']).astype(np.float32) if f'convo_{convo_id}' in hdf_file else None
         return data
+    
+    def _make_outgoing_batch(self, hdf_file, batch_ids: list[int]) -> tuple[str, tuple[int, int], np.dtype]:
+        batch = [self._load_id(hdf_file, convo_id) for convo_id in batch_ids]
+
+        max_len = max([len(distr) for distr in batch])
+        padded_batch = np.array([np.pad(distr, ((0, max_len - len(distr)), (0, 0))) for distr in batch])
+
+        shared_batch_memory = shared_memory.SharedMemory(create=True, size=padded_batch.nbytes)
+        shared_batch = np.ndarray(padded_batch.shape, dtype=padded_batch.dtype, buffer=shared_batch_memory.buf)
+        np.copyto(shared_batch, padded_batch)
+        self.shared_batches.append(shared_batch_memory)
+
+        return shared_batch_memory.name, shared_batch.shape, shared_batch.dtype
 
     def _clear_dataset(self, hdf_file: h5py.File):
         for dataset_name in hdf_file:

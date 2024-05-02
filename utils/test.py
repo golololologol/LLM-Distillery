@@ -2,6 +2,7 @@ import torch
 from tqdm import tqdm
 import torch.nn.functional as F
 import torch
+from transformers import AutoTokenizer
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
@@ -286,14 +287,35 @@ def input_prompt_format():
 #set1 = {1, 2, 3}
 #set2 = {2, 3, 4}
 
-total_gpus = torch.cuda.device_count()
-for i in range(total_gpus):
-    gpu = {}
-    gpu["name"] = torch.cuda.get_device_name(i) + f" ({i})"
-    gpu["memory_total"] = torch.cuda.get_device_properties(i).total_memory/1024**2
-    gpu["memory_used"] = torch.cuda.memory_allocated(i)/1024**2
-    gpu["memory_free"] = torch.cuda.mem_get_info(i)[1]/1024**2
-    print(gpu["name"])
-    print(gpu["memory_total"])
-    print(gpu["memory_used"])
-    print(gpu["memory_free"])
+#total_gpus = torch.cuda.device_count()
+#for i in range(total_gpus):
+    #gpu = {}
+    #gpu["name"] = torch.cuda.get_device_name(i) + f" ({i})"
+    #gpu["memory_total"] = torch.cuda.get_device_properties(i).total_memory/1024**2
+    #gpu["memory_used"] = torch.cuda.memory_allocated(i)/1024**2
+    #gpu["memory_free"] = torch.cuda.mem_get_info(i)[1]/1024**2
+    #print(gpu["name"])
+    #print(gpu["memory_total"])
+    #print(gpu["memory_used"])
+    #print(gpu["memory_free"])
+
+#tokenizer = AutoTokenizer.from_pretrained("alpindale/gemma-7b", use_fast=False)
+#
+#all_tokens = tokenizer.get_vocab()
+#print(tokenizer.convert_tokens_to_ids("<start_of_turn>"))
+#added_tokens = ""
+#print(added_tokens)
+#base_tokens1 = set(all_tokens) - set(added_tokens)
+#
+#tokenizer = AutoTokenizer.from_pretrained("HuggingFaceH4/zephyr-7b-gemma-v0.1")
+#
+#all_tokens = tokenizer.get_vocab().keys()
+#added_tokens = tokenizer.all_special_tokens
+#base_tokens2 = set(all_tokens) - set(added_tokens)
+
+#print(base_tokens1 - base_tokens2)
+
+a = torch.tensor(([[1.5, 1], [2.3, 3.4]], [[1.5, 1], [2.3, 3.4]]))
+b = torch.tensor(([0.04, 10.1, 1.2], [1.5, 2.3, 3.4]))
+# see how many elements are in the second dimension
+print(b.size(0))

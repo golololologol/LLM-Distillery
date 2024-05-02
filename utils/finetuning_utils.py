@@ -14,9 +14,9 @@ sys.stdout = sys.__stdout__
 
 import math
 import torch
-from torch.optim.lr_scheduler import _LRScheduler
+from torch.optim.lr_scheduler import LRScheduler
 
-class WarmupStableDecayLR(_LRScheduler):
+class WarmupStableDecayLR(LRScheduler):
     def __init__(self, optimizer, total_steps, warmup_steps, decay_start_percentage, final_lr, last_epoch=-1, verbose=False):
         self.total_steps = total_steps
         self.warmup_steps = warmup_steps
@@ -26,6 +26,7 @@ class WarmupStableDecayLR(_LRScheduler):
         self.constant_lr = optimizer.param_groups[0]['lr']
 
         super().__init__(optimizer, last_epoch, verbose)
+
     
     def get_lr(self):
         if self.last_epoch < self.warmup_steps:
@@ -44,12 +45,13 @@ def launch_tensorboard(log_dir):
     tensorboard = subprocess.Popen(['tensorboard', '--logdir', log_dir, '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return tensorboard
 
-def calculate_divergence(student_logits_batch, teacher_logprobs_batch: torch.Tensor, custom=False):
-    assert teacher_logprobs_batch[0].sum() != 0, "Teacher logprobs are all zeros"
-    student_logprobs_batch = F.log_softmax(student_logits_batch, dim=-1)
+def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, custom=False):
+    assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
+    student_logprobs = F.log_softmax(student_logits, dim=-1)
+    teacher_logprobs = F.log_softmax(teacher_logits, dim=-1)
     
     reduction = 'none' if custom else 'batchmean'
-    kl_div = F.kl_div(student_logprobs_batch, teacher_logprobs_batch, reduction=reduction, log_target=True)
+    kl_div = F.kl_div(student_logprobs, teacher_logprobs, reduction=reduction, log_target=True)
     if custom:
         kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).mean().log()
 

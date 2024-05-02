@@ -1,13 +1,15 @@
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch.utils.tensorboard.writer import SummaryWriter
 from utils.vocab_utils import get_vocab_family, get_special_tokens
-from utils.finetuning_utils import set_optimizer
+from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_divergence
 from utils.convert_to_safetensor import convert_model
 from multiprocessing import shared_memory
 from typing import Optional
 from numpy import ndarray
 from tqdm import tqdm
 import torch.nn.functional as F
+import subprocess
 import numpy as np
 import multiprocessing
 import shutil
@@ -268,28 +270,41 @@ class StudentModel(BaseModel):
         self.data_order = ""
         self.optimizer_name = ""
         self.optimizer = None
-        self.validation_data_manager = None
         self.lr_scheduler_name = ""
         self.lr_scheduler = None
         self.lr = 0
         self.grad_accum_steps = 0
         self.num_training_steps = 0
         self.validation_per_steps = 0
+        self.val_batch_order_ids = []
         self.save_interval = 0
         self.training_precision_name = ""
         self.decay_start = 0
+        self.final_lr = 5e-7
         self.paths: Paths = paths
         self.num_epochs = 0
         self.num_warmup_steps = 0
         self.multi_gpu = False
+        self.num_trained_steps = 0
+        self.num_val_steps = 0
+        self.next_val_step = 0
+        self.next_accum_step = 0
+        self.custom_reduction = False
+        self.logger = None
+        self.tensorboard = None
+        self.saved_state = False
 
-    def load_model(self):
+    def _launch_tensorboard(log_dir):
+        tensorboard = subprocess.Popen(['tensorboard', '--logdir', log_dir, '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return tensorboard
 
+    def _load_model(self):
         print(f"Loading {self.model_name}...")
 
         precision_dict = {
             "fp16": torch.float16,
             "4bit": torch.bfloat16,
+            "8bit": torch.bfloat16,
             "fp32": torch.float32,
             "bf16": torch.bfloat16
         }
@@ -301,11 +316,15 @@ class StudentModel(BaseModel):
             device_map="auto" if self.multi_gpu else self.device,
             torch_dtype=train_precision,
             load_in_4bit=self.training_precision_name == "4bit",
+            load_in_8bit=self.training_precision_name == "8bit",
             attn_implementation="flash_attention_2"
         )
         self.model.train()
 
-    """def load_optimizer(self):
+    def _unload_model(self):
+        self.model = None
+
+    def _load_optimizer(self):
         self.optimizer = set_optimizer(
             self.model.parameters(),
             lr=self.lr,
@@ -313,19 +332,16 @@ class StudentModel(BaseModel):
             betas=(0.5, 0.9),
             optimizer_name=self.optimizer_name,
             weight_decay=2e-5
-        )"""
+        )
+
+    def _unload_optimizer(self):
+        self.optimizer = None
     
-    def sort_dataset_by_len(self):
+    def _sort_val_dataset_by_len(self):
         self.validation_dataset.sort(key=lambda convo: convo.length, reverse=True)
         self.validation_dataset_sorted = True
-        validation_loading_order = [convo.origin_convo_id for convo in self.validation_dataset]
-
-        self.dataset.sort(key=lambda convo: convo.length, reverse=True)
-        self.dataset_sorted = True
-        loading_order = [convo.origin_convo_id for convo in self.dataset]
-        return loading_order, validation_loading_order
     
-    def _order_dataset(self):
+    def _reorder_dataset(self):
         if self.dataset_sorted:
             return
         if self.data_order == "shuffle":
@@ -335,21 +351,20 @@ class StudentModel(BaseModel):
             self.dataset_sorted = True
         elif self.data_order == "native":
             self.dataset_sorted = True
-            pass
 
-    def save_state(self):
+    def _save_state(self):
         self.model.save_pretrained(self.paths.student_states)
         self.model.config.save_pretrained(self.paths.student_states)
         torch.save(self.optimizer.state_dict(), os.path.join(self.paths.student_states, "optimizer.pt"))
         torch.save(self.lr_scheduler.state_dict(), os.path.join(self.paths.student_states, "scheduler.pt"))
 
-    def load_state(self):
+    def _load_state(self):
         self.model = AutoModelForCausalLM.from_pretrained(self.paths.student_states)
         self.model.train()
         self.optimizer.load_state_dict(torch.load(os.path.join(self.paths.student_states, "optimizer.pt")))
         self.lr_scheduler.load_state_dict(torch.load(os.path.join(self.paths.student_states, "scheduler.pt")))
 
-    def _construct_batches(self, dataset_chunk: list[ConvoTokenized]) -> list[list[ConvoTokenized]]:
+    def _construct_batches(self, dataset_chunk: list[ConvoTokenized]) -> tuple[list[list[ConvoTokenized]], list[list[int]]]:
         num_batches = math.ceil(len(dataset_chunk) / self.batch_size)
         convo_batches = []
         id_batches = []
@@ -362,22 +377,104 @@ class StudentModel(BaseModel):
         return convo_batches, id_batches
 
     def train_chunk(self, data_manager, validation_data_manager, full_collect):
-        trainable_ids = data_manager.get_convo_ids()
-        num_to_process = len(trainable_ids)
+        self.progress_bar = tqdm(total=self.num_training_steps, initial=self.num_trained_steps, desc="Training", smoothing=0.06, leave=False)
 
-        self._order_dataset()
+        trainable_ids = data_manager.get_convo_ids()
+
+        if not self.validation_dataset_sorted:
+            self._sort_val_dataset_by_len()
+            self.validation_dataset, self.val_batch_order_ids = self._construct_batches(self.validation_dataset)
+
+        if self.logger is None:
+            self.logger = SummaryWriter(log_dir=self.paths.logging)
+            self.tensorboard = self._launch_tensorboard(self.paths.logging)
+
+        self._reorder_dataset()
         dataset_chunk = self.dataset if full_collect else [convo for convo in self.dataset if convo.origin_convo_id in trainable_ids]
-        convo_batches, id_batches = self._construct_batches(dataset_chunk)
+        batched_chunk_convos, id_batches = self._construct_batches(dataset_chunk)
+
         data_manager.enqueue_get_batches(id_batches)
 
-        self.validation_data_manager = validation_data_manager
+        if self.saved_state:
+            self._load_state()
+        else:
+            self._load_model()
+            self._load_optimizer()
 
+        self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_training_steps, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
 
-        
+        # main training loop
+        for batch_convos in batched_chunk_convos:
+            state_updated = False
+            num_steps = len(batch_convos)
+            max_non_padded_len = max(convo.length for convo in batch_convos)
+            batch_tokenized = np.ndarray([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
+            batch_tokenized_tensor = torch.tensor(batch_tokenized, dtype=torch.long).to(self.device)
 
+            sdh_mem_name, batch_shape, batch_dtype = data_manager.read_next_batch()
+            teacher_batch_raw = torch.tensor(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shared_memory.SharedMemory(name=sdh_mem_name).buf)).to(self.device)
 
+            batch_logits = self.model(batch_tokenized_tensor).logits.float()[:, :, :self.crop_to_size]
 
+            for i, convo in enumerate(batch_convos):
+                content_indices = self._get_content_indices_tensor(convo.content_ranges)
+                convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
+                convo_teacher_logits = teacher_batch_raw[i, :convo_content_logits.size(0)]
+                kl_div = calculate_divergence(convo_content_logits, convo_teacher_logits, custom=self.custom_reduction)
+                self.logger.add_scalar("Loss/train", kl_div, self.num_trained_steps + i)
+                kl_div.backward()
+                self.progress_bar.update(1)
+                self.lr_scheduler.step()
+                self.logger.add_scalar("LR", self.lr_scheduler.get_last_lr()[0], self.num_trained_steps + i)
 
+            if self.num_trained_steps >= self.next_accum_step:
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                state_updated = True
+                self.next_accum_step += self.grad_accum_steps
+
+            self.num_trained_steps += num_steps
+
+            if self.num_trained_steps >= self.next_val_step:
+                validation_data_manager.enqueue_get_batches(self.val_batch_order_ids)
+
+                for val_convo_batch in self.validation_dataset:
+                    val_max_non_padded_len = max(convo.length for convo in val_convo_batch)
+                    val_batch_tokenized = np.ndarray([convo.tokenized[:val_max_non_padded_len] for convo in val_convo_batch])
+                    val_batch_tokenized_tensor = torch.tensor(val_batch_tokenized, dtype=torch.long).to(self.device)
+
+                    sdh_mem_name, batch_shape, batch_dtype = validation_data_manager.read_next_batch()
+                    teacher_data_raw = torch.tensor(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shared_memory.SharedMemory(name=sdh_mem_name).buf)).to(self.device)
+
+                    val_batch_logits = self.model(val_batch_tokenized_tensor).logits.float()[:, :, :self.crop_to_size]
+
+                    for i, val_convo in enumerate(val_convo_batch):
+                        val_content_indices = self._get_content_indices_tensor(val_convo.content_ranges)
+                        val_convo_content_logits = torch.index_select(val_batch_logits[i], 0, val_content_indices) / self.temperature
+                        val_convo_teacher_logits = teacher_data_raw[i, :val_convo_content_logits.size(0), :]
+                        val_kl_div = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, custom=self.custom_reduction)
+                        self.logger.add_scalar("Loss/val", val_kl_div, self.num_val_steps + i)
+
+                    self.num_val_steps += len(val_convo_batch)
+
+                self.next_val_step += self.validation_per_steps
+
+        if not state_updated:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+
+        self._save_state()
+        self.saved_state = True
+        self.progress_bar.close()
+        self._unload_model()
+        self._unload_optimizer()
+
+    def close(self):
+        if self.logger is not None:
+            self.logger.close()
+        if self.tensorboard is not None:
+            self.tensorboard.terminate()
+         
 
 
 def _batch_creator_worker(inference_queue, batch_size, dataset_chunk: list[ConvoTokenized]):

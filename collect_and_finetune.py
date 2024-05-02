@@ -105,7 +105,8 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
     student.context_len = context_len
     student.temperature = temperature
 
-def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start, multi_gpu, data_order):
+def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision,
+                         decay_start, multi_gpu, data_order, validate_every_n_steps, custom_reduction):
     student.num_epochs = num_epochs
     student.num_warmup_steps = num_warmup_steps
     student.lr = lr
@@ -116,6 +117,11 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.decay_start = decay_start
     student.multi_gpu = multi_gpu
     student.data_order = data_order
+    student.validation_per_steps = validate_every_n_steps
+    student.next_val_step = validate_every_n_steps
+    student.next_accum_step = grad_accum_steps
+    student.num_training_steps = num_epochs * student.dataset_len
+    student.custom_reduction = custom_reduction
 
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
     for teacher in teachers:
@@ -157,9 +163,11 @@ def main():
     optimizer = "adamw"
     data_order = "shuffle" # "shuffle", "native", "sorted"
     grad_accum_steps = 1
-    training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit"
+    training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     multi_gpu = False
     decay_start = 0.9
+    validate_every_n_steps = 1000
+    custom_reduction = False
 
     # Initialization
     paths = Paths(cache_folder, clean_start=True)
@@ -169,7 +177,8 @@ def main():
     prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range)
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature)
-    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start, multi_gpu, data_order)
+    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start,
+                         multi_gpu, data_order, validate_every_n_steps, custom_reduction)
 
     sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
@@ -192,23 +201,20 @@ def main():
     if full_collect:
         for teacher in teachers:
             teacher.process_chunk(reserve_vram, full_collect=True, data_manager=data_manager)
-        #student.train_chunk() #TODO
+        
+        for epoch in tqdm(range(num_epochs), desc="Epochs", smoothing=0.06, position=0):
+            student.train_chunk(data_manager, validation_data_manager, full_collect)
+
     else:
-        pbar = tqdm(total=len(loop_stops), desc="Stops", smoothing=0.06, position=0, leave=True)
+        for epoch in tqdm(range(num_epochs), desc="Epochs", smoothing=0.06, position=0):
 
-        for stop in loop_stops:
-            data_manager.purge_dataset()
-            for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=1, leave=False):
-                teacher.process_chunk(reserve_vram, next_stop_id=stop, data_manager=data_manager)
+            for stop in tqdm(loop_stops, desc="Chunks", smoothing=0.06, position=1, leave=False):
+                data_manager.purge_dataset()
 
-            #student.train_chunk() #TODO
-            
-            pbar.update(1)
+                for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=2, leave=False):
+                    teacher.process_chunk(reserve_vram, next_stop_id=stop, data_manager=data_manager)
 
-        pbar.close()
-            
-
-                
+                student.train_chunk(data_manager, validation_data_manager, full_collect)
 
 if __name__ == "__main__":
     main()
