@@ -20,6 +20,7 @@ class H5DataManager:
         self.device = device
         self.queue = multiprocessing.Queue(max_queue_size)
         self.result_queue = multiprocessing.Queue(max_queue_size)
+        self.max_queue_size = max_queue_size
         self.done_everything = done_everything
         self.got_task = multiprocessing.Event()
         self.loading_process = multiprocessing.Process(target=self._process_thread)
@@ -34,7 +35,7 @@ class H5DataManager:
                 self.got_task.wait()
                 self.done_everything.clear()
                 self.shared_batches = []
-                
+
                 while not self.queue.empty():
                     task, data = self.queue.get()
                     match task:
@@ -69,6 +70,7 @@ class H5DataManager:
             else:
                 self._save_data(hdf_file, distribution.distribution, id)
                 self.teacher_convos.append(id)
+
             distr_shd_mem.close()
             distr_shd_mem.unlink()
 
@@ -100,6 +102,8 @@ class H5DataManager:
     
     def _load_id(self, hdf_file, convo_id: int) -> np.ndarray:
         data = np.array(hdf_file[f'convo_{convo_id}']).astype(np.float32) if f'convo_{convo_id}' in hdf_file else None
+        if data is None:
+            raise ValueError(f"Convo ID {convo_id} not found in dataset.")
         return data
     
     def _make_outgoing_batch(self, hdf_file, batch_ids: list[int]) -> tuple[str, tuple[int, int], np.dtype]:
@@ -112,6 +116,9 @@ class H5DataManager:
         shared_batch = np.ndarray(padded_batch.shape, dtype=padded_batch.dtype, buffer=shared_batch_memory.buf)
         np.copyto(shared_batch, padded_batch)
         self.shared_batches.append(shared_batch_memory)
+
+        if len(self.shared_batches) > self.max_queue_size + 3:
+            del self.shared_batches[0]
 
         return shared_batch_memory.name, shared_batch.shape, shared_batch.dtype
 
@@ -245,7 +252,11 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
             conversation_tokenized = np.concatenate((conversation_tokenized, full_turn_tokenized))
         else:
             conversation_tokenized = full_turn_tokenized
-        
+    
+    if not conversation_content_ranges:
+        empty = True
+        return conversation_tokenized, conversation_content_ranges, empty
+
     if conversation_content_ranges[0][0] > context_len:
         empty = True
 
@@ -270,6 +281,7 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
         conversation_tokenized, conversation_content_ranges, empty = tokenize_convo(item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, add_bos=add_bos)
         
         if empty:
+            print(f"Skipping conversation {convo_id} due to empty content.")
             continue
 
         num_pad_tokens = 0
@@ -294,4 +306,7 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
         ids.add(convo_id)
         dataset.append(conversation)
 
+    if not dataset:
+        raise ValueError("No conversations found in dataset.")
+    
     return dataset, ids

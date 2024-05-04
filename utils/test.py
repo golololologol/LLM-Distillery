@@ -1,12 +1,7 @@
 import torch
-from tqdm import tqdm
 import torch.nn.functional as F
-import torch
-from transformers import AutoTokenizer
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import shutil
 #from dataset_utils import H5Reader, H5Writer
 
 #d1 = np.random.random(size = (10,2))
@@ -315,7 +310,8 @@ def input_prompt_format():
 
 #print(base_tokens1 - base_tokens2)
 
-a = torch.tensor(([[1.5, 1], [2.3, 3.4]], [[1.5, 1], [2.3, 3.4]]))
-b = torch.tensor(([0.04, 10.1, 1.2], [1.5, 2.3, 3.4]))
+#a = torch.tensor(([[1.5, 1], [2.3, 3.4]], [[1.5, 1], [2.3, 3.4]]))
+#b = torch.tensor(([0.04, 10.1, 1.2], [1.5, 2.3, 3.4]))
 # see how many elements are in the second dimension
-print(b.size(0))
+#print(b.size(0))
+model = AutoModelForCausalLM.from_pretrained("HuggingFaceH4/zephyr-7b-gemma-v0.1")

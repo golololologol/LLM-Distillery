@@ -31,8 +31,8 @@ class WarmupStableDecayLR(LRScheduler):
     def get_lr(self):
         if self.last_epoch < self.warmup_steps:
             progress = self.last_epoch / self.warmup_steps
-            cosine = 0.5 * (1 + math.cos(math.pi + progress * math.pi))
-            return [self.constant_lr * cosine for group in self.optimizer.param_groups]
+            cosine = (0.5 * (1 + math.cos(math.pi + progress * math.pi)))
+            return [max((self.constant_lr * cosine), 1e-7) for group in self.optimizer.param_groups]
         elif self.warmup_steps <= self.last_epoch <= self.decay_start_step:
             return [self.constant_lr for group in self.optimizer.param_groups]
         elif self.decay_start_step < self.last_epoch < self.total_steps:
@@ -47,8 +47,8 @@ def launch_tensorboard(log_dir):
 
 def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, custom=False):
     assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
-    student_logprobs = F.log_softmax(student_logits, dim=-1)
-    teacher_logprobs = F.log_softmax(teacher_logits, dim=-1)
+    student_logprobs = F.log_softmax(student_logits[:teacher_logits.size(0)], dim=-1)
+    teacher_logprobs = F.log_softmax(teacher_logits[:student_logits.size(0)], dim=-1)
     
     reduction = 'none' if custom else 'batchmean'
     kl_div = F.kl_div(student_logprobs, teacher_logprobs, reduction=reduction, log_target=True)
