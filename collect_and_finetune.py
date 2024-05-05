@@ -119,7 +119,7 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.decay_start = decay_start
     student.multi_gpu = multi_gpu
     student.data_order = data_order
-    student.validation_per_steps = validate_every_n_epochs * student.validation_dataset_len
+    student.validation_per_steps = validate_every_n_epochs * student.dataset_len
     student.next_accum_step = grad_accum_steps
     student.num_training_steps = num_epochs * student.dataset_len
     student.custom_reduction = custom_reduction
@@ -140,9 +140,9 @@ def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, in
 
 def main():
     cache_folder = r"C:\Users\PC\Desktop\cache"
-    max_cache_size_gb = 200
+    max_cache_size_gb = 1200
 
-    dataset_path = r"C:\Users\PC\Desktop\train_test.jsonl"
+    dataset_path = r"C:\Users\PC\Desktop\train_test_small.jsonl"
     validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
@@ -151,25 +151,25 @@ def main():
     # General model settings
     context_len = 2*1024
     save_sys_range = False
-    save_user_range = False
+    save_user_range = True
     save_assistant_range = True
     crop_distr_to_size = 32000
-    device = "cuda:1"
+    device = "cuda:0"
     reserve_vram = [5, 0.2] # GB
 
     # Training settings
-    num_epochs = 8
-    num_warmup_steps = 200
-    temperature = 2
-    lr = 2e-6
+    num_epochs = 4
+    num_warmup_steps = 50
+    temperature = 1
+    lr = 5e-6
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
-    optimizer = "adamw32bit" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop32bit"
+    optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop32bit"
     data_order = "shuffle" # "shuffle", "native", "sorted"
     grad_accum_steps = 1
     training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     multi_gpu = True
     decay_start = 0.9 # wsd only
-    validate_every_n_epochs = 0.5
+    validate_every_n_epochs = 1
     save_student_every_n_epochs = 1
     custom_reduction = True
 
@@ -188,7 +188,6 @@ def main():
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
 
     loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb)
-    print(f"Loop stops: {loop_stops}")
     # Main loop
 
     ## Validation collecting loop
@@ -222,13 +221,14 @@ def main():
             for teacher in teachers:
                 teacher.new_epoch()
 
+    validation_data_manager.close()
+    data_manager.close()
+
     print("\nDone!\n")
 
     input("Press Enter to close tensorboard and program...")
 
     student.close()
-    validation_data_manager.close()
-    data_manager.close()
 
 if __name__ == "__main__":
     main()

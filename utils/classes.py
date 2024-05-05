@@ -1,6 +1,7 @@
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.utils.tensorboard.writer import SummaryWriter
+from torch.multiprocessing.reductions import rebuild_cuda_tensor
 from utils.vocab_utils import get_vocab_family, get_special_tokens
 from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_divergence, launch_tensorboard
 from utils.convert_to_safetensor import convert_model
@@ -8,6 +9,7 @@ from multiprocessing import shared_memory
 from typing import Optional
 from numpy import ndarray
 from tqdm import tqdm
+from line_profiler import profile
 import torch.nn.functional as F
 import numpy as np
 import multiprocessing
@@ -131,7 +133,7 @@ class Paths:
        └─ trained
     '''
 
-    def __init__(self, cache, clean_start: bool = False):
+    def __init__(self, cache, clean_start: bool = False, empty_logs: bool = False):
         self.cache: str = cache
         self.logging: str = os.path.join(cache, "tensorboard_logs")
         self.dataset: str = os.path.join(cache, "dataset")
@@ -140,11 +142,11 @@ class Paths:
         self.student_states: str = os.path.join(self.student_root, "states")
         self.student_gguf: str = os.path.join(self.student_root, "gguf")
         self.student_trained: str = os.path.join(self.student_root, "trained")
-        self.initialize_folders(clean_start)
+        self.initialize_folders(clean_start, empty_logs)
     
-    def initialize_folders(self, clean_start):
+    def initialize_folders(self, clean_start, empty_logs=False):
         if clean_start:
-            self.empty_all()
+            self.empty_all(empty_logs)
         os.makedirs(self.cache, exist_ok=True)
         os.makedirs(self.logging, exist_ok=True)
         os.makedirs(self.dataset, exist_ok=True)
@@ -154,9 +156,9 @@ class Paths:
         os.makedirs(self.student_gguf, exist_ok=True)
         os.makedirs(self.student_trained, exist_ok=True)
 
-    def create_folder(self, existing_folder, new_folder: str):
-        os.makedirs(os.path.join(existing_folder, new_folder), exist_ok=True)
-        setattr(self, new_folder, os.path.join(existing_folder, new_folder))
+    def create_folder(self, existing_folder, subfolder: str):
+        os.makedirs(os.path.join(existing_folder, subfolder), exist_ok=True)
+        setattr(self, subfolder, os.path.join(existing_folder, subfolder))
 
     def empty_folder(self, folder: str):
         for file in os.listdir(folder):
@@ -169,14 +171,17 @@ class Paths:
     def empty_dataset(self):
         self.empty_folder(self.dataset)
     
-    def empty_student_states(self):
-        self.empty_folder(self.student_states)
+    def empty_student_root(self):
+        self.empty_folder(self.student_root)
 
     def empty_logs(self):
         self.empty_folder(self.logging)
 
-    def empty_all(self):
-        self.empty_folder(self.cache)
+    def empty_all(self, empty_logs=False):
+        self.empty_dataset()
+        self.empty_student_root()
+        if empty_logs:
+            self.empty_logs()
 
 class Distribution:
     def __init__(self, origin_convo_id: int, length: int = 0, cropped_end: bool = False, content_ranges: list[tuple[int, int]] = [], tokenized: ndarray = None):
@@ -264,8 +269,8 @@ class BaseModel:
     def _get_content_indices_tensor(self, content_ranges) -> torch.Tensor:
         content_indices = []
         for start, end in content_ranges:
-            content_indices.append(torch.arange(start, end, device=self.device))
-        return torch.cat(content_indices)
+            content_indices.append(np.arange(start, end))
+        return torch.tensor(np.concatenate(content_indices), dtype=torch.long).to(self.device, non_blocking=True)
 
 class StudentModel(BaseModel):
     def __init__(self, model_path: str, paths: Paths):
@@ -291,7 +296,6 @@ class StudentModel(BaseModel):
         self.num_warmup_steps = 0
         self.multi_gpu = False
         self.num_trained_steps = 0
-        self.num_val_steps = 0
         self.next_val_step = 0
         self.next_accum_step = 0
         self.custom_reduction = False
@@ -405,11 +409,12 @@ class StudentModel(BaseModel):
             self.validation_dataset_batched, self.val_batch_order_ids = self._construct_batches(self.validation_dataset)
 
         if self.logger is None:
-            self.logger = SummaryWriter(log_dir=self.paths.logging)
+            comment = f"{self.model_name}_lr_{self.lr}_{time.strftime('%d-%m-%Y_%H-%M-%S')}"
+            self.logger = SummaryWriter(log_dir=os.path.join(self.paths.logging, comment))
             self.tensorboard = launch_tensorboard(self.paths.logging)
 
         if self.grad_accum_steps < self.batch_size:
-            print("Warning: Grad accum steps are less than batch size. Setting accumulation steps to batch size.")
+            print("Warning: Grad accum steps < batch size. Setting accumulation steps = batch size.")
             self.grad_accum_steps = self.batch_size
 
         if self.tokenizer is None:
@@ -462,33 +467,36 @@ class StudentModel(BaseModel):
             self.tensorboard.terminate()
 
     # main training loop
+    @profile
     def _run_training_cycle(self, batched_chunk_convos, data_manager, validation_data_manager):
         for batch_convos in batched_chunk_convos:
             state_updated = False
             num_steps = len(batch_convos)
             max_non_padded_len = max(convo.length for convo in batch_convos)
             batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
-            batch_tokenized_tensor = torch.tensor(batch_tokenized, dtype=torch.long).to(self.device)
-
+            batch_tokenized_tensor = torch.tensor(batch_tokenized, dtype=torch.long).to(self.device, non_blocking=True)
+            
             sdh_mem_name, batch_shape, batch_dtype = data_manager.read_next_batch()
             shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
-            teacher_batch_raw = torch.tensor(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).contiguous().to(self.device)
+            teacher_batch_raw = torch.tensor(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(self.device, non_blocking=True)
             shd_mem.close()
             shd_mem.unlink()
 
-            batch_logits = self.model(batch_tokenized_tensor).logits.float()[:, :, :self.crop_to_size].contiguous()
+            batch_kl_div = torch.tensor(0.0).to(self.device, non_blocking=True)
 
-            batch_kl_div = torch.tensor(0.0, device=self.device)
+            batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
+
             for i, convo in enumerate(batch_convos):
                 content_indices = self._get_content_indices_tensor(convo.content_ranges)
                 convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
-                convo_teacher_logits = teacher_batch_raw[i].contiguous()
+                convo_teacher_logits = teacher_batch_raw[i]
                 kl_div = calculate_divergence(convo_content_logits, convo_teacher_logits, custom=self.custom_reduction)
-                self.logger.add_scalar("Loss/train", kl_div, self.num_trained_steps + i)
                 batch_kl_div += kl_div
                 self.lr_scheduler.step()
-                self.logger.add_scalar("LR", self.lr_scheduler.get_last_lr()[0], self.num_trained_steps + i)
-
+            
+            batch_kl_div /= num_steps
+            self.logger.add_scalar("LR", self.lr_scheduler.get_last_lr()[0], self.num_trained_steps)
+            self.logger.add_scalar("Loss/train", batch_kl_div, self.num_trained_steps)
             self.progress_bar.update(num_steps)
             batch_kl_div.backward()
 
@@ -511,37 +519,37 @@ class StudentModel(BaseModel):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
+    @profile
     def _validate(self, validation_data_manager):
         self.model.eval()
         validation_data_manager.enqueue_get_batches(self.val_batch_order_ids)
         pbar = tqdm(total=self.validation_dataset_len, desc="Validating", leave=False, smoothing=0.06)
 
         with torch.no_grad():
-            total_val_kl_div = torch.tensor(0.0, device=self.device)
+            total_val_kl_div = torch.tensor(0.0).to(self.device, non_blocking=True)
             for val_convo_batch in self.validation_dataset_batched:
                 val_max_non_padded_len = max(convo.length for convo in val_convo_batch)
                 val_batch_tokenized = np.array([convo.tokenized[:val_max_non_padded_len] for convo in val_convo_batch])
-                val_batch_tokenized_tensor = torch.tensor(val_batch_tokenized, dtype=torch.long).to(self.device)
-    
+                val_batch_tokenized_tensor = torch.tensor(val_batch_tokenized, dtype=torch.long).to(self.device, non_blocking=True)
+
                 sdh_mem_name, batch_shape, batch_dtype = validation_data_manager.read_next_batch()
                 shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
-                teacher_data_raw = torch.tensor(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).contiguous().to(self.device)
+                teacher_data_raw = torch.tensor(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(self.device, non_blocking=True)
                 shd_mem.close()
                 shd_mem.unlink()
-    
-                val_batch_logits = self.model(val_batch_tokenized_tensor).logits.float()[:, :, :self.crop_to_size].contiguous()
-    
+
+                val_batch_logits = self.model(val_batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
+
                 for i, val_convo in enumerate(val_convo_batch):
                     val_content_indices = self._get_content_indices_tensor(val_convo.content_ranges)
                     val_convo_content_logits = torch.index_select(val_batch_logits[i], 0, val_content_indices) / self.temperature
-                    val_convo_teacher_logits = teacher_data_raw[i].contiguous()
+                    val_convo_teacher_logits = teacher_data_raw[i]
                     val_kl_div = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, custom=self.custom_reduction)
                     total_val_kl_div += val_kl_div
-    
+
                 pbar.update(len(val_convo_batch))
-    
-        self.logger.add_scalar("Loss/val", total_val_kl_div, self.num_val_steps)
-        self.num_val_steps += 1
+
+        self.logger.add_scalar("Loss/val", total_val_kl_div, self.num_trained_steps)
         pbar.close()
         self.model.train()
         self.next_val_step += self.validation_per_steps
@@ -745,7 +753,6 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
             batch_logprobs_np = np.ndarray(batch_logp_shape, dtype=batch_logp_dtype, buffer=logp_shd_mem.buf)
 
             batch_distributions_len = _process_inference_results(batch_logprobs_np, batch_distributions)
-            shared_list = shared_list[-((1 + max_queue_size)*batch_size):]
             logp_shd_mem.close()
             logp_shd_mem.unlink()
 

@@ -4,7 +4,6 @@ import h5py
 import multiprocessing
 import json
 import logging
-import time
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
@@ -137,7 +136,7 @@ class H5DataManager:
         self.queue.put(('get_batches', batches))
         self.got_task.set()
     
-    def read_next_batch(self) -> np.ndarray:
+    def read_next_batch(self):
         return self.result_queue.get()
 
     def write_batch(self, batch: list[Distribution]):
