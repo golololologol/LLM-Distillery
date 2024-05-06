@@ -2,6 +2,7 @@ from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_di
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.utils.tensorboard.writer import SummaryWriter
 from classes.data_classes import ConvoTokenized
+from classes.data_manager import H5DataManager
 from multiprocessing import shared_memory
 from classes.base_model import BaseModel
 from classes.paths import Paths
@@ -47,9 +48,16 @@ class StudentModel(BaseModel):
         self.save_every_steps = 0
         self.next_save_step = 0
         self.state_path = ""
+        self.distr_device = ""
+
+    def _set_postfix(self, postfix: str):
+        self.progress_bar.set_postfix_str(postfix)
+
+    def _release_postfix(self):
+        self.progress_bar.set_postfix_str("")
 
     def _load_model(self, model_path: str = None):
-        self.progress_bar.set_postfix_str("Loading student...")
+        self._set_postfix("Loading model...")
 
         precision_dict = {
             "fp16": torch.float16,
@@ -73,12 +81,14 @@ class StudentModel(BaseModel):
         )
         self.model.train()
 
-        self.progress_bar.set_postfix_str("")
+        self._release_postfix()
 
     def _unload_model(self):
         self.model = None
 
     def _load_optimizer(self):
+        self._set_postfix("Loading optimizer...")
+
         self.optimizer = set_optimizer(
             self.model.parameters(),
             lr=self.lr,
@@ -86,6 +96,8 @@ class StudentModel(BaseModel):
             optimizer_name=self.optimizer_name,
             weight_decay=2e-5
         )
+
+        self._release_postfix()
 
     def _unload_optimizer(self):
         self.optimizer = None
@@ -106,6 +118,8 @@ class StudentModel(BaseModel):
             self.dataset_sorted = True
 
     def _save_state(self):
+        self._set_postfix("Saving state...")
+
         self.paths.empty_student_states()
         state = {
             'model': self.model.state_dict(),
@@ -114,12 +128,20 @@ class StudentModel(BaseModel):
         }
         torch.save(state, os.path.join(self.paths.student_states, "training_state.pt"))
 
-    def _save_model(self, step: int):
+        self._release_postfix()
+
+    def _save_model(self, step: int|str):
+        self._set_postfix(f"Saving model at step {step}...")
+
         folder_name = f"{self.model_name}_step_{step}"
         self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
         self.tokenizer.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
 
+        self._release_postfix()
+
     def _load_state(self):
+        self._set_postfix("Loading state...")
+
         state = torch.load(os.path.join(self.paths.student_states, "training_state.pt"))
 
         self._load_model()
@@ -130,6 +152,8 @@ class StudentModel(BaseModel):
 
         self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_training_steps, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
         self.lr_scheduler.load_state_dict(state['scheduler'])
+
+        self._release_postfix()
 
     def _construct_batches(self, dataset_chunk: list[ConvoTokenized]) -> tuple[list[list[ConvoTokenized]], list[list[int]]]:
         num_batches = math.ceil(len(dataset_chunk) / self.batch_size)
@@ -143,7 +167,7 @@ class StudentModel(BaseModel):
 
         return convo_batches, id_batches
 
-    def train_chunk(self, data_manager, validation_data_manager, full_collect):
+    def train_chunk(self, data_manager: H5DataManager, validation_data_manager: H5DataManager, full_collect):
         trainable_ids = data_manager.get_dataset_ids()
 
         if not self.validation_dataset_sorted:
@@ -209,6 +233,8 @@ class StudentModel(BaseModel):
 
         if self.num_trained_steps >= self.num_training_steps:
             self._save_model("final")
+            self._save_state()
+            self.saved_state = True
 
         self.progress_bar.close()
         self._unload_model()
@@ -223,22 +249,26 @@ class StudentModel(BaseModel):
             self.tensorboard.terminate()
 
     # main training loop
-    def _run_training_cycle(self, batched_chunk_convos, data_manager, validation_data_manager):
+    def _run_training_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager):
         for batch_convos in batched_chunk_convos:
             state_updated = False
             num_steps = len(batch_convos)
+            device = self.distr_device if self.distr_device else self.device
 
             sdh_mem_name, batch_shape, batch_dtype = data_manager.read_next_batch()
             shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
-            teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(self.device, non_blocking=True)
+            teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(device, non_blocking=True)
 
             max_non_padded_len = max(convo.length for convo in batch_convos)
             batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
             batch_tokenized_tensor = torch.from_numpy(batch_tokenized).to(self.device, non_blocking=True)
 
-            batch_kl_div = torch.tensor(0.0).to(self.device, non_blocking=True)
+            batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
 
             batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
+
+            if not self.distr_device:
+                self.distr_device = batch_logits.device
 
             for i, convo in enumerate(batch_convos):
                 content_indices = self._get_content_indices_tensor(convo.content_ranges)
@@ -253,9 +283,6 @@ class StudentModel(BaseModel):
             self.logger.add_scalar("Loss/train", batch_kl_div, self.num_trained_steps)
             self.progress_bar.update(num_steps)
             batch_kl_div.backward()
-
-            shd_mem.close()
-            shd_mem.unlink()
 
             self.num_trained_steps += num_steps
 
@@ -276,16 +303,17 @@ class StudentModel(BaseModel):
             self.optimizer.step()
             self.optimizer.zero_grad()
 
-    def _validate(self, validation_data_manager):
+    def _validate(self, validation_data_manager: H5DataManager):
         self.model.eval()
+        device = self.distr_device if self.distr_device else self.device
         pbar = tqdm(total=self.validation_dataset_len, desc="Validating", leave=False, smoothing=0.06)
 
         with torch.no_grad():
-            total_val_kl_div = torch.tensor(0.0).to(self.device, non_blocking=True)
+            total_val_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
             for val_convo_batch in self.validation_dataset_batched:
                 sdh_mem_name, batch_shape, batch_dtype = validation_data_manager.read_next_batch()
                 shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
-                teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(self.device, non_blocking=True)
+                teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(device, non_blocking=True)
 
                 val_max_non_padded_len = max(convo.length for convo in val_convo_batch)
                 val_batch_tokenized = np.array([convo.tokenized[:val_max_non_padded_len] for convo in val_convo_batch])
@@ -300,8 +328,6 @@ class StudentModel(BaseModel):
                     val_kl_div = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, custom=self.custom_reduction)
                     total_val_kl_div += val_kl_div
 
-                shd_mem.close()
-                shd_mem.unlink()
                 pbar.update(len(val_convo_batch))
 
         self.logger.add_scalar("Loss/val", total_val_kl_div, self.num_trained_steps)

@@ -22,6 +22,7 @@ def read_jsonl_lazy(file_path):
             except json.JSONDecodeError as e:
                 print(f"Fuck up on line {line_number}: {e.msg}. Line content: {line.strip()}")
 
+
 def good_encode(text: str, sp_toks: dict, tokenizer, encode_special=True, replace_tokens=True):
     if replace_tokens:
         text = text.replace('<bos>', sp_toks["bos"]).replace('<eos>', sp_toks["eos"])
@@ -35,12 +36,14 @@ def good_encode(text: str, sp_toks: dict, tokenizer, encode_special=True, replac
 
     return encoded_text
 
+
 def encode_prompt_format(prompt_format: dict, sp_toks: dict, tokenizer) -> dict[str, list[int]]:
     prompt_format = prompt_format.copy()
 
     for key, value in prompt_format.items():
         prompt_format[key] = good_encode(value, sp_toks, tokenizer)
     return prompt_format
+
 
 def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, add_bos=True):
     empty = False
@@ -113,6 +116,7 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
         empty = True
 
     return conversation_tokenized, conversation_content_ranges, empty
+
 
 def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range, add_bos=True) -> tuple[list[ConvoTokenized], set[int]]:
     try:

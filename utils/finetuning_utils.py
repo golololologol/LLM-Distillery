@@ -1,21 +1,18 @@
-import numpy as np
-import torch.nn.functional as F
-import torch
-import line_profiler
-import torch.optim.lr_scheduler as lr
+from torch.optim.lr_scheduler import LRScheduler
 from transformers import get_scheduler
+import torch.nn.functional as F
+import numpy as np
 import subprocess
-import os
+import torch
+import math
 import sys
+import os
 
-# shut the fuck up bnb with its `bin ..bitsandbytes\libbitsandbytes_cuda121.dll`
+# shut the the hell up bnb with its `bin ..bitsandbytes\libbitsandbytes_cuda121.dll`
 sys.stdout = open(os.devnull, 'w')
 import bitsandbytes as bnb
 sys.stdout = sys.__stdout__
 
-import math
-import torch
-from torch.optim.lr_scheduler import LRScheduler
 
 class WarmupStableDecayLR(LRScheduler):
     def __init__(self, optimizer, total_steps, warmup_steps, decay_start_percentage, final_lr, last_epoch=-1, verbose=False):
@@ -28,7 +25,6 @@ class WarmupStableDecayLR(LRScheduler):
 
         super().__init__(optimizer, last_epoch, verbose)
 
-    
     def get_lr(self):
         if self.last_epoch < self.warmup_steps:
             progress = self.last_epoch / self.warmup_steps
@@ -42,11 +38,12 @@ class WarmupStableDecayLR(LRScheduler):
         else:
             return [self.final_lr for group in self.optimizer.param_groups]
 
+
 def launch_tensorboard(log_dir):
     tensorboard = subprocess.Popen(['tensorboard', '--logdir', log_dir, '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return tensorboard
 
-@line_profiler.profile
+
 def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, custom=False):
     # assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
     student_logprobs = F.log_softmax(student_logits[:teacher_logits.size(0)], dim=-1)
@@ -59,6 +56,7 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
 
     return kl_div
 
+
 def scale_temperature(current_step, num_training_steps, temperature):
     temp_scaling_steps = num_training_steps / 2
     if current_step < temp_scaling_steps and temperature > 1:
@@ -66,6 +64,7 @@ def scale_temperature(current_step, num_training_steps, temperature):
         return 1 + (temperature - 1) * np.exp(-decay_rate * current_step)
     else:
         return 1
+
 
 def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay=1e-2, momentum=0.9, nesterov=True):
     optimizer_name = optimizer_name.lower()
@@ -92,6 +91,7 @@ def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay
     else:
         raise ValueError(f"Invalid optimizer name: {optimizer_name}\nAvailable optimizers: {list(optimizer_classes.keys())}")
     
+
 def set_lr_scheduler(optimizer, lr_scheduler_name, num_warmup_steps, num_training_steps, num_epoch_steps, decay_start=0.5, constant_lr=5e-5, final_lr=5e-7):
     lr_scheduler_name = lr_scheduler_name.lower()
     

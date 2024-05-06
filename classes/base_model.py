@@ -141,6 +141,7 @@ class BaseModel:
         self.special_tokens: dict = {}
         self.temperature: float = 1.0
         self.crop_to_size: int = 0
+        self.topK: int = 0
         self._prepare()
 
     def _prepare(self):

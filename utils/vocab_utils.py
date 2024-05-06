@@ -1,6 +1,7 @@
 from transformers import AutoTokenizer
 import hashlib
 
+
 def try_load_tokenizer(model_path: str) -> AutoTokenizer:
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
@@ -8,6 +9,7 @@ def try_load_tokenizer(model_path: str) -> AutoTokenizer:
         raise ValueError(f"Tokenizer for {model_path} could not be loaded")
     
     return tokenizer
+
 
 def get_special_tokens(tokenizer=None, model_path="") -> dict[str, str|int]:
     tokenizer = try_load_tokenizer(model_path) if tokenizer == None else tokenizer
@@ -34,6 +36,7 @@ def get_special_tokens(tokenizer=None, model_path="") -> dict[str, str|int]:
     
     return sp_toks
 
+
 def get_tokenizer_sha(tokenizer = None, model_path="") -> str:
     tokenizer = try_load_tokenizer(model_path) if tokenizer == None else tokenizer
 
@@ -42,6 +45,7 @@ def get_tokenizer_sha(tokenizer = None, model_path="") -> str:
     base_tokens = sorted(set(all_tokens) - set(added_tokens))
     tokenizer_sha = hashlib.sha256("".join(base_tokens).encode()).hexdigest()
     return tokenizer_sha
+
 
 def get_vocab_family(tokenizer=None, model_path="") -> str:
     tokenizer = try_load_tokenizer(model_path) if tokenizer == None else tokenizer

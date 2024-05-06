@@ -28,6 +28,7 @@ class H5DataManager:
                 self.got_task.wait()
                 self.got_task.clear()
                 self.done_everything.clear()
+                task = None
 
                 while not self.queue.empty():
                     task, data = self.queue.get()
@@ -43,10 +44,14 @@ class H5DataManager:
 
                                     while self.queue.qsize() >= self.max_queue_size - 1:
                                         if self.got_task.is_set():
-                                            exit(0)
+                                            break
                                         time.sleep(0.1)
-                                
+
+                                    if self.got_task.is_set():
+                                        break
+
                                     self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
+                                    
                         case 'put_batch':
                             self._process_distributions(hdf_file, data)
                         case 'get_available_ids':
@@ -54,11 +59,13 @@ class H5DataManager:
                         case 'clear_dataset':
                             self._clear_dataset(hdf_file)
                         case 'exit':
-                            exit(0)
+                            break
+                            
+                if task == 'exit':
+                    break
                         
                 self.done_everything.set()
                 
-
     def _process_distributions(self, hdf_file, batch: list[Distribution]):
         for distribution in batch:
 

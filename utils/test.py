@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from finetuning_utils import calculate_divergence
 import shutil
 #from dataset_utils import H5Reader, H5Writer
 
@@ -100,17 +101,6 @@ import shutil
 #indices_to_select = torch.tensor(([1,2], [2,3]))
 #tensor3 = torch.index
 #print(tensor3)
-
-def calculate_divergence(student_logits, teacher_log_probs: torch.Tensor, temp=1.0, custom=False):
-    student_log_probs = F.log_softmax(F.log_softmax(student_logits, dim=-1).clip(-103, 88) / temp, dim=-1)
-    
-    reduction = 'batchmean' if not custom else 'none'
-    kl_div = F.kl_div(student_log_probs, F.log_softmax(F.log_softmax(teacher_log_probs, dim=-1).clip(-103, 88) / temp, dim=-1), reduction=reduction, log_target=True)
-    if custom:
-        kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).mean().log()
-
-    return kl_div*temp
-
 
 #teacher = H5Reader(r"F:\distilled\soup\MythoMax-L2-Kimiko-v2-13b\validate", "cpu")
 #teacher_tensor = teacher.read_next()
@@ -314,4 +304,8 @@ def input_prompt_format():
 #b = torch.tensor(([0.04, 10.1, 1.2], [1.5, 2.3, 3.4]))
 # see how many elements are in the second dimension
 #print(b.size(0))
-model = AutoModelForCausalLM.from_pretrained("HuggingFaceH4/zephyr-7b-gemma-v0.1")
+
+tensor1 = torch.tensor(([0, 0.996]), dtype=torch.float32)
+tensor2 = torch.tensor(([0.02, 0.996]), dtype=torch.float32)
+
+print(calculate_divergence(tensor1, tensor2, custom=True))

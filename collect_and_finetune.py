@@ -102,13 +102,14 @@ def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[Teach
         teacher.validation_dataset_len = len(teacher.validation_dataset)
     
 
-def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str):
+def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str, save_topK: int):
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
         teacher.temperature = temperature
         teacher.student_eos_id = student.special_tokens["eos_id"]
         teacher.device = device
+        teacher.topK = save_topK
 
     student.crop_to_size = crop_to_size
     student.context_len = context_len
@@ -154,7 +155,7 @@ def main():
     cache_folder = r"C:\Users\PC\Desktop\cache"
     max_cache_size_gb = 410
 
-    dataset_path = r"C:\Users\PC\Desktop\train_test.jsonl"
+    dataset_path = r"C:\Users\PC\Desktop\train_test_small.jsonl"
     validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
@@ -166,6 +167,7 @@ def main():
     save_user_range = False
     save_assistant_range = True
     crop_distr_to_size = 32000
+    save_topK = 200
     device = "cuda:0"
     reserve_vram = [5, 0.2] # GB
 
@@ -192,7 +194,7 @@ def main():
     ensure_compatibility(teachers, student)
     prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range)
 
-    set_params(teachers, student, crop_distr_to_size, context_len, temperature, device)
+    set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start,
                          multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs)
 
