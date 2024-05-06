@@ -1,6 +1,7 @@
 import numpy as np
 import torch.nn.functional as F
 import torch
+import line_profiler
 import torch.optim.lr_scheduler as lr
 from transformers import get_scheduler
 import subprocess
@@ -45,8 +46,9 @@ def launch_tensorboard(log_dir):
     tensorboard = subprocess.Popen(['tensorboard', '--logdir', log_dir, '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     return tensorboard
 
+@line_profiler.profile
 def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, custom=False):
-    assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
+    # assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
     student_logprobs = F.log_softmax(student_logits[:teacher_logits.size(0)], dim=-1)
     teacher_logprobs = F.log_softmax(teacher_logits[:student_logits.size(0)], dim=-1)
     

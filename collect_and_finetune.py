@@ -1,7 +1,11 @@
-import os
+from utils.dataset_utils import tokenize_dataset
+from classes.teacher_model import TeacherModel
+from classes.student_model import StudentModel
+from classes.data_manager import H5DataManager
+from classes.paths import Paths
 from tqdm import tqdm
-from utils.dataset_utils import tokenize_dataset, H5DataManager
-from utils.classes import TeacherModel, StudentModel, Paths
+import os
+
     
 def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb):
     kb_per_distr_val = 0.001953125 # storage of one FP16 value
@@ -27,6 +31,7 @@ def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb):
 
     return loop_stops, full_collect
 
+
 def get_teachers(models_folder) -> list[TeacherModel]:
     teachers = []
     model_paths = [os.path.join(models_folder, model_name) for model_name in os.listdir(models_folder)]
@@ -40,6 +45,7 @@ def get_teachers(models_folder) -> list[TeacherModel]:
     
     return teachers
             
+
 def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel):
     checklist = {
         'vocab_family': teachers[0].vocab_family,
@@ -54,6 +60,7 @@ def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel):
         if value != getattr(student, key):
             raise ValueError(f"Student has {key} = {getattr(student, key)} while the teachers have {key} = {value}")
         
+
 def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[TeacherModel], student: StudentModel, context_len, save_sys_range, save_user_range, save_assistant_range):
     print("Preparing datasets for the student...")
     student.dataset, relevant_ids = tokenize_dataset(
@@ -94,6 +101,7 @@ def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[Teach
         teacher.validation_dataset = [convo for convo in teacher.validation_dataset if convo.origin_convo_id in common_ids_val]
         teacher.validation_dataset_len = len(teacher.validation_dataset)
     
+
 def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str):
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
@@ -106,6 +114,7 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
     student.context_len = context_len
     student.temperature = temperature
     student.device = device
+
 
 def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision,
                          decay_start, multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs):
@@ -126,9 +135,11 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.save_every_steps = save_student_every_n_epochs * student.dataset_len
     student.next_save_step = save_student_every_n_epochs * student.dataset_len
 
+
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
     for teacher in teachers:
         setattr(teacher, param_name, param_value)
+
 
 def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, int], validation_sorting_map: dict[int, int]):
     for teacher in teachers:
@@ -138,11 +149,12 @@ def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, in
         if not teacher.validation_dataset_sorted:
             teacher.sort_dataset_by_map(validation_sorting_map, validation=True)
 
+
 def main():
     cache_folder = r"C:\Users\PC\Desktop\cache"
-    max_cache_size_gb = 1200
+    max_cache_size_gb = 410
 
-    dataset_path = r"C:\Users\PC\Desktop\train_test_small.jsonl"
+    dataset_path = r"C:\Users\PC\Desktop\train_test.jsonl"
     validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
@@ -151,7 +163,7 @@ def main():
     # General model settings
     context_len = 2*1024
     save_sys_range = False
-    save_user_range = True
+    save_user_range = False
     save_assistant_range = True
     crop_distr_to_size = 32000
     device = "cuda:0"
@@ -159,7 +171,7 @@ def main():
 
     # Training settings
     num_epochs = 4
-    num_warmup_steps = 50
+    num_warmup_steps = 200
     temperature = 1
     lr = 5e-6
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
@@ -169,7 +181,7 @@ def main():
     training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     multi_gpu = True
     decay_start = 0.9 # wsd only
-    validate_every_n_epochs = 1
+    validate_every_n_epochs = 0.1
     save_student_every_n_epochs = 1
     custom_reduction = True
 
