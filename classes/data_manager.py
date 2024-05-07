@@ -38,6 +38,7 @@ class H5DataManager:
                         case 'get_batches':
                             for batch_ids in data:
                                 self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
+                            self.got_task.wait()
                         case 'read_only_mode':
                             while not self.got_task.is_set():
                                 for batch_ids in data:
@@ -137,11 +138,6 @@ class H5DataManager:
         self.teacher_convos = []
         self.shared_batches = []
         self.result_queue.put(True)
-    
-    def get_batch(self, convo_ids: list[int]) -> np.ndarray:
-        self.queue.put(('get_batch', convo_ids))
-        self.got_task.set()
-        return self.result_queue.get()
     
     def enqueue_get_batches(self, batches: list[list[int]]):
         self.queue.put(('get_batches', batches))

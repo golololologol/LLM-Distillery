@@ -353,3 +353,4 @@ class TeacherModel(BaseModel):
             convo_path = os.path.join(folder, f"{convo.origin_convo_id}.json")
             with open(convo_path, 'w', encoding='utf-8') as file:
                 json.dump(convo_dict, file, ensure_ascii=False, indent=4)
+                

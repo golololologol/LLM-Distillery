@@ -1,8 +1,6 @@
 import torch
+import numpy as np
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from finetuning_utils import calculate_divergence
-import shutil
 #from dataset_utils import H5Reader, H5Writer
 
 #d1 = np.random.random(size = (10,2))
@@ -305,7 +303,35 @@ def input_prompt_format():
 # see how many elements are in the second dimension
 #print(b.size(0))
 
-tensor1 = torch.tensor(([0, 0.996]), dtype=torch.float32)
-tensor2 = torch.tensor(([0.02, 0.996]), dtype=torch.float32)
+def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, custom=False):
+    # assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
+    diff = 1 - torch.sum(F.softmax(student_logits, dim=-1), dim=-1)
+    student_logprobs = F.log_softmax(torch.cat((student_logits[:teacher_logits.size(0)], diff.unsqueeze(-1)), dim=-1), dim=-1)
 
-print(calculate_divergence(tensor1, tensor2, custom=True))
+    teacher_logprobs = F.log_softmax(F.pad(teacher_logits[:student_logits.size(0)], (0, 1), value=0), dim=-1)
+
+    reduction = 'none' if custom else 'batchmean'
+    kl_div = F.kl_div(student_logprobs, teacher_logprobs, reduction=reduction, log_target=True)
+    if custom:
+        kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).mean().log()
+
+    return kl_div
+
+def truncated_kldiv(student_probs, teacher_probs):
+
+    div = (teacher_probs - student_probs) 
+
+    div = div.sum() / (div.shape[0])
+
+    if div < 0:
+        div = -div
+
+    return div * (5 - student_probs.sum(dim=-1))
+
+tensor1 = torch.tensor(([0.00005, 0.2]), dtype=torch.float32)
+tensor2 = torch.tensor(([0.6, 0.2]), dtype=torch.float32)
+
+print("student_probs", tensor1)
+print("teacher_probs", tensor2)
+
+print(truncated_kldiv(tensor1, tensor2))
