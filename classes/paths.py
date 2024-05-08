@@ -56,6 +56,9 @@ class Paths:
     def empty_student_root(self):
         self.empty_folder(self.student_root)
 
+    def empty_student_states(self):
+        self.empty_folder(self.student_states)
+
     def empty_logs(self):
         self.empty_folder(self.logging)
 

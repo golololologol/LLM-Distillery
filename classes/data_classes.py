@@ -14,6 +14,7 @@ class Distribution:
         self.shd_mem_name: str = ""
         self.distr_shape = None
         self.distr_dtype = None
+        self.indices = None
 
 
 class ConvoTokenized:

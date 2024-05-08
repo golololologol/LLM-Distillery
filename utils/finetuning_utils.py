@@ -44,17 +44,30 @@ def launch_tensorboard(log_dir):
     return tensorboard
 
 
-def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, custom=False):
+def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices, custom=False):
     # assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
-    student_logprobs = F.log_softmax(student_logits[:teacher_logits.size(0)], dim=-1)
-    teacher_logprobs = F.log_softmax(teacher_logits[:student_logits.size(0)], dim=-1)
+    min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
+    if indices is None:
+        student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
+        teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
     
-    reduction = 'none' if custom else 'batchmean'
-    kl_div = F.kl_div(student_logprobs, teacher_logprobs, reduction=reduction, log_target=True)
-    if custom:
-        kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).mean().log()
+        reduction = 'none' if custom else 'batchmean'
+        div = F.kl_div(student_logprobs, teacher_logprobs, reduction=reduction, log_target=True)
+        if custom:
+            div = ((div.exp() - 1).sum(dim=-1) + 1).mean().log()
+        
+    else:
+        student_logprobs = torch.gather(F.log_softmax(student_logits[:min_len], dim=-1), dim=-1, index=indices[:min_len])
+        teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
+        
+        sum = student_logprobs.exp().sum(dim=-1).mean()
 
-    return kl_div
+        reduction = 'none' if custom else 'batchmean'
+        div = F.kl_div(student_logprobs, teacher_logprobs, reduction=reduction, log_target=True)
+        if custom:
+            div = ((div.exp() - 1).sum(dim=-1) + 1).mean().log() / 1.5
+
+    return div + (1 - sum)
 
 
 def scale_temperature(current_step, num_training_steps, temperature):

@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import math
 import torch.nn.functional as F
 #from dataset_utils import H5Reader, H5Writer
 
@@ -318,20 +319,13 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
     return kl_div
 
 def truncated_kldiv(student_probs, teacher_probs):
+    sum = student_probs.sum(dim=-1).mean()
 
-    div = (teacher_probs - student_probs) 
+    div = F.mse_loss(student_probs, teacher_probs) * math.pow(3 - sum, 2)
 
-    div = div.sum() / (div.shape[0])
+    return div
 
-    if div < 0:
-        div = -div
-
-    return div * (5 - student_probs.sum(dim=-1))
-
-tensor1 = torch.tensor(([0.00005, 0.2]), dtype=torch.float32)
-tensor2 = torch.tensor(([0.6, 0.2]), dtype=torch.float32)
-
-print("student_probs", tensor1)
-print("teacher_probs", tensor2)
-
+tensor1 = torch.tensor(([0.7, 0.2], [0.2, 0.8]), dtype=torch.float32)
+tensor2 = torch.tensor(([0.8, 0.4], [.8, .1]), dtype=torch.float32)
+print(torch.tensor(([0.0001])).log())
 print(truncated_kldiv(tensor1, tensor2))

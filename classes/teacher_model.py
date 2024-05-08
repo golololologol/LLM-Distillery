@@ -47,7 +47,7 @@ def _batch_creator_worker(inference_queue, batch_size, dataset_chunk: list[Convo
 
 
 def _inference_worker(inference_queue, result_queue, made_distributions, done_chunk, model_path, model_name, reserve_vram,
-                        device, temperature, crop_to_size, pbar_queue, context_len, batch_size, max_queue_size, seq_chunk_len):
+                        device, temperature, crop_to_size, pbar_queue, context_len, batch_size, max_queue_size, seq_chunk_len, enable_topK, topK):
         
     def _load_model(reserve_vram_gb: list[float] = []):
         pbar_queue.put(("str", f"Loading {model_name}..."))
@@ -89,18 +89,23 @@ def _inference_worker(inference_queue, result_queue, made_distributions, done_ch
         torch.cuda.empty_cache()
 
     def _inference(model: ExLlamaV2, cache: ExLlamaV2Cache, batch_tokenized: torch.Tensor) -> ndarray:
-        assert model is not None, f"{model_name}: Model has not been loaded yet."
+        #assert model is not None, f"{model_name}: Model has not been loaded yet."
 
         with torch.no_grad():
             cache.current_seq_len = 0
             
             batch_logp: torch.Tensor = F.log_softmax(model.forward(batch_tokenized, cache=cache).contiguous()[:, :, :crop_to_size].float()/temperature, dim=-1)
+            indices = None
+
+            if enable_topK:
+                batch_logp, indices = torch.topk(batch_logp, topK, dim=-1)
+                indices: ndarray = indices.to('cpu').numpy()
 
             batch_logp_data: ndarray = batch_logp.to('cpu').numpy()
             shd_mem = shared_memory.SharedMemory(create=True, size=batch_logp_data.nbytes)
             shared_batch_logp = ndarray(batch_logp_data.shape, dtype=batch_logp_data.dtype, buffer=shd_mem.buf)
             np.copyto(shared_batch_logp, batch_logp_data)
-            return shd_mem.name, batch_logp_data.shape, batch_logp_data.dtype, shd_mem
+            return shd_mem.name, batch_logp_data.shape, batch_logp_data.dtype, shd_mem, indices
         
     def _enqueue_batch_tensor():
         batch_tokenized_np, batch_distributions = inference_queue.get()
@@ -131,15 +136,16 @@ def _inference_worker(inference_queue, result_queue, made_distributions, done_ch
 
         if batch_tensor is None:
             _unload_model(model, cache)
-            result_queue.put((None, None, None, None))
+            result_queue.put((None, None, None, None, None))
             made_distributions.set()
             done_chunk.wait()
             break
 
-        shd_mem_name, batch_logp_shape, batch_logp_dtype, shd_mem = _inference(model, cache, batch_tensor)
+        shd_mem_name, batch_logp_shape, batch_logp_dtype, shd_mem, indices_np = _inference(model, cache, batch_tensor)
         shared_list.append(shd_mem)
-        shared_list = shared_list[-(4 + max_queue_size):]
-        result_queue.put((shd_mem_name, batch_logp_shape, batch_logp_dtype, batch_distributions))
+        if len(shared_list) > max_queue_size + 20:
+            shared_list.pop(0)
+        result_queue.put((shd_mem_name, batch_logp_shape, batch_logp_dtype, batch_distributions, indices_np))
         made_distributions.set()
 
         if not inference_queue.empty():
@@ -160,9 +166,13 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
         for distribution in batch_distributions:
             content_indices = _get_content_indices_np(distribution.content_ranges)
             distribution.distribution = distribution.distribution[content_indices]
-            content_tokens = distribution.tokenized[content_indices][1:]
-            gathered_log_probs = distribution.distribution[np.arange(len(content_indices) - 1), content_tokens]
-            distribution.ppl = min(np.exp(-np.mean(gathered_log_probs)), 100)
+            distribution.indices = distribution.indices[:distribution.length] if distribution.indices is not None else None
+            distribution.indices = distribution.indices[content_indices] if distribution.indices is not None else None
+            
+            if distribution.indices is None:
+                content_tokens = distribution.tokenized[content_indices][1:]
+                gathered_log_probs = distribution.distribution[np.arange(len(content_indices) - 1), content_tokens]
+                distribution.ppl = min(np.exp(-np.mean(gathered_log_probs)), 100)
 
             shd_mem = shared_memory.SharedMemory(create=True, size=distribution.distribution.nbytes)
             distribution.shd_mem_name = shd_mem.name
@@ -172,7 +182,7 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
             np.copyto(shd_distr, distribution.distribution)
             shared_list.append(shd_mem)
 
-            if len(shared_list) > max_queue_size + 3:
+            if len(shared_list) > max_queue_size + 20:
                 shared_list.pop(0)
 
             del distribution.distribution
@@ -181,9 +191,12 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
 
         return batch_content_distributions, batch_distributions_len
 
-    def _process_inference_results(batch_logprobs_np: ndarray, batch_distributions: list[Distribution]) -> int:
+    def _process_inference_results(batch_logprobs_np: ndarray, batch_distributions: list[Distribution], batch_indices_np: ndarray) -> int:
         for i, distribution in enumerate(batch_distributions):
             convo_logprobs = batch_logprobs_np[i]
+            if batch_indices_np is not None:
+                convo_indices = batch_indices_np[i]
+            
             if encourage_eos:
                 content_end_ids = [end-1 for start, end in distribution.content_ranges]
 
@@ -191,10 +204,22 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
                     content_end_ids = content_end_ids[:-1]
 
                 for end in content_end_ids:
-                    convo_logprobs[end, student_eos_id] = np.log((np.max(np.exp(convo_logprobs[end])) * 1.1))
-                    convo_logprobs[end] = np.log((np.exp(convo_logprobs[end]) / np.sum(np.exp(convo_logprobs[end]))))
+                    eos_pos_logprob = np.log((np.max(np.exp(convo_logprobs[end])) * 1.1))
+                    if batch_indices_np is not None:
+
+                        if student_eos_id not in convo_indices[end]:
+                            convo_logprobs[end, -1:] = eos_pos_logprob
+                            convo_indices[end][-1] = student_eos_id
+                        else:
+                            position = np.where(convo_indices[end] == student_eos_id)[0][0]
+                            convo_logprobs[end, position] = eos_pos_logprob
+
+                    else:
+                        convo_logprobs[end, student_eos_id] = eos_pos_logprob
+                        convo_logprobs[end] = np.log((np.exp(convo_logprobs[end]) / np.sum(np.exp(convo_logprobs[end]))))
 
             distribution.distribution = convo_logprobs[:distribution.length]
+            distribution.indices = convo_indices
         batch_content_distributions, batch_distributions_len = _get_batch_content_logprobs(batch_distributions)
         disk_queue.put(batch_content_distributions)
 
@@ -206,7 +231,7 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
     while True:
         made_distributions.wait()
         while not result_queue.empty():
-            shd_mem_name, batch_logp_shape, batch_logp_dtype, batch_distributions = result_queue.get()
+            shd_mem_name, batch_logp_shape, batch_logp_dtype, batch_distributions, indices_np = result_queue.get()
 
             if batch_distributions is None:
                 exit_flag = True
@@ -216,7 +241,7 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
             logp_shd_mem = shared_memory.SharedMemory(name=shd_mem_name)
             batch_logprobs_np = np.ndarray(batch_logp_shape, dtype=batch_logp_dtype, buffer=logp_shd_mem.buf)
 
-            batch_distributions_len = _process_inference_results(batch_logprobs_np, batch_distributions)
+            batch_distributions_len = _process_inference_results(batch_logprobs_np, batch_distributions, indices_np)
             logp_shd_mem.close()
             logp_shd_mem.unlink()
 
@@ -322,8 +347,8 @@ class TeacherModel(BaseModel):
         self.progress_bar.set_postfix_str(f"Starting workers for {self.model_name}...")
 
         batch_creator = multiprocessing.Process(target=_batch_creator_worker, args=(inference_queue, self.batch_size, dataset_chunk))
-        inference_worker = multiprocessing.Process(target=_inference_worker, args=(inference_queue, result_queue, made_distributions, done_chunk, self.model_path, self.model_name, self.reserve_vram,
-                                                                                         self.device, self.temperature, self.crop_to_size, pbar_queue, self.context_len, self.batch_size, self.max_queue_size, self.seq_chunk_len))
+        inference_worker = multiprocessing.Process(target=_inference_worker, args=(inference_queue, result_queue, made_distributions, done_chunk, self.model_path, self.model_name, self.reserve_vram, self.device, 
+                                                                                   self.temperature, self.crop_to_size, pbar_queue, self.context_len, self.batch_size, self.max_queue_size, self.seq_chunk_len, self.enable_topK, self.topK))
         result_processor = multiprocessing.Process(target=_result_processor_worker, args=(result_queue, made_distributions, done_chunk, disk_queue, self.encourage_eos, self.student_eos_id, pbar_queue, self.max_queue_size, self.batch_size))
 
         batch_creator.start()
@@ -353,4 +378,3 @@ class TeacherModel(BaseModel):
             convo_path = os.path.join(folder, f"{convo.origin_convo_id}.json")
             with open(convo_path, 'w', encoding='utf-8') as file:
                 json.dump(convo_dict, file, ensure_ascii=False, indent=4)
-                

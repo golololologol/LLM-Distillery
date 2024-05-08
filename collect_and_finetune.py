@@ -7,9 +7,12 @@ from tqdm import tqdm
 import os
 
     
-def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb):
+def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb, enable_topK, save_topK):
     kb_per_distr_val = 0.001953125 # storage of one FP16 value
-    distr_size_kb = kb_per_distr_val * teacher.crop_to_size
+    if enable_topK:
+        distr_size_kb = kb_per_distr_val * save_topK
+    else:
+        distr_size_kb = kb_per_distr_val * teacher.crop_to_size
     max_cache_size_kb = max_cache_size_gb * 1e6
     cache_size_kb = 0
     full_collect = False
@@ -102,7 +105,7 @@ def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[Teach
         teacher.validation_dataset_len = len(teacher.validation_dataset)
     
 
-def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str, save_topK: int):
+def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str, save_topK: int, enable_topK: bool):
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
@@ -110,6 +113,7 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
         teacher.student_eos_id = student.special_tokens["eos_id"]
         teacher.device = device
         teacher.topK = save_topK
+        teacher.enable_topK = enable_topK
 
     student.crop_to_size = crop_to_size
     student.context_len = context_len
@@ -163,27 +167,29 @@ def main():
 
     # General model settings
     context_len = 2*1024
-    save_sys_range = False
-    save_user_range = False
+    save_sys_range = True
+    save_user_range = True
     save_assistant_range = True
     crop_distr_to_size = 32000
+    enable_topK = True
     save_topK = 200
     device = "cuda:0"
     reserve_vram = [5, 0.2] # GB
 
+
     # Training settings
-    num_epochs = 4
+    num_epochs = 2
     num_warmup_steps = 200
     temperature = 1
-    lr = 5e-6
+    lr = 2e-6
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop32bit"
     data_order = "shuffle" # "shuffle", "native", "sorted"
     grad_accum_steps = 1
-    training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit", "8bit"
+    training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     multi_gpu = True
     decay_start = 0.9 # wsd only
-    validate_every_n_epochs = 0.1
+    validate_every_n_epochs = 1
     save_student_every_n_epochs = 1
     custom_reduction = True
 
@@ -194,16 +200,16 @@ def main():
     ensure_compatibility(teachers, student)
     prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range)
 
-    set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK)
+    set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start,
                          multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs)
 
     sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
 
-    loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb)
+    loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb, enable_topK, save_topK)
     # Main loop
-
+    
     ## Validation collecting loop
     print("Processing validation data...")
     validation_data_manager = H5DataManager(paths.dataset_validation, device)

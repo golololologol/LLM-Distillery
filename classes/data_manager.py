@@ -17,7 +17,6 @@ class H5DataManager:
         self.done_everything = done_everything
         self.got_task = multiprocessing.Event()
         self.loading_process = multiprocessing.Process(target=self._process_thread)
-        self.teacher_convos = []
         self.shared_batches = []
 
         self.loading_process.start()
@@ -74,12 +73,11 @@ class H5DataManager:
             distribution.distribution = np.ndarray(distribution.distr_shape, dtype=distribution.distr_dtype, buffer=distr_shd_mem.buf)
 
             id = distribution.origin_convo_id
-            if id in self.teacher_convos:
+            if f"{id}" in hdf_file:
                 merged_data = self._merge_data(hdf_file, distribution, id)
                 self._save_data(hdf_file, merged_data, id)
             else:
-                self._save_data(hdf_file, distribution.distribution, id)
-                self.teacher_convos.append(id)
+                self._save_data(hdf_file, distribution.distribution, id, distribution.indices)
 
             distr_shd_mem.close()
             distr_shd_mem.unlink()
@@ -104,38 +102,51 @@ class H5DataManager:
 
         return np.log(merged_data)
 
-    def _save_data(self, hdf_file: h5py.File, data: np.ndarray, convo_id: int):
+    def _save_data(self, hdf_file: h5py.File, data: np.ndarray, convo_id: int, indices):
         dataset_name = f'convo_{convo_id}'
         if dataset_name in hdf_file:
             del hdf_file[dataset_name]
-        hdf_file.create_dataset(dataset_name, data=data.astype(np.float16))
+        hdf_file.create_dataset(dataset_name, data=data, dtype=np.float32)
+
+        if indices is not None:
+            indices_name = f'indices_{convo_id}'
+            if indices_name in hdf_file:
+                del hdf_file[indices_name]
+            hdf_file.create_dataset(indices_name, data=indices)
     
     def _load_id(self, hdf_file, convo_id: int) -> np.ndarray:
-        data = np.array(hdf_file[f'convo_{convo_id}']).astype(np.float32) if f'convo_{convo_id}' in hdf_file else None
+        data = np.array(hdf_file[f'convo_{convo_id}'], dtype=np.float32) if f'convo_{convo_id}' in hdf_file else None
+        indices = np.array(hdf_file[f'indices_{convo_id}']) if f'indices_{convo_id}' in hdf_file else None
         if data is None:
             raise ValueError(f"Convo ID {convo_id} not found in dataset.")
-        return data
+        return data, indices
     
     def _make_outgoing_batch(self, hdf_file, batch_ids: list[int]) -> tuple[str, tuple[int, int], np.dtype]:
-        batch = [self._load_id(hdf_file, convo_id) for convo_id in batch_ids]
+        batch = []
+        batch_indices = []
+        for convo_id in batch_ids:
+            data, indices = self._load_id(hdf_file, convo_id)
+            batch.append(data)
+            batch_indices.append(indices)
 
         max_len = max([len(distr) for distr in batch])
-        padded_batch = np.array([np.pad(distr, ((0, max_len - len(distr)), (0, 0))) for distr in batch])
+        padded_data = [(np.pad(distr, ((0, max_len - len(distr)), (0, 0))), (len(distr))) for distr in batch]
+        padded_batch = np.array([distr[0] for distr in padded_data])
+        batch_padding = [distr[1] for distr in padded_data]
 
         shared_batch_memory = shared_memory.SharedMemory(create=True, size=padded_batch.nbytes)
         shared_batch = np.ndarray(padded_batch.shape, dtype=padded_batch.dtype, buffer=shared_batch_memory.buf)
         np.copyto(shared_batch, padded_batch)
         self.shared_batches.append(shared_batch_memory)
 
-        if len(self.shared_batches) >= self.max_queue_size + 3:
+        if len(self.shared_batches) >= self.max_queue_size + 10:
             self.shared_batches = self.shared_batches[1:]
 
-        return (shared_batch_memory.name, shared_batch.shape, shared_batch.dtype)
+        return (shared_batch_memory.name, shared_batch.shape, shared_batch.dtype, batch_indices, batch_padding)
 
     def _clear_dataset(self, hdf_file: h5py.File):
         for dataset_name in hdf_file:
             del hdf_file[dataset_name]
-        self.teacher_convos = []
         self.shared_batches = []
         self.result_queue.put(True)
     

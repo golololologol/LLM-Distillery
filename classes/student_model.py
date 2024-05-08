@@ -120,7 +120,9 @@ class StudentModel(BaseModel):
     def _save_state(self):
         self._set_postfix("Saving state...")
 
-        self.paths.empty_student_states()
+        if self.num_trained_steps < self.num_training_steps:
+            self.paths.empty_student_states()
+
         state = {
             'model': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
@@ -255,7 +257,7 @@ class StudentModel(BaseModel):
             num_steps = len(batch_convos)
             device = self.distr_device if self.distr_device else self.device
 
-            sdh_mem_name, batch_shape, batch_dtype = data_manager.read_next_batch()
+            sdh_mem_name, batch_shape, batch_dtype, batch_indices, batch_padding = data_manager.read_next_batch()
             shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
             teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(device, non_blocking=True)
 
@@ -271,11 +273,14 @@ class StudentModel(BaseModel):
                 self.distr_device = batch_logits.device
 
             for i, convo in enumerate(batch_convos):
+                indices = torch.from_numpy(batch_indices[i]).to(device, non_blocking=True)
                 content_indices = self._get_content_indices_tensor(convo.content_ranges)
+
                 convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
                 convo_teacher_logits = teacher_batch_raw[i]
-                kl_div = calculate_divergence(convo_content_logits, convo_teacher_logits, custom=self.custom_reduction)
+                kl_div = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, custom=self.custom_reduction)
                 batch_kl_div += kl_div
+
                 self.lr_scheduler.step()
             
             batch_kl_div /= num_steps
@@ -311,7 +316,7 @@ class StudentModel(BaseModel):
         with torch.no_grad():
             total_val_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
             for val_convo_batch in self.validation_dataset_batched:
-                sdh_mem_name, batch_shape, batch_dtype = validation_data_manager.read_next_batch()
+                sdh_mem_name, batch_shape, batch_dtype, val_batch_indices, batch_padding = validation_data_manager.read_next_batch()
                 shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
                 teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(device, non_blocking=True)
 
@@ -322,10 +327,13 @@ class StudentModel(BaseModel):
                 val_batch_logits = self.model(val_batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
 
                 for i, val_convo in enumerate(val_convo_batch):
+                    val_indices = torch.from_numpy(val_batch_indices[i]).to(device, non_blocking=True)
                     val_content_indices = self._get_content_indices_tensor(val_convo.content_ranges)
+
                     val_convo_content_logits = torch.index_select(val_batch_logits[i], 0, val_content_indices) / self.temperature
                     val_convo_teacher_logits = teacher_batch_raw[i]
-                    val_kl_div = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, custom=self.custom_reduction)
+
+                    val_kl_div = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits[:batch_padding[i]], val_indices, custom=self.custom_reduction)
                     total_val_kl_div += val_kl_div
 
                 pbar.update(len(val_convo_batch))
