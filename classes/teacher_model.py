@@ -9,9 +9,13 @@ import torch.nn.functional as F
 import multiprocessing
 import numpy as np
 import torch
+if not torch.cuda.is_initialized():
+    torch.cuda.init()
 import math
 import json
 import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import gc
 
 
@@ -109,6 +113,7 @@ def _inference_worker(inference_queue, result_queue, made_distributions, done_ch
         
     def _enqueue_batch_tensor():
         batch_tokenized_np, batch_distributions = inference_queue.get()
+        inference_queue.task_done()
 
         if batch_tokenized_np is None:
             tokenized_batches.append((None, None))
@@ -232,6 +237,7 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
         made_distributions.wait()
         while not result_queue.empty():
             shd_mem_name, batch_logp_shape, batch_logp_dtype, batch_distributions, indices_np = result_queue.get()
+            result_queue.task_done()
 
             if batch_distributions is None:
                 exit_flag = True
@@ -302,10 +308,12 @@ class TeacherModel(BaseModel):
     def _manage_queues(self, disk_queue, pbar_queue):
         while not disk_queue.empty():
             batch_content_distributions = disk_queue.get()
+            disk_queue.task_done()
             self.data_manager.write_batch(batch_content_distributions)
 
         while not pbar_queue.empty():
             action, value = pbar_queue.get()
+            pbar_queue.task_done()
             self._pbar_actions(action, value)
 
     def sort_dataset_by_len(self):

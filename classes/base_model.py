@@ -115,7 +115,8 @@ def input_config():
 
 
 class BaseModel:
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, student: bool = False):
+        self.student: bool = student
         self.model_path: str = model_path
         self.model_name: str = ""
         self.device: str = "cuda:0"
@@ -157,22 +158,24 @@ class BaseModel:
         if not is_model_safetensors(self.model_path):
             self.model_path = convert_model(self.model_path)
 
-        pf = load_prompt_format(self.model_path)
-        if pf is None:
-            print(f"{self.model_name} has no prompt format")
-            pf = input_prompt_format()
-            save_prompt_format(pf, self.model_path)
+        if not self.student:
+            pf = load_prompt_format(self.model_path)
+            if pf is None:
+                print(f"{self.model_name} has no prompt format")
+                pf = input_prompt_format()
+                save_prompt_format(pf, self.model_path)
 
-        config = load_config(self.model_path)
-        if config is None:
-            print(f"{self.model_name} has no config")
-            config = input_config()
-            save_config(config, self.model_path)
+            config = load_config(self.model_path)
+            if config is None:
+                print(f"{self.model_name} has no config")
+                config = input_config()
+                save_config(config, self.model_path)
 
-        self.prompt_format = pf
-        self.batch_size = config.get('batch_size', 1)
-        self.add_bos = config.get('add_bos', True)
-        self.seq_chunk_len = config.get('seq_chunk_len', 256)
+            self.prompt_format = pf
+            self.batch_size = config.get('batch_size', 1)
+            self.add_bos = config.get('add_bos', True)
+            self.seq_chunk_len = config.get('seq_chunk_len', 256)
+
         self.vocab_family = get_vocab_family(model_path=self.model_path)
         self.special_tokens = get_special_tokens(model_path=self.model_path)
 

@@ -1,5 +1,6 @@
 from classes.data_classes import Distribution
 from multiprocessing import shared_memory
+from multiprocessing import get_context
 import multiprocessing
 import numpy as np
 import time
@@ -8,15 +9,15 @@ import os
 
 
 class H5DataManager:
-    def __init__(self, dataset_path, device, max_queue_size=3, done_everything=multiprocessing.Event()):
+    def __init__(self, dataset_path, device, max_queue_size=5):
         self.file_path = os.path.join(dataset_path, "distributions.hdf5")
         self.device = device
         self.queue = multiprocessing.Queue(max_queue_size)
         self.result_queue = multiprocessing.Queue(max_queue_size)
         self.max_queue_size = max_queue_size
-        self.done_everything = done_everything
+        self.done_everything = multiprocessing.Event()
         self.got_task = multiprocessing.Event()
-        self.loading_process = multiprocessing.Process(target=self._process_thread)
+        self.loading_process = get_context("spawn").Process(target=self._process_thread)
         self.shared_batches = []
 
         self.loading_process.start()
@@ -31,6 +32,7 @@ class H5DataManager:
 
                 while not self.queue.empty():
                     task, data = self.queue.get()
+
                     match task:
                         case 'get_batch':
                             self.result_queue.put(self._make_outgoing_batch(hdf_file, data))
@@ -68,7 +70,6 @@ class H5DataManager:
                 
     def _process_distributions(self, hdf_file, batch: list[Distribution]):
         for distribution in batch:
-
             distr_shd_mem = shared_memory.SharedMemory(name=distribution.shd_mem_name)
             distribution.distribution = np.ndarray(distribution.distr_shape, dtype=distribution.distr_dtype, buffer=distr_shd_mem.buf)
 

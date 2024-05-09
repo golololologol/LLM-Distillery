@@ -1,9 +1,11 @@
+from classes.base_model import is_model_safetensors
 from utils.dataset_utils import tokenize_dataset
 from classes.teacher_model import TeacherModel
 from classes.student_model import StudentModel
 from classes.data_manager import H5DataManager
 from classes.paths import Paths
 from tqdm import tqdm
+import multiprocessing
 import os
 
     
@@ -37,6 +39,14 @@ def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb, enable_topK, 
 
 def get_teachers(models_folder) -> list[TeacherModel]:
     teachers = []
+
+    # check if the path is to one model folder or a folder with multiple models
+    for file in os.listdir(models_folder):
+        if file.endswith(".bin") or file.endswith(".json") or file.endswith(".safetensors"):
+
+            teachers.append(TeacherModel(models_folder))
+            return teachers
+
     model_paths = [os.path.join(models_folder, model_name) for model_name in os.listdir(models_folder)]
 
     if not model_paths:
@@ -156,28 +166,28 @@ def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, in
 
 
 def main():
-    cache_folder = r"C:\Users\PC\Desktop\cache"
+    cache_folder = r"/root/axo_clone/Distill_Latest_Clone/t_cache"
     max_cache_size_gb = 410
 
-    dataset_path = r"C:\Users\PC\Desktop\train_test_small.jsonl"
-    validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
+    validation_dataset_path = r"/root/axo_clone/Distill_Latest_Clone/datasets/instruct_set1/val_test.jsonl"
+    dataset_path = r"/root/axo_clone/Distill_Latest_Clone/datasets/instruct_set1/train_test_small.jsonl"
 
-    teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
-    student_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+    teacher_models_folder = r"/workspace/models_nonHF/llama3_8b_hf_copy"
+    student_path = r"/workspace/models_nonHF/llama3_8b_hf_copy"
 
     # General model settings
-    context_len = 2*1024
+    context_len = 8192
     save_sys_range = True
     save_user_range = True
     save_assistant_range = True
-    crop_distr_to_size = 32000
+    crop_distr_to_size = 128256
     enable_topK = True
     save_topK = 200
     device = "cuda:0"
-    reserve_vram = [5, 0.2] # GB
-
+    reserve_vram = [5, 0.5, 0.5, 0.5] # GB
 
     # Training settings
+    batch_size = 4
     num_epochs = 2
     num_warmup_steps = 200
     temperature = 1
@@ -193,10 +203,23 @@ def main():
     save_student_every_n_epochs = 1
     custom_reduction = True
 
+    # Student settings
+    add_bos = True
+    prompt_format = {
+        "SYS_START": "SYS: ",
+        "USER_START": "USER: ",
+        "ASSISTANT_START": "ASSISTANT: ",
+        "SYS_END": "\n",
+        "USER_END": "\n",
+        "ASSISTANT_END": "\n",
+    }
+
+
     # Initialization
+    multiprocessing.set_start_method('spawn', force=True)
     paths = Paths(cache_folder, clean_start=True)
     teachers = get_teachers(teacher_models_folder)
-    student = StudentModel(student_path, paths)
+    student = StudentModel(student_path, paths, add_bos, prompt_format, batch_size)
     ensure_compatibility(teachers, student)
     prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range)
 

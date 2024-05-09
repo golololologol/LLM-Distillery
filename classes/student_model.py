@@ -16,8 +16,8 @@ import os
 
 
 class StudentModel(BaseModel):
-    def __init__(self, model_path: str, paths: Paths):
-        super().__init__(model_path)
+    def __init__(self, model_path: str, paths: Paths, add_bos: bool, prompt_format: dict, batch_size: int):
+        super().__init__(model_path, student=True)
         self.model: Optional[AutoModelForCausalLM] = None
         self.tokenizer: Optional[AutoTokenizer] = None
         self.data_order = ""
@@ -49,6 +49,9 @@ class StudentModel(BaseModel):
         self.next_save_step = 0
         self.state_path = ""
         self.distr_device = ""
+        self.add_bos = add_bos
+        self.prompt_format = prompt_format
+        self.batch_size = batch_size
 
     def _set_postfix(self, postfix: str):
         self.progress_bar.set_postfix_str(postfix)

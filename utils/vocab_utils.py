@@ -19,7 +19,7 @@ def get_special_tokens(tokenizer=None, model_path="") -> dict[str, str|int]:
         return getattr(tokenizer, attr) or default
 
     if vocab_family == "llama_1|2" or vocab_family == "mistral":
-        
+        # existing implementation
         sp_toks = {
             "bos": safe_get('bos_token', '<s>'),
             "bos_id": safe_get('bos_token_id', 1),
@@ -28,9 +28,20 @@ def get_special_tokens(tokenizer=None, model_path="") -> dict[str, str|int]:
             "pad": safe_get('pad_token', '</s>'),
             "pad_id": safe_get('pad_token_id', 2),
             "unk": safe_get('unk_token', '<unk>'),
-            "unk_id": safe_get('unk_token_id', 0),
+            "unk_id": safe_get('unk_token_id', 0)
         }
-
+    elif vocab_family == "llama_3":
+        # new implementation for LLaMA-3
+        sp_toks = {
+            "bos": safe_get('bos_token', '<|begin_of_text|>'),
+            "bos_id": safe_get('bos_token_id', 128000),
+            "eos": safe_get('eos_token', '<|end_of_text|>'),
+            "eos_id": safe_get('eos_token_id', 128001),
+            "pad": safe_get('pad_token', '<|end_of_text|>'),
+            "pad_id": safe_get('pad_token_id', 128001),
+            "unk": safe_get('unk_token', '<|end_of_text|>'),
+            "unk_id": safe_get('unk_token_id', 128001)
+        }
     else:
         raise NotImplementedError(f"Special tokens for {vocab_family} have not been added yet!")
     
