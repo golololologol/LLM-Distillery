@@ -333,19 +333,11 @@ def truncated_kldiv(student_probs, teacher_probs):
 
 
 
-teacher_tensor = torch.tensor(([0.01, 0.99], [0.99, 0.01]), dtype=torch.float32).log()
+teacher_tensor = torch.tensor(([0.01, 0.98, 0.01], [0.98, 0.01, 0.01]), dtype=torch.float32).log()
 student_tensor = torch.tensor(([0.01, 0.49, 0.5], [0.5, 0.49, 0.01]), dtype=torch.float32).log()
 indices = torch.tensor(([0, 1], [1, 2]))
 
 print(f"Student's full distribution: {student_tensor.exp()}")
 gathered_student = torch.gather(student_tensor, dim=-1, index=indices)
 print(f"\nStudent gathered: {gathered_student.exp()}")
-print(f"\nTeacher: {teacher_tensor.exp()}")
-
-print("\nTo calculate correct KL divergence, both distribution's probabilities must sum to 1, so we must do softmax,\n thus losing the confidence of the student's predictions in the gathered distribution.")
-teacher_logprobs = F.log_softmax(teacher_tensor, dim=-1)
-student_logprobs = F.log_softmax(gathered_student, dim=-1)
-print(f"\nStudent's gathered probs after softmax: {student_logprobs.exp()}")
-print(f"\nTeacher's logprobs: {teacher_logprobs.exp()}")
-
-print(f"\nKL divergence: {calculate_divergence(student_logprobs, teacher_logprobs, custom=True)}")
+print((1 - gathered_student.exp().sum(dim=-1).mean()).exp() - 1)

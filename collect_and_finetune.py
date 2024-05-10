@@ -174,45 +174,46 @@ def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, in
 
 def main():
     cache_folder = r"/workspace/distil_cache"
-    max_cache_size_gb = 220
+    max_cache_size_gb = 300
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
-    dataset_path = r"/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
+    # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
+    dataset_path = r"/root/axo_clone/axolotl/data/random_samples_50k.jsonl"
     validation_dataset_path = r"/root/axo_clone/Distill_Latest_Clone/val_test.jsonl"
 
     teacher_models_folder = r"/root/models_nonHF"
     student_path = r"/workspace/models_nonHF/llama3_8b_hf_copy"
 
-    completion = False
-    clean_start = False
+    completion = True
+    clean_start = True
 
     # General model settings
     context_len = 8*1024
     save_sys_range = True
     save_user_range = True
     save_assistant_range = True
-    crop_distr_to_size = 999999
+    crop_distr_to_size = 32000
     enable_topK = True
     save_topK = 200
     device = "cuda:0"
-    reserve_vram = [10, 10, 5, 1] # GB
+    reserve_vram = [5, 0.5] # GB
 
     # Training settings
     batch_size = 2
-    num_epochs = 2
-    num_warmup_steps = 0
+    num_epochs = 1
+    num_warmup_steps = 50
     temperature = 1
-    lr = 2e-5
+    lr = 2e-6
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop32bit"
     data_order = "shuffle" # "shuffle", "native", "sorted"
-    grad_accum_steps = 1
+    grad_accum_steps = 2
     training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     multi_gpu = True
     decay_start = 0.9 # wsd only
-    validate_every_n_epochs = 0.1
+    validate_every_n_epochs = 0.05
     save_student_every_n_epochs = 0.5
-    custom_reduction = False
+    custom_reduction = True
     encourage_eos = False
 
     # Student settings
@@ -243,21 +244,19 @@ def main():
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
 
     loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb, enable_topK, save_topK)
+
     # Main loop
     
     ## Validation collecting loop
-    #print("Processing validation data...")
+    print("Processing validation data...")
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
 
-    #for teacher in teachers:
-        #teacher.process_chunk(reserve_vram, full_collect=True, data_manager=validation_data_manager, validation=True)
-
+    for teacher in teachers:
+        teacher.process_chunk(reserve_vram, full_collect=True, data_manager=validation_data_manager, validation=True)
     
     ## Training collecting loop
     print("Processing all data..." if full_collect else "Processing data in chunks...")
     data_manager = H5DataManager(paths.dataset, device)
-
-    student.train_chunk(data_manager, validation_data_manager, full_collect)
 
     if full_collect:
         for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):

@@ -267,7 +267,6 @@ class StudentModel(BaseModel):
             batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
             batch_tokenized_tensor = torch.from_numpy(batch_tokenized).to(self.device, non_blocking=True)
 
-            batch_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_combined_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
@@ -285,26 +284,23 @@ class StudentModel(BaseModel):
                 convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
                 convo_teacher_logits = teacher_batch_raw[i]
                 convo_content_tokens = torch.index_select(batch_tokenized_tensor[i], 0, content_indices)
-                combined_topL_loss, combined_loss, cross_entropy_loss, kl_div, sum_inv = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, custom=self.custom_reduction)
+                combined_loss, cross_entropy_loss, kl_div, sum_inv = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, custom=self.custom_reduction)
 
-                batch_loss += combined_topL_loss
-                batch_combined_loss += combined_loss
-                batch_cross_entropy_loss += cross_entropy_loss
-                batch_kl_div += kl_div
-                batch_sum_inv += sum_inv
+                batch_combined_loss += combined_loss / num_steps
+                batch_cross_entropy_loss += cross_entropy_loss / num_steps
+                batch_kl_div += kl_div / num_steps
+                batch_sum_inv += sum_inv / num_steps
 
                 self.lr_scheduler.step()
             
-            batch_loss /= num_steps
-            self.logger.log({"Loss/combined TopL": batch_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
-            self.logger.log({"Loss/combined": batch_combined_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+            self.logger.log({"Loss/combined (kl_div + inv_sum)": batch_combined_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
             self.logger.log({"Loss/cross entropy": batch_cross_entropy_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
             self.logger.log({"Loss/KL divergence": batch_kl_div.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
             self.logger.log({"Loss/sum inv": batch_sum_inv.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
 
             self.logger.log({"Learning rate": self.lr_scheduler.get_last_lr()[0]}, step=self.num_trained_steps)
             self.progress_bar.update(num_steps)
-            batch_loss.backward()
+            batch_combined_loss.backward()
 
             self.num_trained_steps += num_steps
 
@@ -331,7 +327,6 @@ class StudentModel(BaseModel):
         pbar = tqdm(total=self.validation_dataset_len, desc="Validating", leave=False, smoothing=0.06)
 
         with torch.no_grad():
-            batch_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_combined_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
@@ -356,9 +351,8 @@ class StudentModel(BaseModel):
                     val_convo_teacher_logits = teacher_batch_raw[i]
                     val_convo_content_tokens = torch.index_select(val_batch_tokenized_tensor[i], 0, val_content_indices)
 
-                    combined_topL_loss, combined_loss, cross_entropy_loss, kl_div, sum_inv = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits[:batch_padding[i]], val_indices, val_convo_content_tokens, custom=self.custom_reduction)
+                    combined_loss, cross_entropy_loss, kl_div, sum_inv = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits[:batch_padding[i]], val_indices, val_convo_content_tokens, custom=self.custom_reduction)
                     
-                    batch_loss += combined_topL_loss
                     batch_combined_loss += combined_loss
                     batch_cross_entropy_loss += cross_entropy_loss
                     batch_kl_div += kl_div
@@ -366,11 +360,15 @@ class StudentModel(BaseModel):
 
                 pbar.update(len(val_convo_batch))
 
-        self.logger.log({"Val Loss/combined TopL": batch_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+        batch_combined_loss /= self.validation_dataset_len
+        batch_cross_entropy_loss /= self.validation_dataset_len
+        batch_kl_div /= self.validation_dataset_len
+        batch_sum_inv /= self.validation_dataset_len
+
         self.logger.log({"Val Loss/combined": batch_combined_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
         self.logger.log({"Val Loss/cross entropy": batch_cross_entropy_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
         self.logger.log({"Val Loss/KL divergence": batch_kl_div.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/sum inv": batch_sum_inv.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/inverse sum": batch_sum_inv.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
 
         pbar.close()
         self.model.train()
