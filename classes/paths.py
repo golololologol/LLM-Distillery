@@ -43,6 +43,8 @@ class Paths:
         setattr(self, subfolder, os.path.join(existing_folder, subfolder))
 
     def empty_folder(self, folder: str):
+        if not os.path.exists(folder):
+            return
         for file in os.listdir(folder):
             file_path = os.path.join(folder, file)
             if os.path.isdir(file_path):

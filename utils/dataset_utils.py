@@ -45,7 +45,7 @@ def encode_prompt_format(prompt_format: dict, sp_toks: dict, tokenizer) -> dict[
     return prompt_format
 
 
-def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, add_bos=True):
+def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, completion, add_bos=True):
     empty = False
 
     if add_bos:
@@ -56,6 +56,23 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
         start_index = -1
 
     conversation_content_ranges = []
+
+
+
+    if completion:
+
+        text = json_item.get("text", "")
+        if text:
+            text_tokenized = good_encode(text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
+            conversation_tokenized = np.concatenate((conversation_tokenized, text_tokenized))
+            conversation_content_ranges.append((0, len(text_tokenized)))
+        else:
+            empty = True
+
+        return conversation_tokenized, conversation_content_ranges, empty
+        
+
+
     num_turns = len(json_item["conversations"])
 
     if num_turns == 0:
@@ -118,7 +135,7 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
     return conversation_tokenized, conversation_content_ranges, empty
 
 
-def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range, add_bos=True) -> tuple[list[ConvoTokenized], set[int]]:
+def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range, add_bos=True, completion=False) -> tuple[list[ConvoTokenized], set[int]]:
     try:
         config = ExLlamaV2Config()
         config.model_dir = model_path
@@ -134,7 +151,7 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
     ids = set()
 
     for convo_id, item in tqdm(enumerate(read_jsonl_lazy(dataset_path)), desc="Tokenizing", unit="convo", smoothing=0.06, leave=False): # Every conversation
-        conversation_tokenized, conversation_content_ranges, empty = tokenize_convo(item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, add_bos=add_bos)
+        conversation_tokenized, conversation_content_ranges, empty = tokenize_convo(item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, completion, add_bos=add_bos)
         
         if empty:
             continue
@@ -154,7 +171,8 @@ def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_
                 break
             if end > context_len:
                 end = context_len
-                cropped_end = True
+                if not completion:
+                    cropped_end = True
             corrected_content_ranges.append((start, end))
 
         conversation = ConvoTokenized(conversation_tokenized, corrected_content_ranges, num_pad_tokens, cropped_end, convo_id)

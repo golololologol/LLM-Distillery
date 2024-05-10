@@ -14,10 +14,9 @@ if not torch.cuda.is_initialized():
 import math
 import json
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 import gc
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 def _batch_creator_worker(inference_queue, batch_size, dataset_chunk: list[ConvoTokenized]):
     def _prepare_batch_for_inference(convo_id, batch_size, dataset_chunk: list[ConvoTokenized]) -> tuple[ndarray, list[Distribution], int]:
@@ -124,7 +123,9 @@ def _inference_worker(inference_queue, result_queue, made_distributions, done_ch
 
         batch_tensor = torch.tensor(batch_tokenized_np, dtype=torch.long).to(device, non_blocking=True)
         tokenized_batches.append((batch_tensor, batch_distributions))
-        
+    
+    torch.cuda.empty_cache()
+
     model, cache = _load_model(reserve_vram)
 
     pbar_queue.put(("str", f"Generating..."))

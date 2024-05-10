@@ -16,6 +16,7 @@ class H5DataManager:
         self.result_queue = multiprocessing.Queue(max_queue_size)
         self.max_queue_size = max_queue_size
         self.done_everything = multiprocessing.Event()
+        self.done_everything.set()
         self.got_task = multiprocessing.Event()
         self.loading_process = get_context("spawn").Process(target=self._process_thread)
         self.shared_batches = []
@@ -107,17 +108,17 @@ class H5DataManager:
         dataset_name = f'convo_{convo_id}'
         if dataset_name in hdf_file:
             del hdf_file[dataset_name]
-        hdf_file.create_dataset(dataset_name, data=data, dtype=np.float32)
+        hdf_file.create_dataset(dataset_name, data=data, dtype=np.float16)
 
         if indices is not None:
             indices_name = f'indices_{convo_id}'
             if indices_name in hdf_file:
                 del hdf_file[indices_name]
-            hdf_file.create_dataset(indices_name, data=indices)
+            hdf_file.create_dataset(indices_name, data=indices, dtype=np.int32)
     
     def _load_id(self, hdf_file, convo_id: int) -> np.ndarray:
         data = np.array(hdf_file[f'convo_{convo_id}'], dtype=np.float32) if f'convo_{convo_id}' in hdf_file else None
-        indices = np.array(hdf_file[f'indices_{convo_id}']) if f'indices_{convo_id}' in hdf_file else None
+        indices = np.array(hdf_file[f'indices_{convo_id}'], dtype=np.int64) if f'indices_{convo_id}' in hdf_file else None
         if data is None:
             raise ValueError(f"Convo ID {convo_id} not found in dataset.")
         return data, indices
@@ -167,6 +168,7 @@ class H5DataManager:
         self.got_task.set()
 
     def get_dataset_ids(self) -> list[int]:
+        self.done_everything.wait()
         self.queue.put(('get_available_ids', None))
         self.got_task.set()
         return self.result_queue.get()

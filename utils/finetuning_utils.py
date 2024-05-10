@@ -44,30 +44,52 @@ def launch_tensorboard(log_dir):
     return tensorboard
 
 
-def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices, custom=False):
+def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_content_tokens, custom=False):
     # assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
     min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
+    zero = torch.tensor([0], dtype=torch.float32).to(student_logits.device, non_blocking=True)
+    sum_inv = torch.tensor(0.0, dtype=torch.float32).to(student_logits.device, non_blocking=True)
+    student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
+    teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
+
+    cross_entropy_loss_raw = F.cross_entropy(student_logits[:min_len - 1], convo_content_tokens[1:min_len], reduction='none')
+
+    # add zeros to beginning and end of cross entropy loss to match the length of the logits
+    cross_entropy_loss = torch.cat((cross_entropy_loss_raw, zero), dim=0)
+
     if indices is None:
-        student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
-        teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
-    
-        reduction = 'none' if custom else 'batchmean'
-        div = F.kl_div(student_logprobs, teacher_logprobs, reduction=reduction, log_target=True)
+        kl_div = F.kl_div(student_logprobs, teacher_logprobs, reduction='none', log_target=True)
         if custom:
-            div = ((div.exp() - 1).sum(dim=-1) + 1).mean().log()
+            kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).log()
+        else:
+            kl_div = kl_div.mean(dim=-1)
         
     else:
-        student_logprobs = torch.gather(F.log_softmax(student_logits[:min_len], dim=-1), dim=-1, index=indices[:min_len])
-        teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
+        student_gathered = torch.gather(student_logprobs, dim=-1, index=indices[:min_len])
         
-        sum = student_logprobs.exp().sum(dim=-1).mean()
+        sum_inv = (1 - student_gathered.exp().sum(dim=-1).mean())
 
-        reduction = 'none' if custom else 'batchmean'
-        div = F.kl_div(student_logprobs, teacher_logprobs, reduction=reduction, log_target=True)
+        kl_div = F.kl_div(student_gathered, teacher_logprobs, reduction='none', log_target=True)
         if custom:
-            div = ((div.exp() - 1).sum(dim=-1) + 1).mean().log() / 1.5
+            kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).log()
+        else:
+            kl_div = kl_div.mean(dim=-1)
+    
+    cross_entr_divis = 1
+    kl_div_divis = 1
+    sum_divis = 1
+    total_divis = 3
+    topL = 0.2
 
-    return div + (1 - sum)
+    combined_loss = (cross_entropy_loss/cross_entr_divis + kl_div/kl_div_divis + sum_inv/sum_divis) / total_divis
+
+    max = torch.max(combined_loss)
+    topL_floor = max * topL
+
+    # pick top 20% of the losses compared to the max
+    combined_topL_loss = combined_loss[combined_loss >= topL_floor].mean()
+
+    return combined_topL_loss, combined_loss.mean(), cross_entropy_loss_raw.mean(), kl_div.mean(), sum_inv
 
 
 def scale_temperature(current_step, num_training_steps, temperature):

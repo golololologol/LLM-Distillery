@@ -1,6 +1,5 @@
-from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_divergence, launch_tensorboard
+from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_divergence
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from torch.utils.tensorboard.writer import SummaryWriter
 from classes.data_classes import ConvoTokenized
 from classes.data_manager import H5DataManager
 from multiprocessing import shared_memory
@@ -10,10 +9,12 @@ from typing import Optional
 from tqdm import tqdm
 import numpy as np
 import torch
+import wandb
 import math
 import time
 import os
 
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 
 class StudentModel(BaseModel):
     def __init__(self, model_path: str, paths: Paths, add_bos: bool, prompt_format: dict, batch_size: int):
@@ -182,8 +183,7 @@ class StudentModel(BaseModel):
 
         if self.logger is None:
             comment = f"{self.model_name}_lr_{self.lr}_{time.strftime('%d-%m-%Y_%H-%M-%S')}"
-            self.logger = SummaryWriter(log_dir=os.path.join(self.paths.logging, comment))
-            self.tensorboard = launch_tensorboard(self.paths.logging)
+            self.logger = wandb.init(project="student_training", name=comment, config=self.__dict__, group=self.model_name, reinit=True)
 
         if self.grad_accum_steps < self.batch_size:
             print("Warning: Grad accum steps < batch size. Setting accumulation steps = batch size.")
@@ -203,7 +203,8 @@ class StudentModel(BaseModel):
             self._load_optimizer()
             self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_training_steps, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
 
-        self._validate(validation_data_manager)
+        if self.num_trained_steps == 0:
+            self._validate(validation_data_manager)
 
         if full_collect:
             data_manager_left_shuffles = self.num_epochs - 1
@@ -249,9 +250,7 @@ class StudentModel(BaseModel):
 
     def close(self):
         if self.logger is not None:
-            self.logger.close()
-        if self.tensorboard is not None:
-            self.tensorboard.terminate()
+            self.logger.finish()
 
     # main training loop
     def _run_training_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager):
@@ -268,7 +267,11 @@ class StudentModel(BaseModel):
             batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
             batch_tokenized_tensor = torch.from_numpy(batch_tokenized).to(self.device, non_blocking=True)
 
+            batch_loss = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_combined_loss = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_sum_inv = torch.tensor(0.0).to(device, non_blocking=True)
 
             batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
 
@@ -281,16 +284,27 @@ class StudentModel(BaseModel):
 
                 convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
                 convo_teacher_logits = teacher_batch_raw[i]
-                kl_div = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, custom=self.custom_reduction)
+                convo_content_tokens = torch.index_select(batch_tokenized_tensor[i], 0, content_indices)
+                combined_topL_loss, combined_loss, cross_entropy_loss, kl_div, sum_inv = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, custom=self.custom_reduction)
+
+                batch_loss += combined_topL_loss
+                batch_combined_loss += combined_loss
+                batch_cross_entropy_loss += cross_entropy_loss
                 batch_kl_div += kl_div
+                batch_sum_inv += sum_inv
 
                 self.lr_scheduler.step()
             
-            batch_kl_div /= num_steps
-            self.logger.add_scalar("LR", self.lr_scheduler.get_last_lr()[0], self.num_trained_steps)
-            self.logger.add_scalar("Loss/train", batch_kl_div, self.num_trained_steps)
+            batch_loss /= num_steps
+            self.logger.log({"Loss/combined TopL": batch_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+            self.logger.log({"Loss/combined": batch_combined_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+            self.logger.log({"Loss/cross entropy": batch_cross_entropy_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+            self.logger.log({"Loss/KL divergence": batch_kl_div.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+            self.logger.log({"Loss/sum inv": batch_sum_inv.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+
+            self.logger.log({"Learning rate": self.lr_scheduler.get_last_lr()[0]}, step=self.num_trained_steps)
             self.progress_bar.update(num_steps)
-            batch_kl_div.backward()
+            batch_loss.backward()
 
             self.num_trained_steps += num_steps
 
@@ -317,7 +331,12 @@ class StudentModel(BaseModel):
         pbar = tqdm(total=self.validation_dataset_len, desc="Validating", leave=False, smoothing=0.06)
 
         with torch.no_grad():
-            total_val_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_loss = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_combined_loss = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_sum_inv = torch.tensor(0.0).to(device, non_blocking=True)
+
             for val_convo_batch in self.validation_dataset_batched:
                 sdh_mem_name, batch_shape, batch_dtype, val_batch_indices, batch_padding = validation_data_manager.read_next_batch()
                 shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
@@ -335,13 +354,24 @@ class StudentModel(BaseModel):
 
                     val_convo_content_logits = torch.index_select(val_batch_logits[i], 0, val_content_indices) / self.temperature
                     val_convo_teacher_logits = teacher_batch_raw[i]
+                    val_convo_content_tokens = torch.index_select(val_batch_tokenized_tensor[i], 0, val_content_indices)
 
-                    val_kl_div = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits[:batch_padding[i]], val_indices, custom=self.custom_reduction)
-                    total_val_kl_div += val_kl_div
+                    combined_topL_loss, combined_loss, cross_entropy_loss, kl_div, sum_inv = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits[:batch_padding[i]], val_indices, val_convo_content_tokens, custom=self.custom_reduction)
+                    
+                    batch_loss += combined_topL_loss
+                    batch_combined_loss += combined_loss
+                    batch_cross_entropy_loss += cross_entropy_loss
+                    batch_kl_div += kl_div
+                    batch_sum_inv += sum_inv
 
                 pbar.update(len(val_convo_batch))
 
-        self.logger.add_scalar("Loss/val", total_val_kl_div, self.num_trained_steps)
+        self.logger.log({"Val Loss/combined TopL": batch_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/combined": batch_combined_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/cross entropy": batch_cross_entropy_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/KL divergence": batch_kl_div.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/sum inv": batch_sum_inv.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+
         pbar.close()
         self.model.train()
         self.next_val_step += self.validation_per_steps

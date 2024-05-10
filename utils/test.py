@@ -304,15 +304,11 @@ def input_prompt_format():
 # see how many elements are in the second dimension
 #print(b.size(0))
 
-def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, custom=False):
+def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, custom=True):
     # assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
-    diff = 1 - torch.sum(F.softmax(student_logits, dim=-1), dim=-1)
-    student_logprobs = F.log_softmax(torch.cat((student_logits[:teacher_logits.size(0)], diff.unsqueeze(-1)), dim=-1), dim=-1)
-
-    teacher_logprobs = F.log_softmax(F.pad(teacher_logits[:student_logits.size(0)], (0, 1), value=0), dim=-1)
 
     reduction = 'none' if custom else 'batchmean'
-    kl_div = F.kl_div(student_logprobs, teacher_logprobs, reduction=reduction, log_target=True)
+    kl_div = F.kl_div(student_logits, teacher_logits, reduction=reduction, log_target=True)
     if custom:
         kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).mean().log()
 
@@ -325,7 +321,31 @@ def truncated_kldiv(student_probs, teacher_probs):
 
     return div
 
-tensor1 = torch.tensor(([0.7, 0.2], [0.2, 0.8]), dtype=torch.float32)
-tensor2 = torch.tensor(([0.8, 0.4], [.8, .1]), dtype=torch.float32)
-print(torch.tensor(([0.0001])).log())
-print(truncated_kldiv(tensor1, tensor2))
+#tensor1 = torch.tensor(([0.01, 0.99], [0.99, 0.01]), dtype=torch.float32).log()
+
+#log_soft_1 = F.log_softmax(tensor1, dim=-1)
+
+#indices = torch.tensor(([1, 0]))
+
+#list = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+#print(list[1:-1])
+#print(F.cross_entropy(log_soft_1, indices, reduction='none'))
+
+
+
+teacher_tensor = torch.tensor(([0.01, 0.99], [0.99, 0.01]), dtype=torch.float32).log()
+student_tensor = torch.tensor(([0.01, 0.49, 0.5], [0.5, 0.49, 0.01]), dtype=torch.float32).log()
+indices = torch.tensor(([0, 1], [1, 2]))
+
+print(f"Student's full distribution: {student_tensor.exp()}")
+gathered_student = torch.gather(student_tensor, dim=-1, index=indices)
+print(f"\nStudent gathered: {gathered_student.exp()}")
+print(f"\nTeacher: {teacher_tensor.exp()}")
+
+print("\nTo calculate correct KL divergence, both distribution's probabilities must sum to 1, so we must do softmax,\n thus losing the confidence of the student's predictions in the gathered distribution.")
+teacher_logprobs = F.log_softmax(teacher_tensor, dim=-1)
+student_logprobs = F.log_softmax(gathered_student, dim=-1)
+print(f"\nStudent's gathered probs after softmax: {student_logprobs.exp()}")
+print(f"\nTeacher's logprobs: {teacher_logprobs.exp()}")
+
+print(f"\nKL divergence: {calculate_divergence(student_logprobs, teacher_logprobs, custom=True)}")

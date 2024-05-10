@@ -1,4 +1,3 @@
-from classes.base_model import is_model_safetensors
 from utils.dataset_utils import tokenize_dataset
 from classes.teacher_model import TeacherModel
 from classes.student_model import StudentModel
@@ -10,7 +9,7 @@ import os
 
     
 def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb, enable_topK, save_topK):
-    kb_per_distr_val = 0.001953125 # storage of one FP16 value
+    kb_per_distr_val = 0.001953125 * 3 # storage of one FP16 value
     if enable_topK:
         distr_size_kb = kb_per_distr_val * save_topK
     else:
@@ -74,15 +73,15 @@ def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel):
             raise ValueError(f"Student has {key} = {getattr(student, key)} while the teachers have {key} = {value}")
         
 
-def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[TeacherModel], student: StudentModel, context_len, save_sys_range, save_user_range, save_assistant_range):
+def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[TeacherModel], student: StudentModel, context_len, save_sys_range, save_user_range, save_assistant_range, completion):
     print("Preparing datasets for the student...")
     student.dataset, relevant_ids = tokenize_dataset(
         dataset_path, student.model_path, student.prompt_format, context_len,
-        save_sys_range, save_user_range, save_assistant_range, add_bos=student.add_bos)
+        save_sys_range, save_user_range, save_assistant_range, add_bos=student.add_bos, completion=completion)
 
     student.validation_dataset, relevant_ids_val = tokenize_dataset(
         validation_dataset_path, student.model_path, student.prompt_format, context_len,
-        save_sys_range, save_user_range, save_assistant_range, add_bos=student.add_bos)
+        save_sys_range, save_user_range, save_assistant_range, add_bos=student.add_bos, completion=False)
 
     teachers_ids = set()
     teachers_ids_val = set()
@@ -91,11 +90,11 @@ def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[Teach
         print(f"Preparing datasets for {teacher.model_name}...")
         teacher.dataset, teacher_ids = tokenize_dataset(
             dataset_path, teacher.model_path, teacher.prompt_format, context_len,
-            save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos)
+            save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos, completion=completion)
 
         teacher.validation_dataset, teacher_ids_val = tokenize_dataset(
             validation_dataset_path, teacher.model_path,teacher.prompt_format,context_len,
-            save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos)
+            save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos, completion=False)
         
         teachers_ids.update(teacher_ids)
         teachers_ids_val.update(teacher_ids_val)
@@ -104,9 +103,16 @@ def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[Teach
     common_ids_val = relevant_ids_val.intersection(teachers_ids_val)
 
     student.dataset = [convo for convo in student.dataset if convo.origin_convo_id in common_ids]
+    total_tokens = sum([convo.length for convo in student.dataset])
+    total_content_tokens = sum([convo.len_content for convo in student.dataset])
     student.dataset_len = len(student.dataset)
+    print(f"Total tokens in dataset: {total_tokens}, total content tokens: {total_content_tokens}")
+
     student.validation_dataset = [convo for convo in student.validation_dataset if convo.origin_convo_id in common_ids_val]
+    total_tokens_val = sum([convo.length for convo in student.validation_dataset])
+    total_content_tokens_val = sum([convo.len_content for convo in student.validation_dataset])
     student.validation_dataset_len = len(student.validation_dataset)
+    print(f"Total tokens in validation dataset: {total_tokens_val}, total content tokens: {total_content_tokens_val}")
 
     for teacher in teachers:
         teacher.dataset = [convo for convo in teacher.dataset if convo.origin_convo_id in common_ids]
@@ -115,7 +121,7 @@ def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[Teach
         teacher.validation_dataset_len = len(teacher.validation_dataset)
     
 
-def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str, save_topK: int, enable_topK: bool):
+def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str, save_topK: int, enable_topK: bool, encourage_eos: bool):
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
@@ -124,6 +130,7 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
         teacher.device = device
         teacher.topK = save_topK
         teacher.enable_topK = enable_topK
+        teacher.encourage_eos = encourage_eos
 
     student.crop_to_size = crop_to_size
     student.context_len = context_len
@@ -166,32 +173,36 @@ def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, in
 
 
 def main():
-    cache_folder = r"/root/axo_clone/Distill_Latest_Clone/t_cache"
-    max_cache_size_gb = 410
+    cache_folder = r"/workspace/distil_cache"
+    max_cache_size_gb = 220
 
-    validation_dataset_path = r"/root/axo_clone/Distill_Latest_Clone/datasets/instruct_set1/val_test.jsonl"
-    dataset_path = r"/root/axo_clone/Distill_Latest_Clone/datasets/instruct_set1/train_test_small.jsonl"
+    # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
+    dataset_path = r"/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
+    validation_dataset_path = r"/root/axo_clone/Distill_Latest_Clone/val_test.jsonl"
 
-    teacher_models_folder = r"/workspace/models_nonHF/llama3_8b_hf_copy"
+    teacher_models_folder = r"/root/models_nonHF"
     student_path = r"/workspace/models_nonHF/llama3_8b_hf_copy"
 
+    completion = False
+    clean_start = False
+
     # General model settings
-    context_len = 8192
+    context_len = 8*1024
     save_sys_range = True
     save_user_range = True
     save_assistant_range = True
-    crop_distr_to_size = 128256
+    crop_distr_to_size = 999999
     enable_topK = True
     save_topK = 200
     device = "cuda:0"
-    reserve_vram = [5, 0.5, 0.5, 0.5] # GB
+    reserve_vram = [10, 10, 5, 1] # GB
 
     # Training settings
-    batch_size = 4
+    batch_size = 2
     num_epochs = 2
-    num_warmup_steps = 200
+    num_warmup_steps = 0
     temperature = 1
-    lr = 2e-6
+    lr = 2e-5
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop32bit"
     data_order = "shuffle" # "shuffle", "native", "sorted"
@@ -199,31 +210,32 @@ def main():
     training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     multi_gpu = True
     decay_start = 0.9 # wsd only
-    validate_every_n_epochs = 1
-    save_student_every_n_epochs = 1
-    custom_reduction = True
+    validate_every_n_epochs = 0.1
+    save_student_every_n_epochs = 0.5
+    custom_reduction = False
+    encourage_eos = False
 
     # Student settings
     add_bos = True
     prompt_format = {
-        "SYS_START": "SYS: ",
-        "USER_START": "USER: ",
-        "ASSISTANT_START": "ASSISTANT: ",
-        "SYS_END": "\n",
-        "USER_END": "\n",
-        "ASSISTANT_END": "\n",
+        "SYS_START": "### System:\n",
+        "USER_START": "### User:\n",
+        "ASSISTANT_START": "### AI:\n",
+        "SYS_END": "\n\n",
+        "USER_END": "\n\n",
+        "ASSISTANT_END": "\n\n",
     }
 
 
     # Initialization
     multiprocessing.set_start_method('spawn', force=True)
-    paths = Paths(cache_folder, clean_start=True)
+    paths = Paths(cache_folder, clean_start=clean_start)
     teachers = get_teachers(teacher_models_folder)
     student = StudentModel(student_path, paths, add_bos, prompt_format, batch_size)
     ensure_compatibility(teachers, student)
-    prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range)
+    prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range, completion)
 
-    set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK)
+    set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start,
                          multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs)
 
@@ -234,15 +246,18 @@ def main():
     # Main loop
     
     ## Validation collecting loop
-    print("Processing validation data...")
+    #print("Processing validation data...")
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
 
-    for teacher in teachers:
-        teacher.process_chunk(reserve_vram, full_collect=True, data_manager=validation_data_manager, validation=True)
+    #for teacher in teachers:
+        #teacher.process_chunk(reserve_vram, full_collect=True, data_manager=validation_data_manager, validation=True)
 
+    
     ## Training collecting loop
     print("Processing all data..." if full_collect else "Processing data in chunks...")
     data_manager = H5DataManager(paths.dataset, device)
+
+    student.train_chunk(data_manager, validation_data_manager, full_collect)
 
     if full_collect:
         for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):
