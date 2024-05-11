@@ -255,7 +255,6 @@ class StudentModel(BaseModel):
     # main training loop
     def _run_training_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager):
         for batch_convos in batched_chunk_convos:
-            state_updated = False
             num_steps = len(batch_convos)
             device = self.distr_device if self.distr_device else self.device
 
@@ -271,6 +270,7 @@ class StudentModel(BaseModel):
             batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
             batch_sum_inv = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_certainty_loss = torch.tensor(0.0).to(device, non_blocking=True)
 
             batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
 
@@ -284,22 +284,27 @@ class StudentModel(BaseModel):
                 convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
                 convo_teacher_logits = teacher_batch_raw[i]
                 convo_content_tokens = torch.index_select(batch_tokenized_tensor[i], 0, content_indices)
-                combined_loss, cross_entropy_loss, kl_div, sum_inv = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, custom=self.custom_reduction)
+                combined_loss, cross_entropy_loss, kl_div, sum_inv, certainty_loss = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, custom=self.custom_reduction)
 
-                batch_combined_loss += combined_loss / num_steps
-                batch_cross_entropy_loss += cross_entropy_loss / num_steps
-                batch_kl_div += kl_div / num_steps
-                batch_sum_inv += sum_inv / num_steps
+                batch_combined_loss += combined_loss / self.grad_accum_steps
+                batch_cross_entropy_loss += cross_entropy_loss / self.grad_accum_steps
+                batch_kl_div += kl_div / self.grad_accum_steps
+                batch_sum_inv += sum_inv / self.grad_accum_steps
+                batch_certainty_loss += certainty_loss / self.grad_accum_steps
 
                 self.lr_scheduler.step()
             
-            self.logger.log({"Loss/combined (kl_div + inv_sum)": batch_combined_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
-            self.logger.log({"Loss/cross entropy": batch_cross_entropy_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
-            self.logger.log({"Loss/KL divergence": batch_kl_div.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
-            self.logger.log({"Loss/sum inv": batch_sum_inv.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+            multiplier = self.grad_accum_steps / self.batch_size
+
+            self.logger.log({"Loss/combined (kl_div + certainty_loss)": batch_combined_loss * multiplier}, step=self.num_trained_steps)
+            self.logger.log({"Loss/cross entropy": batch_cross_entropy_loss * multiplier}, step=self.num_trained_steps)
+            self.logger.log({"Loss/KL divergence": batch_kl_div * multiplier}, step=self.num_trained_steps)
+            self.logger.log({"Loss/sum inv": batch_sum_inv * multiplier}, step=self.num_trained_steps)
+            self.logger.log({"Loss/certainty loss": batch_certainty_loss * multiplier}, step=self.num_trained_steps)
 
             self.logger.log({"Learning rate": self.lr_scheduler.get_last_lr()[0]}, step=self.num_trained_steps)
             self.progress_bar.update(num_steps)
+
             batch_combined_loss.backward()
 
             self.num_trained_steps += num_steps
@@ -317,10 +322,6 @@ class StudentModel(BaseModel):
             if self.num_trained_steps >= self.next_val_step:
                 self._validate(validation_data_manager)
 
-        if not state_updated:
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-
     def _validate(self, validation_data_manager: H5DataManager):
         self.model.eval()
         device = self.distr_device if self.distr_device else self.device
@@ -331,6 +332,7 @@ class StudentModel(BaseModel):
             batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
             batch_sum_inv = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_certainty_loss = torch.tensor(0.0).to(device, non_blocking=True)
 
             for val_convo_batch in self.validation_dataset_batched:
                 sdh_mem_name, batch_shape, batch_dtype, val_batch_indices, batch_padding = validation_data_manager.read_next_batch()
@@ -351,24 +353,22 @@ class StudentModel(BaseModel):
                     val_convo_teacher_logits = teacher_batch_raw[i]
                     val_convo_content_tokens = torch.index_select(val_batch_tokenized_tensor[i], 0, val_content_indices)
 
-                    combined_loss, cross_entropy_loss, kl_div, sum_inv = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits[:batch_padding[i]], val_indices, val_convo_content_tokens, custom=self.custom_reduction)
+                    combined_loss, cross_entropy_loss, kl_div, sum_inv, certainty_loss = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits[:batch_padding[i]], val_indices, val_convo_content_tokens, custom=self.custom_reduction)
                     
                     batch_combined_loss += combined_loss
                     batch_cross_entropy_loss += cross_entropy_loss
                     batch_kl_div += kl_div
                     batch_sum_inv += sum_inv
+                    batch_certainty_loss += certainty_loss
 
                 pbar.update(len(val_convo_batch))
 
-        batch_combined_loss /= self.validation_dataset_len
-        batch_cross_entropy_loss /= self.validation_dataset_len
-        batch_kl_div /= self.validation_dataset_len
-        batch_sum_inv /= self.validation_dataset_len
-
-        self.logger.log({"Val Loss/combined": batch_combined_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/cross entropy": batch_cross_entropy_loss.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/KL divergence": batch_kl_div.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/inverse sum": batch_sum_inv.to("cpu", non_blocking=True).item()}, step=self.num_trained_steps)
+        divisor = len(self.validation_dataset)
+        self.logger.log({"Val Loss/combined": batch_combined_loss/divisor}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/cross entropy": batch_cross_entropy_loss/divisor}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/KL divergence": batch_kl_div/divisor}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/inverse sum": batch_sum_inv/divisor}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/certainty loss": batch_certainty_loss/divisor}, step=self.num_trained_steps)
 
         pbar.close()
         self.model.train()

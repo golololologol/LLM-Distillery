@@ -371,19 +371,3 @@ class TeacherModel(BaseModel):
         batch_creator.join()
         inference_worker.join()
         result_processor.terminate()
-    
-    def write_dataset_to_file(self, folder: str):
-        tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        for convo in self.dataset[:4]:
-            convo_dict = {
-                "tokenized": convo.tokenized.tolist(),
-                "decoded": [tokenizer.decode(convo.tokenized)],
-                "content_ranges": convo.content_ranges,
-                "content_decoded": [tokenizer.decode(convo.tokenized[start:end]) for start, end in convo.content_ranges],
-                "padding": convo.padding,
-                "cropped_end": convo.cropped_end,
-                "origin_convo_id": convo.origin_convo_id
-            }
-            convo_path = os.path.join(folder, f"{convo.origin_convo_id}.json")
-            with open(convo_path, 'w', encoding='utf-8') as file:
-                json.dump(convo_dict, file, ensure_ascii=False, indent=4)

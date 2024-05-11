@@ -5,6 +5,7 @@ from classes.data_manager import H5DataManager
 from classes.paths import Paths
 from tqdm import tqdm
 import multiprocessing
+import json
 import os
 
     
@@ -73,15 +74,13 @@ def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel):
             raise ValueError(f"Student has {key} = {getattr(student, key)} while the teachers have {key} = {value}")
         
 
-def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[TeacherModel], student: StudentModel, context_len, save_sys_range, save_user_range, save_assistant_range, completion):
+def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[TeacherModel], student: StudentModel, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type):
     print("Preparing datasets for the student...")
     student.dataset, relevant_ids = tokenize_dataset(
-        dataset_path, student.model_path, student.prompt_format, context_len,
-        save_sys_range, save_user_range, save_assistant_range, add_bos=student.add_bos, completion=completion)
+        dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type)
 
     student.validation_dataset, relevant_ids_val = tokenize_dataset(
-        validation_dataset_path, student.model_path, student.prompt_format, context_len,
-        save_sys_range, save_user_range, save_assistant_range, add_bos=student.add_bos, completion=False)
+        validation_dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type)
 
     teachers_ids = set()
     teachers_ids_val = set()
@@ -89,12 +88,10 @@ def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[Teach
     for teacher in teachers:
         print(f"Preparing datasets for {teacher.model_name}...")
         teacher.dataset, teacher_ids = tokenize_dataset(
-            dataset_path, teacher.model_path, teacher.prompt_format, context_len,
-            save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos, completion=completion)
+            dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, teacher, ignore_model_type)
 
         teacher.validation_dataset, teacher_ids_val = tokenize_dataset(
-            validation_dataset_path, teacher.model_path,teacher.prompt_format,context_len,
-            save_sys_range, save_user_range, save_assistant_range, add_bos=teacher.add_bos, completion=False)
+            validation_dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, teacher, ignore_model_type)
         
         teachers_ids.update(teacher_ids)
         teachers_ids_val.update(teacher_ids_val)
@@ -106,13 +103,13 @@ def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[Teach
     total_tokens = sum([convo.length for convo in student.dataset])
     total_content_tokens = sum([convo.len_content for convo in student.dataset])
     student.dataset_len = len(student.dataset)
-    print(f"Total tokens in dataset: {total_tokens}, total content tokens: {total_content_tokens}")
+    print(f"Total tokens in dataset: {total_tokens}; Content tokens: {total_content_tokens}")
 
     student.validation_dataset = [convo for convo in student.validation_dataset if convo.origin_convo_id in common_ids_val]
     total_tokens_val = sum([convo.length for convo in student.validation_dataset])
     total_content_tokens_val = sum([convo.len_content for convo in student.validation_dataset])
     student.validation_dataset_len = len(student.validation_dataset)
-    print(f"Total tokens in validation dataset: {total_tokens_val}, total content tokens: {total_content_tokens_val}")
+    print(f"Total tokens in validation dataset: {total_tokens_val}; Content tokens: {total_content_tokens_val}")
 
     for teacher in teachers:
         teacher.dataset = [convo for convo in teacher.dataset if convo.origin_convo_id in common_ids]
@@ -172,23 +169,112 @@ def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, in
             teacher.sort_dataset_by_map(validation_sorting_map, validation=True)
 
 
+def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: Paths):
+
+    def check_sha(path, current_sha):
+        if not os.path.exists(path):
+            print(f"File not found: {path}")
+            return False
+
+        disk_sha = {}
+        with open(path, "r") as f:
+            for line in f:
+                json_line = json.loads(line)
+                disk_sha.update(json_line)
+
+        for id, sha in current_sha.items():
+            if id not in disk_sha:
+                print(f"ID {id} not found in disk sha")
+                return False
+            if disk_sha[id] != sha:
+                print(f"ID {id} sha mismatch: {disk_sha[id]} vs {sha}")
+                return False
+
+        return True
+    
+    def check_teacher_names(path, teacher_names):
+        disk_teacher_names = []
+
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                disk_teacher_names = json.load(f)
+        else:
+            return False
+
+        if disk_teacher_names != teacher_names:
+            return False
+        
+        return True
+    
+    collect = True
+    collect_val = True
+    teacher_names = [teacher.model_name for teacher in teachers]
+    current_sha = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.dataset}
+    distr_path = os.path.join(paths.dataset, "distributions.hdf5")
+    distr_path_val = os.path.join(paths.dataset_validation, "distributions.hdf5")
+    names_path = os.path.join(paths.dataset, "teacher_names.json")
+    names_path_val = os.path.join(paths.dataset_validation, "teacher_names.json")
+    sha_path = os.path.join(paths.dataset, "sha.jsonl")
+    sha_path_val = os.path.join(paths.dataset_validation, "sha.jsonl")
+
+    if os.path.exists(distr_path) and os.path.exists(names_path) and os.path.exists(sha_path):
+        matching_sha = False
+
+        matching_names = check_teacher_names(names_path, teacher_names)
+        if matching_names:
+            matching_sha = check_sha(sha_path, current_sha)
+
+        collect = not (matching_sha and matching_names)
+
+    if os.path.exists(distr_path_val) and os.path.exists(names_path_val) and os.path.exists(sha_path_val):
+        matching_sha_val = False
+
+        matching_names_val = check_teacher_names(names_path_val, teacher_names)
+
+        if matching_names_val:
+            matching_sha_val = check_sha(sha_path_val, current_sha)
+
+        collect_val = not (matching_sha_val and matching_names_val)
+
+    return collect, collect_val
+
+
+def save_dataset_metadata(path, teachers: list[TeacherModel], student: StudentModel, validation=False):
+    if os.path.exists(os.path.join(path, "sha.jsonl")):
+        os.remove(os.path.join(path, "sha.jsonl"))
+
+    if os.path.exists(os.path.join(path, "teacher_names.json")):
+        os.remove(os.path.join(path, "teacher_names.json"))
+
+    with open(os.path.join(path, "sha.jsonl"), "w", encoding="utf-8") as f:
+
+        if validation:
+            for convo in student.validation_dataset:
+                f.write(json.dumps({convo.origin_convo_id: convo.content_sha}, ensure_ascii=False) + "\n")
+        else:
+            for convo in student.dataset:
+                f.write(json.dumps({convo.origin_convo_id: convo.content_sha}, ensure_ascii=False) + "\n")
+            
+    with open(os.path.join(path, "teacher_names.json"), "w", encoding="utf-8") as f:
+        json.dump([teacher.model_name for teacher in teachers], f, indent=4, ensure_ascii=False)
+
+
 def main():
-    cache_folder = r"/workspace/distil_cache"
+    cache_folder = r"C:\Users\PC\Desktop\cache"
     max_cache_size_gb = 300
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
-    dataset_path = r"/root/axo_clone/axolotl/data/random_samples_50k.jsonl"
-    validation_dataset_path = r"/root/axo_clone/Distill_Latest_Clone/val_test.jsonl"
+    dataset_path = r"C:\Users\PC\Converted_random_samples_4k.jsonl"
+    validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
-    teacher_models_folder = r"/root/models_nonHF"
-    student_path = r"/workspace/models_nonHF/llama3_8b_hf_copy"
+    teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
+    student_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
 
-    completion = True
-    clean_start = True
+    ignore_model_type = True # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
 
     # General model settings
-    context_len = 8*1024
+    context_len = 2*1024
     save_sys_range = True
     save_user_range = True
     save_assistant_range = True
@@ -199,20 +285,20 @@ def main():
     reserve_vram = [5, 0.5] # GB
 
     # Training settings
-    batch_size = 2
-    num_epochs = 1
+    batch_size = 4
+    num_epochs = 4
     num_warmup_steps = 50
     temperature = 1
-    lr = 2e-6
+    lr = 3e-6
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop32bit"
     data_order = "shuffle" # "shuffle", "native", "sorted"
-    grad_accum_steps = 2
+    grad_accum_steps = 8
     training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     multi_gpu = True
     decay_start = 0.9 # wsd only
-    validate_every_n_epochs = 0.05
-    save_student_every_n_epochs = 0.5
+    validate_every_n_epochs = 0.5
+    save_student_every_n_epochs = 1
     custom_reduction = True
     encourage_eos = False
 
@@ -230,11 +316,12 @@ def main():
 
     # Initialization
     multiprocessing.set_start_method('spawn', force=True)
-    paths = Paths(cache_folder, clean_start=clean_start)
+    paths = Paths(cache_folder)
     teachers = get_teachers(teacher_models_folder)
     student = StudentModel(student_path, paths, add_bos, prompt_format, batch_size)
+
     ensure_compatibility(teachers, student)
-    prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range, completion)
+    prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type)
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start,
@@ -245,38 +332,53 @@ def main():
 
     loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb, enable_topK, save_topK)
 
-    # Main loop
-    
-    ## Validation collecting loop
-    print("Processing validation data...")
-    validation_data_manager = H5DataManager(paths.dataset_validation, device)
+    collect, collect_val = collect_or_load(student, teachers, paths)
 
-    for teacher in teachers:
-        teacher.process_chunk(reserve_vram, full_collect=True, data_manager=validation_data_manager, validation=True)
+    # Main loop
+
+    ## Validation collecting loop
     
-    ## Training collecting loop
-    print("Processing all data..." if full_collect else "Processing data in chunks...")
+    validation_data_manager = H5DataManager(paths.dataset_validation, device)
     data_manager = H5DataManager(paths.dataset, device)
 
-    if full_collect:
-        for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):
-            teacher.process_chunk(reserve_vram, full_collect=True, data_manager=data_manager)
-        
-        student.train_chunk(data_manager, validation_data_manager, full_collect)
+    if collect_val:
+        print("Collecting validation data...")
+        for teacher in teachers:
+            teacher.process_chunk(reserve_vram, full_collect=True, data_manager=validation_data_manager, validation=True)
+
+        save_dataset_metadata(paths.dataset_validation, teachers, student)
 
     else:
-        for epoch in tqdm(range(num_epochs), desc="Epochs", smoothing=0.06, position=0):
+        print("Using data on disk for validation...")
+    
+    ## Training collecting loop
+    if collect:
+        print("Collecting all data..." if full_collect else "Collecting data in chunks...")
 
-            for stop in tqdm(loop_stops, desc="Chunks", smoothing=0.06, position=1, leave=False):
-                data_manager.purge_dataset()
+        if full_collect:
+            for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):
+                teacher.process_chunk(reserve_vram, full_collect=True, data_manager=data_manager)
 
-                for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=2, leave=False):
-                    teacher.process_chunk(reserve_vram, next_stop_id=stop, data_manager=data_manager)
+            save_dataset_metadata(paths.dataset, teachers, student)
 
-                student.train_chunk(data_manager, validation_data_manager, full_collect)
-            
-            for teacher in teachers:
-                teacher.new_epoch()
+            student.train_chunk(data_manager, validation_data_manager, full_collect)
+
+        else:
+            for epoch in tqdm(range(num_epochs), desc="Epochs", smoothing=0.06, position=0):
+
+                for stop in tqdm(loop_stops, desc="Chunks", smoothing=0.06, position=1, leave=False):
+                    data_manager.purge_dataset()
+
+                    for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=2, leave=False):
+                        teacher.process_chunk(reserve_vram, next_stop_id=stop, data_manager=data_manager)
+
+                    student.train_chunk(data_manager, validation_data_manager, full_collect)
+
+                for teacher in teachers:
+                    teacher.new_epoch()
+    else:
+        print("Using data on disk for training...")
+        student.train_chunk(data_manager, validation_data_manager, True)
 
     validation_data_manager.close()
     data_manager.close()

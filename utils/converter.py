@@ -1,5 +1,6 @@
 import json
 import random
+import os
 
 def write_records(records, outfile, sort):
     if sort:
@@ -134,11 +135,32 @@ def convert_gpt_roleplay(input_path, output_path, dataset_name, sort):
 
         write_records(records, outfile, sort)
 
+def rewrite_random_smaples(input_path, output_path, dataset_name, sort):
+    with open(input_path, 'r', encoding='utf-8') as infile, open(output_path, 'w', encoding='utf-8') as outfile:
+        records = []
+        for line in infile:
+            record = json.loads(line.strip())
 
-input_file_path = r"C:\Users\PC\Downloads\en-00000-of-00001-6291ef0dc79c47ed.jsonl"
-output_file_path = r"C:\Users\PC\Downloads\Converted_gpt_roleplay.jsonl"
-dataset_name = 'gpt_roleplay'
+            text = record['text']
+
+            new_record = {
+                "init": "",
+                "conversations": [text] if text else [""],
+                "source": dataset_name,
+                "tags": ["completion"]
+            }
+
+            records.append(new_record)
+
+        write_records(records, outfile, sort)
+
+
+input_file_path = r"C:\Users\PC\random_samples_4k.jsonl"
+path = os.path.dirname(input_file_path)
+name = os.path.basename(input_file_path).split('.')[0]
+output_file_path = os.path.join(path, f"Converted_{name}.jsonl")
+dataset_name = name
 sort = True
 
-convert_gpt_roleplay(input_file_path, output_file_path, dataset_name, sort)
+rewrite_random_smaples(input_file_path, output_file_path, dataset_name, sort)
 print(f"Converted {input_file_path} to {output_file_path} with dataset name {dataset_name}")

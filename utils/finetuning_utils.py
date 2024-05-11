@@ -48,8 +48,12 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
     # assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
     min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
     inv_sum = torch.tensor(0.0, dtype=torch.float32).to(student_logits.device, non_blocking=True)
+    certainty_loss = torch.tensor(0.0, dtype=torch.float32).to(student_logits.device, non_blocking=True)
+
     student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
     teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
+
+    N_remaining = student_logprobs.size(-1) - teacher_logprobs.size(-1)
 
     cross_entropy_loss = F.cross_entropy(student_logits[:min_len - 1], convo_content_tokens[1:min_len])
 
@@ -61,9 +65,14 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
             kl_div = kl_div.mean()
         
     else:
-        student_gathered = torch.gather(student_logprobs, dim=-1, index=indices[:min_len])
-        
-        inv_sum = (1 - student_gathered.exp().sum(dim=-1).mean()).exp() - 1
+        student_gathered = F.log_softmax(torch.gather(student_logprobs, dim=-1, index=indices[:min_len]), dim=-1)
+
+        inv_sum = (1 - student_gathered.exp().sum(dim=-1).mean()) 
+
+        epsilon = 6e-7
+
+        if inv_sum > 1e-5:
+            certainty_loss = inv_sum * (inv_sum / (N_remaining * epsilon)).log()
 
         kl_div = F.kl_div(student_gathered, teacher_logprobs, reduction='none', log_target=True)
         if custom:
@@ -72,12 +81,12 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
             kl_div = kl_div.mean()
     
     kl_div_divis = 1
-    sum_divis = 1
+    certainty_loss_divis = 1
     total_divis = 1
 
-    combined_loss = (kl_div/kl_div_divis + inv_sum/sum_divis) / total_divis
+    combined_loss = (kl_div/kl_div_divis + certainty_loss/certainty_loss_divis) / total_divis
 
-    return combined_loss, cross_entropy_loss, kl_div, inv_sum
+    return combined_loss, cross_entropy_loss, kl_div, inv_sum, certainty_loss
 
 
 def scale_temperature(current_step, num_training_steps, temperature):

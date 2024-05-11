@@ -5,14 +5,14 @@ import os
 
 class Paths:
     '''
-    cache
-    ├─ tensorboard_logs
-    ├─ dataset
-    │  └─ validation
-    └─ student
-       ├─ states
-       ├─ gguf
-       └─ trained
+    cache\n
+    ├─ tensorboard_logs\n
+    ├─ dataset\n
+    │   └─ validation\n
+    └─ student\n
+        ├─ states\n
+        ├─ gguf\n
+        └─ trained\n
     '''
 
     def __init__(self, cache, clean_start: bool = False, empty_logs: bool = False):

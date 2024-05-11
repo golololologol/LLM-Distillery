@@ -1,4 +1,5 @@
 from numpy import ndarray
+import hashlib
 import torch
 
 
@@ -21,8 +22,10 @@ class ConvoTokenized:
     def __init__(self, tokenized: ndarray, content_ranges, padding, cropped_end, convo_id):
         self.tokenized: ndarray = tokenized
         self.content_ranges: list[tuple[int, int]] = content_ranges
+        self.content_tokens: list[int] = [token for start, end in content_ranges for token in tokenized[start:end]]
         self.padding: int = padding
         self.cropped_end: bool = cropped_end
         self.length: int = len(tokenized) - padding
         self.len_content: int = sum([end - start for start, end in content_ranges])
+        self.content_sha: str = hashlib.sha256("".join(map(str, self.content_tokens)).encode()).hexdigest()
         self.origin_convo_id: int = convo_id

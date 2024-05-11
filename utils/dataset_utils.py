@@ -1,6 +1,7 @@
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
 from utils.vocab_utils import get_special_tokens
 from classes.data_classes import ConvoTokenized
+from classes.base_model import BaseModel
 from transformers import AutoTokenizer
 from tqdm import tqdm
 import numpy as np
@@ -45,10 +46,8 @@ def encode_prompt_format(prompt_format: dict, sp_toks: dict, tokenizer) -> dict[
     return prompt_format
 
 
-def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, completion, add_bos=True):
-    empty = False
-
-    if add_bos:
+def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, model: BaseModel, ignore_model_type):
+    if model.add_bos:
         conversation_tokenized = np.array([sp_toks["bos_id"]], dtype=np.int64)
         start_index = 0
     else:
@@ -56,30 +55,38 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
         start_index = -1
 
     conversation_content_ranges = []
-
-
+    tags = json_item.get("tags", [])
+    empty = False
+    completion = "completion" in tags
+    student = model.student or ignore_model_type
 
     if completion:
+        if model.completion or student:
+            text = json_item.get("conversations", [""])[0]
 
-        text = json_item.get("text", "")
-        if text:
-            text_tokenized = good_encode(text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
-            conversation_tokenized = np.concatenate((conversation_tokenized, text_tokenized))
-            conversation_content_ranges.append((0, len(text_tokenized)))
+            if text:
+                text_tokenized = good_encode(text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
+                conversation_tokenized = np.concatenate((conversation_tokenized, text_tokenized))
+                conversation_content_ranges.append((0, len(text_tokenized)))
+            else:
+                empty = True
+
+            return conversation_tokenized, conversation_content_ranges, empty, completion
+
         else:
             empty = True
-
-        return conversation_tokenized, conversation_content_ranges, empty
-        
-
+            return conversation_tokenized, conversation_content_ranges, empty, completion
+    
+    elif model.completion and not student:
+        empty = True
+        return conversation_tokenized, conversation_content_ranges, empty, completion
 
     num_turns = len(json_item["conversations"])
 
     if num_turns == 0:
         empty = True
-        return conversation_tokenized, conversation_content_ranges, empty
-
-    tags = json_item.get("tags", [])
+        return conversation_tokenized, conversation_content_ranges, empty, completion
+    
     reversed = ("reversed" in tags) or json_item.get("reversed", False)
 
     sys_content = json_item.get("init", "")
@@ -94,7 +101,7 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
 
         if turn == "":
             empty = True
-            return conversation_tokenized, conversation_content_ranges, empty
+            return conversation_tokenized, conversation_content_ranges, empty, completion
 
         if reversed:
             assistant = (i + 1) % 2
@@ -127,31 +134,32 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
     
     if not conversation_content_ranges:
         empty = True
-        return conversation_tokenized, conversation_content_ranges, empty
+        return conversation_tokenized, conversation_content_ranges, empty, completion
 
     if conversation_content_ranges[0][0] > context_len:
         empty = True
 
-    return conversation_tokenized, conversation_content_ranges, empty
+    return conversation_tokenized, conversation_content_ranges, empty, completion
 
 
-def tokenize_dataset(dataset_path, model_path, prompt_format, context_len, save_sys_range, save_user_range, save_assistant_range, add_bos=True, completion=False) -> tuple[list[ConvoTokenized], set[int]]:
+def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, model, ignore_model_type) -> tuple[list[ConvoTokenized], set[int]]:
     try:
         config = ExLlamaV2Config()
-        config.model_dir = model_path
+        config.model_dir = model.model_path
         config.prepare()
         tokenizer = ExLlamaV2Tokenizer(config)
     except:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, legacy=False)
+        tokenizer = AutoTokenizer.from_pretrained(model.model_path, legacy=False)
 
-    sp_toks = get_special_tokens(model_path=model_path)
-    pf = encode_prompt_format(prompt_format, sp_toks, tokenizer)
+    sp_toks = get_special_tokens(model_path=model.model_path)
+    pf = encode_prompt_format(model.prompt_format, sp_toks, tokenizer)
     
     dataset = []
     ids = set()
 
     for convo_id, item in tqdm(enumerate(read_jsonl_lazy(dataset_path)), desc="Tokenizing", unit="convo", smoothing=0.06, leave=False): # Every conversation
-        conversation_tokenized, conversation_content_ranges, empty = tokenize_convo(item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, completion, add_bos=add_bos)
+        conversation_tokenized, conversation_content_ranges, empty, completion = tokenize_convo(item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range,
+                                                                                                context_len, model, ignore_model_type)
         
         if empty:
             continue

@@ -1,6 +1,7 @@
 from utils.vocab_utils import get_vocab_family, get_special_tokens
 from utils.convert_to_safetensor import convert_model
 from classes.data_classes import ConvoTokenized
+from transformers import AutoTokenizer
 from typing import Optional
 from tqdm import tqdm
 import numpy as np
@@ -80,7 +81,8 @@ def input_config():
     config = {
         'batch_size': 1,
         'add_bos': True,
-        'seq_chunk_len': 256
+        'seq_chunk_len': 256,
+        'completion': False
     }
     print("Enter the model config, use '<' to go back a step.")
     keys = list(config.keys())
@@ -121,6 +123,7 @@ class BaseModel:
         self.model_name: str = ""
         self.device: str = "cuda:0"
         self.prompt_format: dict = {}
+        self.completion: bool = False
 
         self.batch_size: int = 0
         self.add_bos: bool = False
@@ -175,7 +178,9 @@ class BaseModel:
             self.batch_size = config.get('batch_size', 1)
             self.add_bos = config.get('add_bos', True)
             self.seq_chunk_len = config.get('seq_chunk_len', 256)
+            self.completion = config.get('completion', False)
 
+        
         self.vocab_family = get_vocab_family(model_path=self.model_path)
         self.special_tokens = get_special_tokens(model_path=self.model_path)
 
@@ -184,3 +189,19 @@ class BaseModel:
         for start, end in content_ranges:
             content_indices.append(np.arange(start, end))
         return torch.as_tensor(np.concatenate(content_indices), dtype=torch.long).to(self.device, non_blocking=True)
+    
+    def write_dataset_to_file(self, folder: str):
+        tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+        for convo in self.dataset[:4]:
+            convo_dict = {
+                "tokenized": convo.tokenized.tolist(),
+                "decoded": [tokenizer.decode(convo.tokenized)],
+                "content_ranges": convo.content_ranges,
+                "content_decoded": [tokenizer.decode(convo.tokenized[start:end]) for start, end in convo.content_ranges],
+                "padding": convo.padding,
+                "cropped_end": convo.cropped_end,
+                "origin_convo_id": convo.origin_convo_id
+            }
+            convo_path = os.path.join(folder, f"{convo.origin_convo_id}.json")
+            with open(convo_path, 'w', encoding='utf-8') as file:
+                json.dump(convo_dict, file, ensure_ascii=False, indent=4)

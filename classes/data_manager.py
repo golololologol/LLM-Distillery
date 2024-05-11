@@ -25,6 +25,10 @@ class H5DataManager:
 
     def _process_thread(self):
         with h5py.File(self.file_path, 'a') as hdf_file:
+
+            if not self.queue.empty():
+                self.got_task.set()
+
             while True:
                 self.got_task.wait()
                 self.got_task.clear()
@@ -57,6 +61,8 @@ class H5DataManager:
                                     
                         case 'put_batch':
                             self._process_distributions(hdf_file, data)
+                        case 'update_batch':
+                            self._update_data(hdf_file, data)
                         case 'get_available_ids':
                             self.result_queue.put([int(dataset_name.split('_')[1]) for dataset_name in hdf_file])
                         case 'clear_dataset':
@@ -103,6 +109,16 @@ class H5DataManager:
         merged_data = disk_data + new_data
 
         return np.log(merged_data)
+    
+    def _update_data(self, hdf_file, batch: list[Distribution]):
+        for distribution in batch:
+            distr_shd_mem = shared_memory.SharedMemory(name=distribution.shd_mem_name)
+            distribution.distribution = np.ndarray(distribution.distr_shape, dtype=distribution.distr_dtype, buffer=distr_shd_mem.buf)
+
+            self._save_data(hdf_file, distribution.distribution, distribution.origin_convo_id, distribution.indices)
+
+            distr_shd_mem.close()
+            distr_shd_mem.unlink()
 
     def _save_data(self, hdf_file: h5py.File, data: np.ndarray, convo_id: int, indices):
         dataset_name = f'convo_{convo_id}'
@@ -165,6 +181,10 @@ class H5DataManager:
 
     def write_batch(self, batch: list[Distribution]):
         self.queue.put(('put_batch', batch))
+        self.got_task.set()
+
+    def update_batch(self, batch: list[Distribution]):
+        self.queue.put(('update_batch', batch))
         self.got_task.set()
 
     def get_dataset_ids(self) -> list[int]:
