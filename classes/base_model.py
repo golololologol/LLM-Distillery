@@ -5,6 +5,7 @@ from transformers import AutoTokenizer
 from typing import Optional
 from tqdm import tqdm
 import numpy as np
+import codecs
 import torch
 import json
 import os
@@ -71,6 +72,7 @@ def input_prompt_format():
         elif value == "":
             i += 1
         else:
+            value = codecs.decode(value, 'unicode_escape')
             prompt_format[key] = value
             i += 1
             
@@ -152,7 +154,7 @@ class BaseModel:
     def _prepare(self):
         self.model_name = os.path.basename(self.model_path)
 
-        if not os.path.exists(self.model_path):
+        if not os.path.exists(self.model_path) or not is_model_safetensors(self.model_path):
             self.model_path = f"{self.model_path}_safetensors"
 
             if not os.path.exists(self.model_path):
@@ -164,13 +166,13 @@ class BaseModel:
         if not self.student:
             pf = load_prompt_format(self.model_path)
             if pf is None:
-                print(f"{self.model_name} has no prompt format")
+                print(f"\n{self.model_name} has no prompt format")
                 pf = input_prompt_format()
                 save_prompt_format(pf, self.model_path)
 
             config = load_config(self.model_path)
             if config is None:
-                print(f"{self.model_name} has no config")
+                print(f"\n{self.model_name} has no config")
                 config = input_config()
                 save_config(config, self.model_path)
 
@@ -179,7 +181,6 @@ class BaseModel:
             self.add_bos = config.get('add_bos', True)
             self.seq_chunk_len = config.get('seq_chunk_len', 256)
             self.completion = config.get('completion', False)
-
         
         self.vocab_family = get_vocab_family(model_path=self.model_path)
         self.special_tokens = get_special_tokens(model_path=self.model_path)
@@ -192,16 +193,25 @@ class BaseModel:
     
     def write_dataset_to_file(self, folder: str):
         tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        for convo in self.dataset[:4]:
-            convo_dict = {
-                "tokenized": convo.tokenized.tolist(),
-                "decoded": [tokenizer.decode(convo.tokenized)],
-                "content_ranges": convo.content_ranges,
-                "content_decoded": [tokenizer.decode(convo.tokenized[start:end]) for start, end in convo.content_ranges],
-                "padding": convo.padding,
-                "cropped_end": convo.cropped_end,
-                "origin_convo_id": convo.origin_convo_id
-            }
-            convo_path = os.path.join(folder, f"{convo.origin_convo_id}.json")
-            with open(convo_path, 'w', encoding='utf-8') as file:
-                json.dump(convo_dict, file, ensure_ascii=False, indent=4)
+        path = os.path.join(folder, "tokenized_dataset.jsonl")
+        path_content = os.path.join(folder, "content_tokenized_dataset.jsonl")
+        with open(path, 'w', encoding='utf-8') as file:
+            with open(path_content, 'w', encoding='utf-8') as file_content:
+                for convo in tqdm(self.dataset, desc="Writing dataset to file"):
+                    convo_dict = {
+                        "tokenized": convo.tokenized.tolist(),
+                        "decoded": [tokenizer.decode(convo.tokenized)],
+                        "content_ranges": convo.content_ranges,
+                        "content_indices": [list(range(start, end)) for start, end in convo.content_ranges],
+                        "content_decoded": [tokenizer.decode(convo.tokenized[start:end]) for start, end in convo.content_ranges],
+                        "padding": convo.padding,
+                        "cropped_end": convo.cropped_end,
+                        "origin_convo_id": convo.origin_convo_id
+                    }
+
+                    content_convo_dict = convo_dict.copy()
+                    content_convo_dict.pop("tokenized")
+
+                    file.write(json.dumps(convo_dict, ensure_ascii=False) + "\n")
+                    file_content.write(json.dumps(content_convo_dict, ensure_ascii=False) + "\n")
+

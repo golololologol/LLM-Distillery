@@ -45,7 +45,40 @@ def launch_tensorboard(log_dir):
 
 
 def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_content_tokens, custom=False):
-    # assert teacher_logits[0].sum() != 0, "Teacher logprobs are all zeros"
+    def total_kl_div(student_logprobs: torch.Tensor, teacher_logprobs: torch.Tensor, custom: bool = False, per_token: bool = False):
+        kl_div_raw = F.kl_div(student_logprobs, teacher_logprobs, reduction='none', log_target=True)
+
+        if per_token:
+            if custom:
+                kl_div = kl_div_raw.sum(dim=-1)
+            else:
+                kl_div = kl_div_raw.mean(dim=-1)
+        else:
+            if custom:
+                kl_div = kl_div_raw.sum(dim=-1).mean()
+            else:
+                kl_div = kl_div_raw.mean()
+
+        return kl_div
+    
+    def inv_sum_func(student_logprobs: torch.Tensor):
+        return (1 - student_logprobs.exp().sum(dim=-1).mean())
+
+    def certainty_loss_func(inv_sum: torch.Tensor, N_remaining: int, epsilon=1.7e-6, zero_tensor: torch.Tensor = None):
+        if inv_sum > 1e-5:
+            return inv_sum * (inv_sum / (N_remaining * epsilon)).log()
+        else:
+            return zero_tensor
+        
+    def abomination_loss(kl_div_per_token: torch.Tensor, alpha: float):
+        weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha)
+
+        variance = kl_div_per_token.var()
+
+        loss = (kl_div_per_token * weights).mean()
+
+        return loss, variance
+
     min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
     inv_sum = torch.tensor(0.0, dtype=torch.float32).to(student_logits.device, non_blocking=True)
     certainty_loss = torch.tensor(0.0, dtype=torch.float32).to(student_logits.device, non_blocking=True)
@@ -58,35 +91,26 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
     cross_entropy_loss = F.cross_entropy(student_logits[:min_len - 1], convo_content_tokens[1:min_len])
 
     if indices is None:
-        kl_div = F.kl_div(student_logprobs, teacher_logprobs, reduction='none', log_target=True)
-        if custom:
-            kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).mean().log()
-        else:
-            kl_div = kl_div.mean()
+        kl_div = total_kl_div(student_logprobs, teacher_logprobs, custom=custom, per_token=True)
         
     else:
         student_gathered = F.log_softmax(torch.gather(student_logprobs, dim=-1, index=indices[:min_len]), dim=-1)
 
-        inv_sum = (1 - student_gathered.exp().sum(dim=-1).mean()) 
+        inv_sum = inv_sum_func(student_gathered)
 
-        epsilon = 6e-7
+        certainty_loss = certainty_loss_func(inv_sum, N_remaining, zero_tensor=certainty_loss)
 
-        if inv_sum > 1e-5:
-            certainty_loss = inv_sum * (inv_sum / (N_remaining * epsilon)).log()
+        kl_div = total_kl_div(student_gathered, teacher_logprobs, custom=custom, per_token=True)
 
-        kl_div = F.kl_div(student_gathered, teacher_logprobs, reduction='none', log_target=True)
-        if custom:
-            kl_div = ((kl_div.exp() - 1).sum(dim=-1) + 1).mean().log()
-        else:
-            kl_div = kl_div.mean()
-    
-    kl_div_divis = 1
+    custom_loss, variance = abomination_loss(kl_div, 2)
+
+    custom_loss_divis = 1
     certainty_loss_divis = 1
     total_divis = 1
 
-    combined_loss = (kl_div/kl_div_divis + certainty_loss/certainty_loss_divis) / total_divis
+    combined_loss = (custom_loss/custom_loss_divis + certainty_loss/certainty_loss_divis) / total_divis
 
-    return combined_loss, cross_entropy_loss, kl_div, inv_sum, certainty_loss
+    return combined_loss, cross_entropy_loss, custom_loss, kl_div.mean(), variance, certainty_loss
 
 
 def scale_temperature(current_step, num_training_steps, temperature):

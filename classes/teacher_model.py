@@ -105,6 +105,7 @@ def _inference_worker(inference_queue, result_queue, made_distributions, done_ch
                 indices: ndarray = indices.to('cpu').numpy()
 
             batch_logp_data: ndarray = batch_logp.to('cpu').numpy()
+                
             shd_mem = shared_memory.SharedMemory(create=True, size=batch_logp_data.nbytes)
             shared_batch_logp = ndarray(batch_logp_data.shape, dtype=batch_logp_data.dtype, buffer=shd_mem.buf)
             np.copyto(shared_batch_logp, batch_logp_data)
@@ -174,11 +175,6 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
             distribution.distribution = distribution.distribution[content_indices]
             distribution.indices = distribution.indices[:distribution.length] if distribution.indices is not None else None
             distribution.indices = distribution.indices[content_indices] if distribution.indices is not None else None
-            
-            if distribution.indices is None:
-                content_tokens = distribution.tokenized[content_indices][1:]
-                gathered_log_probs = distribution.distribution[np.arange(len(content_indices) - 1), content_tokens]
-                distribution.ppl = min(np.exp(-np.mean(gathered_log_probs)), 100)
 
             shd_mem = shared_memory.SharedMemory(create=True, size=distribution.distribution.nbytes)
             distribution.shd_mem_name = shd_mem.name

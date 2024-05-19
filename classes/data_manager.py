@@ -3,6 +3,7 @@ from multiprocessing import shared_memory
 from multiprocessing import get_context
 import multiprocessing
 import numpy as np
+import torch
 import time
 import h5py
 import os
@@ -81,9 +82,10 @@ class H5DataManager:
             distribution.distribution = np.ndarray(distribution.distr_shape, dtype=distribution.distr_dtype, buffer=distr_shd_mem.buf)
 
             id = distribution.origin_convo_id
-            if f"{id}" in hdf_file:
-                merged_data = self._merge_data(hdf_file, distribution, id)
-                self._save_data(hdf_file, merged_data, id)
+            name = f'convo_{id}'
+            if name in hdf_file:
+                merged_data, merged_indices = self._merge_data(hdf_file, distribution, id)
+                self._save_data(hdf_file, merged_data, id, merged_indices)
             else:
                 self._save_data(hdf_file, distribution.distribution, id, distribution.indices)
 
@@ -91,24 +93,69 @@ class H5DataManager:
             distr_shd_mem.unlink()
 
     def _merge_data(self, hdf_file, new_distribution: Distribution, id):
-        assert isinstance(new_distribution.distribution, np.ndarray), "Distribution should be a numpy array."
+
+        def merge_full(disk_data, new_data):
+            raw_diff = disk_data.shape[0] - new_data.shape[0]
+
+            if raw_diff < 0:
+                disk_data = np.pad(disk_data, ((0, -raw_diff), (0, 0)))
+            elif raw_diff > 0:
+                new_data = np.pad(new_data, ((0, raw_diff), (0, 0)))
+
+            return disk_data + new_data
+                
         
-        ppl = new_distribution.ppl
-        assert ppl > 0, "PPL should be greater than 0."
+        def merge_topk(disk_data: torch.Tensor, new_data: torch.Tensor, disk_indices: torch.Tensor, new_indices: torch.Tensor):
+            raw_diff = disk_data.size(0) - new_data.size(0)
+            topK = disk_data.size(-1)
+            
+            if raw_diff < 0:
+                rest_data = new_data[disk_data.size(0):]
+                rest_indices = new_indices[disk_data.size(0):]
+                new_data = new_data[:disk_data.size(0)]
+                new_indices = new_indices[:disk_data.size(0)]
+                
+            elif raw_diff > 0:
+                rest_data = disk_data[new_data.size(0):]
+                rest_indices = disk_indices[new_data.size(0):]
+                disk_data = disk_data[:new_data.size(0)]
+                disk_indices = disk_indices[:new_data.size(0)]
 
-        disk_data = np.exp(self._load_id(hdf_file, id))
-        new_data = np.exp(new_distribution.distribution) / np.log(ppl)
+            num_tokens = disk_data.size(0)
+            merged_data = torch.zeros_like(disk_data)
+            merged_indices = torch.zeros_like(disk_indices, dtype=torch.long)
+    
+            for i in range(num_tokens):
+                all_indices = torch.cat((disk_indices[i], new_indices[i]))
+                all_values = torch.cat((disk_data[i], new_data[i]))
+        
+                unique_indices, inv_indices = torch.unique(all_indices, return_inverse=True)
+                summed_values = torch.zeros_like(unique_indices, dtype=all_values.dtype)
+                summed_values.index_add_(0, inv_indices, all_values)
+        
+                top_values, top_indices = torch.topk(summed_values, k=topK)
+                merged_data[i] = top_values
+                merged_indices[i] = unique_indices[top_indices]
 
-        raw_diff = disk_data.shape[0] - new_data.shape[0]
+            if raw_diff != 0:
+                merged_data = torch.cat((merged_data, rest_data))
+                merged_indices = torch.cat((merged_indices, rest_indices))
 
-        if raw_diff < 0:
-            disk_data = np.pad(disk_data, ((0, -raw_diff), (0, 0)))
-        elif raw_diff > 0:
-            new_data = np.pad(new_data, ((0, raw_diff), (0, 0)))
+            return merged_data.numpy(), merged_indices.numpy()
 
-        merged_data = disk_data + new_data
+        disk_data, disk_indices = self._load_id(hdf_file, id)
+        disk_data = np.exp(disk_data)
+        new_data = np.exp(new_distribution.distribution)
 
-        return np.log(merged_data)
+        if disk_indices is not None:
+            merged_data, merged_indices = merge_topk(torch.tensor(disk_data, dtype=torch.float32),
+                                     torch.tensor(new_data, dtype=torch.float32),
+                                     torch.tensor(disk_indices, dtype=torch.long),
+                                     torch.tensor(new_distribution.indices, dtype=torch.long))
+        else:
+            merged_data = merge_full(disk_data, new_data)
+
+        return np.log(merged_data), merged_indices
     
     def _update_data(self, hdf_file, batch: list[Distribution]):
         for distribution in batch:
@@ -122,15 +169,17 @@ class H5DataManager:
 
     def _save_data(self, hdf_file: h5py.File, data: np.ndarray, convo_id: int, indices):
         dataset_name = f'convo_{convo_id}'
+        compression_opts = 6
+
         if dataset_name in hdf_file:
             del hdf_file[dataset_name]
-        hdf_file.create_dataset(dataset_name, data=data, dtype=np.float16)
+        hdf_file.create_dataset(dataset_name, data=data, compression='gzip', compression_opts=compression_opts, dtype=np.float16)
 
         if indices is not None:
             indices_name = f'indices_{convo_id}'
             if indices_name in hdf_file:
                 del hdf_file[indices_name]
-            hdf_file.create_dataset(indices_name, data=indices, dtype=np.int32)
+            hdf_file.create_dataset(indices_name, data=indices, compression='gzip', compression_opts=compression_opts, dtype=np.int32)
     
     def _load_id(self, hdf_file, convo_id: int) -> np.ndarray:
         data = np.array(hdf_file[f'convo_{convo_id}'], dtype=np.float32) if f'convo_{convo_id}' in hdf_file else None
@@ -164,7 +213,10 @@ class H5DataManager:
 
     def _clear_dataset(self, hdf_file: h5py.File):
         for dataset_name in hdf_file:
-            del hdf_file[dataset_name]
+            try:
+                del hdf_file[dataset_name]
+            except:
+                pass
         self.shared_batches = []
         self.result_queue.put(True)
     

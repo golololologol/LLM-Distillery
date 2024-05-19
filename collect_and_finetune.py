@@ -5,15 +5,18 @@ from classes.data_manager import H5DataManager
 from classes.paths import Paths
 from tqdm import tqdm
 import multiprocessing
+import time
 import json
 import os
 
     
 def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb, enable_topK, save_topK):
-    kb_per_distr_val = 0.001953125 * 3 # storage of one FP16 value
+    
     if enable_topK:
+        kb_per_distr_val = (0.001953125 * 3) / 1.7 # storage of one FP16 value * 3 (for int32 index) / 1.7 (avg compression ratio)
         distr_size_kb = kb_per_distr_val * save_topK
     else:
+        kb_per_distr_val = 0.001953125 / 1.55 # storage of one FP16 value / 1.55 (avg compression ratio)
         distr_size_kb = kb_per_distr_val * teacher.crop_to_size
     max_cache_size_kb = max_cache_size_gb * 1e6
     cache_size_kb = 0
@@ -135,24 +138,25 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
     student.device = device
 
 
-def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision,
-                         decay_start, multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs):
+def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision,
+                         decay_start, multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state):
     student.num_epochs = num_epochs
     student.num_warmup_steps = num_warmup_steps
     student.lr = lr
     student.lr_scheduler_name = lr_scheduler
     student.optimizer_name = optimizer
-    student.grad_accum_steps = grad_accum_steps
+    student.num_grad_accum_batches = grad_accum_batches
     student.training_precision_name = training_precision
     student.decay_start = decay_start
     student.multi_gpu = multi_gpu
     student.data_order = data_order
     student.validation_per_steps = validate_every_n_epochs * student.dataset_len
-    student.next_accum_step = grad_accum_steps
+    student.next_accum_step = grad_accum_batches * student.batch_size
     student.num_training_steps = num_epochs * student.dataset_len
     student.custom_reduction = custom_reduction
     student.save_every_steps = save_student_every_n_epochs * student.dataset_len
     student.next_save_step = save_student_every_n_epochs * student.dataset_len
+    student.save_final_state = save_final_state
 
 
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
@@ -169,7 +173,7 @@ def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, in
             teacher.sort_dataset_by_map(validation_sorting_map, validation=True)
 
 
-def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: Paths):
+def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: Paths) -> tuple[bool, bool]:
 
     def check_sha(path, current_sha):
         if not os.path.exists(path):
@@ -191,50 +195,38 @@ def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: 
                 return False
 
         return True
-    
+
     def check_teacher_names(path, teacher_names):
-        disk_teacher_names = []
-
-        if os.path.exists(path):
-            with open(path, "r") as f:
-                disk_teacher_names = json.load(f)
-        else:
+        if not os.path.exists(path):
             return False
 
-        if disk_teacher_names != teacher_names:
-            return False
-        
-        return True
-    
-    collect = True
-    collect_val = True
+        with open(path, "r") as f:
+            disk_teacher_names = json.load(f)
+
+        return disk_teacher_names == teacher_names
+
+    def check_paths(paths, teacher_names, current_sha):
+        distr_path = os.path.join(paths, "distributions.hdf5")
+        names_path = os.path.join(paths, "teacher_names.json")
+        sha_path = os.path.join(paths, "sha.jsonl")
+
+        if not (os.path.exists(distr_path) and os.path.exists(names_path) and os.path.exists(sha_path)):
+            return True
+
+        if not check_teacher_names(names_path, teacher_names):
+            return True
+
+        if not check_sha(sha_path, current_sha):
+            return True
+
+        return False
+
     teacher_names = [teacher.model_name for teacher in teachers]
     current_sha = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.dataset}
-    distr_path = os.path.join(paths.dataset, "distributions.hdf5")
-    distr_path_val = os.path.join(paths.dataset_validation, "distributions.hdf5")
-    names_path = os.path.join(paths.dataset, "teacher_names.json")
-    names_path_val = os.path.join(paths.dataset_validation, "teacher_names.json")
-    sha_path = os.path.join(paths.dataset, "sha.jsonl")
-    sha_path_val = os.path.join(paths.dataset_validation, "sha.jsonl")
+    current_sha_val = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.validation_dataset}
 
-    if os.path.exists(distr_path) and os.path.exists(names_path) and os.path.exists(sha_path):
-        matching_sha = False
-
-        matching_names = check_teacher_names(names_path, teacher_names)
-        if matching_names:
-            matching_sha = check_sha(sha_path, current_sha)
-
-        collect = not (matching_sha and matching_names)
-
-    if os.path.exists(distr_path_val) and os.path.exists(names_path_val) and os.path.exists(sha_path_val):
-        matching_sha_val = False
-
-        matching_names_val = check_teacher_names(names_path_val, teacher_names)
-
-        if matching_names_val:
-            matching_sha_val = check_sha(sha_path_val, current_sha)
-
-        collect_val = not (matching_sha_val and matching_names_val)
+    collect = check_paths(paths.dataset, teacher_names, current_sha)
+    collect_val = check_paths(paths.dataset_validation, teacher_names, current_sha_val)
 
     return collect, collect_val
 
@@ -265,7 +257,7 @@ def main():
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
-    dataset_path = r"C:\Users\PC\Converted_random_samples_4k.jsonl"
+    dataset_path = r"C:\Users\PC\Documents\distil_dataset_v1.jsonl"
     validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
@@ -281,33 +273,34 @@ def main():
     crop_distr_to_size = 32000
     enable_topK = True
     save_topK = 200
-    device = "cuda:0"
+    device = "cuda:1"
     reserve_vram = [5, 0.5] # GB
 
     # Training settings
-    batch_size = 4
-    num_epochs = 4
-    num_warmup_steps = 50
+    num_epochs = 1
+    num_warmup_steps = 200
     temperature = 1
-    lr = 3e-6
+    lr = 5e-6
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop32bit"
     data_order = "shuffle" # "shuffle", "native", "sorted"
-    grad_accum_steps = 8
+    batch_size = 3
+    grad_accum_batches = 1
     training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     multi_gpu = True
     decay_start = 0.9 # wsd only
-    validate_every_n_epochs = 0.5
-    save_student_every_n_epochs = 1
+    validate_every_n_epochs = 0.01
+    save_student_every_n_epochs = 0.2
     custom_reduction = True
     encourage_eos = False
+    save_final_state = True
 
     # Student settings
     add_bos = True
     prompt_format = {
-        "SYS_START": "### System:\n",
-        "USER_START": "### User:\n",
-        "ASSISTANT_START": "### AI:\n",
+        "SYS_START": "#System:\n",
+        "USER_START": "#User:\n",
+        "ASSISTANT_START": "#AI:\n",
         "SYS_END": "\n\n",
         "USER_END": "\n\n",
         "ASSISTANT_END": "\n\n",
@@ -324,8 +317,8 @@ def main():
     prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type)
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
-    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_steps, training_precision, decay_start,
-                         multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs)
+    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start,
+                         multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state)
 
     sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
@@ -339,14 +332,18 @@ def main():
     ## Validation collecting loop
     
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
+    time.sleep(1)
     data_manager = H5DataManager(paths.dataset, device)
 
     if collect_val:
         print("Collecting validation data...")
+
+        validation_data_manager.purge_dataset()
+
         for teacher in teachers:
             teacher.process_chunk(reserve_vram, full_collect=True, data_manager=validation_data_manager, validation=True)
 
-        save_dataset_metadata(paths.dataset_validation, teachers, student)
+        save_dataset_metadata(paths.dataset_validation, teachers, student, validation=True)
 
     else:
         print("Using data on disk for validation...")
@@ -354,6 +351,8 @@ def main():
     ## Training collecting loop
     if collect:
         print("Collecting all data..." if full_collect else "Collecting data in chunks...")
+
+        data_manager.purge_dataset()
 
         if full_collect:
             for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):

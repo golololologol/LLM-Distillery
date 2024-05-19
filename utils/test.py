@@ -3,6 +3,7 @@ import numpy as np
 import math
 import torch.nn.functional as F
 import json
+import codecs
 #from dataset_utils import H5Reader, H5Writer
 
 #d1 = np.random.random(size = (10,2))
@@ -332,21 +333,5 @@ def truncated_kldiv(student_probs, teacher_probs):
 #print(list[1:-1])
 #print(F.cross_entropy(log_soft_1, indices, reduction='none'))
 
-
-
-# Hypothetical leftover sum from the student
-sum_remaining_student_probs = 0.00000000000001
-# Number of classes not in the top-3
-N = 32000
-# Assume uniform distribution for teacher's remaining probabilities
-epsilon = 1e-7
-
-# Direct computation of additional KL divergence
-additional_kld = sum_remaining_student_probs * math.log(sum_remaining_student_probs / (N * epsilon))
-
-print(additional_kld)
-
-
-
-
-
+tensor1 = torch.tensor(([0.01, 0.99], [0.99, 0.01]), dtype=torch.float32)
+print(tensor1.mean(dim=-1))

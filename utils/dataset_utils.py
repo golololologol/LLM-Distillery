@@ -92,10 +92,10 @@ def tokenize_convo(json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_
     sys_content = json_item.get("init", "")
     if sys_content:
         sys_content_tokenized = good_encode(sys_content.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
-        sys_tokenized = np.concatenate((conversation_tokenized, pf['SYS_START'], sys_content_tokenized, pf['SYS_END']))
+        conversation_tokenized = np.concatenate((conversation_tokenized, pf['SYS_START'], sys_content_tokenized, pf['SYS_END']))
         if save_sys_range:
-            conversation_content_ranges.append((len(pf['SYS_START']) + start_index, len(sys_tokenized) - len(pf['SYS_END'])))
-        start_index = len(sys_tokenized) - 1
+            conversation_content_ranges.append((len(pf['SYS_START']) + start_index, len(conversation_tokenized) - len(pf['SYS_END'])))
+        start_index = len(conversation_tokenized) - 1
 
     for i, turn in enumerate(json_item["conversations"]):
 
