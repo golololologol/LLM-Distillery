@@ -191,7 +191,7 @@ def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: 
                 print(f"ID {id} not found in disk sha")
                 return False
             if disk_sha[id] != sha:
-                print(f"ID {id} sha mismatch: {disk_sha[id]} vs {sha}")
+                print(f"Disk data ID {id} sha mismatch: {disk_sha[id]} vs {sha}")
                 return False
 
         return True
@@ -257,7 +257,7 @@ def main():
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
-    dataset_path = r"C:\Users\PC\Documents\distil_dataset_v1.jsonl"
+    dataset_path = r"C:\Users\PC\Desktop\train_test_small.jsonl"
     validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
@@ -289,8 +289,8 @@ def main():
     training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     multi_gpu = True
     decay_start = 0.9 # wsd only
-    validate_every_n_epochs = 0.01
-    save_student_every_n_epochs = 0.2
+    validate_every_n_epochs = 0.5
+    save_student_every_n_epochs = 1
     custom_reduction = True
     encourage_eos = False
     save_final_state = True

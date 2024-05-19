@@ -71,8 +71,8 @@ class H5DataManager:
                         case 'exit':
                             break
                             
-                if task == 'exit':
-                    break
+                    if task == 'exit':
+                        break
                         
                 self.done_everything.set()
                 

@@ -15,6 +15,8 @@ import time
 import os
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['WANDB_SILENT'] = 'true'
+os.environ['ACCELERATE_USE_FSDP'] = '1'
 
 class StudentModel(BaseModel):
     def __init__(self, model_path: str, paths: Paths, add_bos: bool, prompt_format: dict, batch_size: int):
