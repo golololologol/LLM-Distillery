@@ -101,10 +101,11 @@ class StudentModel(BaseModel):
         if self.grad_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        for name, param in self.model.named_parameters():
-            for freeze_layer in self.freeze_layers:
-                if freeze_layer in name:
-                    param.requires_grad = False
+        if self.freeze_layers:
+            for name, param in self.model.named_parameters():
+                for freeze_layer in self.freeze_layers:
+                    if freeze_layer in name:
+                        param.requires_grad = False
 
         self._release_postfix()
 
