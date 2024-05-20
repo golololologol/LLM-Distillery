@@ -139,7 +139,7 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
 
 
 def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision,
-                         decay_start, multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state):
+                         decay_start, multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers):
     student.num_epochs = num_epochs
     student.num_warmup_steps = num_warmup_steps
     student.lr = lr
@@ -150,13 +150,15 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.decay_start = decay_start
     student.multi_gpu = multi_gpu
     student.data_order = data_order
-    student.validation_per_steps = validate_every_n_epochs * student.dataset_len
+    student.validation_every_steps = validate_every_n_epochs * student.dataset_len
     student.next_accum_step = grad_accum_batches * student.batch_size
     student.num_training_steps = num_epochs * student.dataset_len
     student.custom_reduction = custom_reduction
     student.save_every_steps = save_student_every_n_epochs * student.dataset_len
     student.next_save_step = save_student_every_n_epochs * student.dataset_len
     student.save_final_state = save_final_state
+    student.grad_checkpointing = grad_checkpointing
+    student.freeze_layers = freeze_layers
 
 
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
@@ -276,26 +278,34 @@ def main():
     device = "cuda:1"
     reserve_vram = [5, 0.5] # GB
 
+    # Collection settings
+    encourage_eos = False
+
     # Training settings
     num_epochs = 1
     num_warmup_steps = 200
+
+    batch_size = 3
+    grad_accum_batches = 1
+    grad_checkpointing = False
     temperature = 1
     lr = 5e-6
+    decay_start = 0.9 # wsd only
+
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop32bit"
     data_order = "shuffle" # "shuffle", "native", "sorted"
-    batch_size = 3
-    grad_accum_batches = 1
     training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
-    multi_gpu = True
-    decay_start = 0.9 # wsd only
+    
     validate_every_n_epochs = 0.5
     save_student_every_n_epochs = 1
+
+    multi_gpu = True
     custom_reduction = True
-    encourage_eos = False
     save_final_state = True
 
     # Student settings
+    freeze_layers = [".block_sparse_moe.gate"]
     add_bos = True
     prompt_format = {
         "SYS_START": "#System:\n",
@@ -318,7 +328,7 @@ def main():
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start,
-                         multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state)
+                         multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers)
 
     sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)

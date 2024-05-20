@@ -1,4 +1,5 @@
 from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_divergence
+from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from classes.data_classes import ConvoTokenized
 from classes.data_manager import H5DataManager
@@ -21,41 +22,50 @@ os.environ['ACCELERATE_USE_FSDP'] = '1'
 class StudentModel(BaseModel):
     def __init__(self, model_path: str, paths: Paths, add_bos: bool, prompt_format: dict, batch_size: int):
         super().__init__(model_path, student=True)
+
         self.model: Optional[AutoModelForCausalLM] = None
         self.tokenizer: Optional[AutoTokenizer] = None
-        self.data_order = ""
+        self.add_bos = add_bos
+        self.prompt_format = prompt_format
+        self.batch_size = batch_size
+        self.paths: Paths = paths
+
         self.optimizer_name = ""
         self.optimizer = None
         self.lr_scheduler_name = ""
         self.lr_scheduler = None
         self.lr = 0
-        self.num_grad_accum_batches = 0
-        self.num_training_steps = 0
-        self.validation_per_steps = 0
-        self.val_batch_order_ids = []
-        self.save_interval = 0
-        self.training_precision_name = ""
-        self.decay_start = 0
-        self.final_lr = 5e-7
-        self.paths: Paths = paths
+        self.decay_start = 0 # wsd only
+        self.final_lr = 5e-7 # wsd only
+
         self.num_epochs = 0
+        self.num_training_steps = 0
         self.num_warmup_steps = 0
-        self.multi_gpu = False
+        self.num_grad_accum_batches = 0
+        self.validation_every_steps = 0
+        self.save_every_steps = 0
+
+        # state and progress
+        self.next_save_step = 0
         self.num_trained_steps = 0
         self.next_val_step = 0
         self.next_accum_step = 0
-        self.custom_reduction = False
-        self.logger = None
-        self.tensorboard = None
-        self.saved_state = False
-        self.save_every_steps = 0
-        self.next_save_step = 0
         self.state_path = ""
         self.distr_device = ""
-        self.add_bos = add_bos
-        self.prompt_format = prompt_format
-        self.batch_size = batch_size
+        self.saved_state = False
+        self.val_batch_order_ids = []
+        
+        self.freeze_layers = []
+        self.training_precision_name = ""
+        self.custom_reduction = False
+        self.logger = None
+        self.data_order = ""
         self.save_final_state = False
+        self.grad_checkpointing = False
+        self.multi_gpu = False
+
+
+        
 
     def _set_postfix(self, postfix: str):
         self.progress_bar.set_postfix_str(postfix)
@@ -80,13 +90,21 @@ class StudentModel(BaseModel):
 
         self.model = AutoModelForCausalLM.from_pretrained(
             path,
-            device_map="auto" if self.multi_gpu else self.device,
+            device_map="balanced_low_0" if self.multi_gpu else self.device,
             torch_dtype=train_precision,
             load_in_4bit=self.training_precision_name == "4bit",
             load_in_8bit=self.training_precision_name == "8bit",
             attn_implementation="flash_attention_2"
         )
         self.model.train()
+
+        if self.grad_checkpointing:
+            self.model.gradient_checkpointing_enable()
+
+        for name, param in self.model.named_parameters():
+            for freeze_layer in self.freeze_layers:
+                if freeze_layer in name:
+                    param.requires_grad = False
 
         self._release_postfix()
 
@@ -379,4 +397,4 @@ class StudentModel(BaseModel):
 
         pbar.close()
         self.model.train()
-        self.next_val_step += self.validation_per_steps
+        self.next_val_step += self.validation_every_steps
