@@ -333,14 +333,5 @@ def truncated_kldiv(student_probs, teacher_probs):
 #list = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 #print(list[1:-1])
 #print(F.cross_entropy(log_soft_1, indices, reduction='none'))
-torch.cuda.empty_cache()
 
-model = AutoModelForCausalLM.from_pretrained(
-            r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T",
-            device_map="balanced",
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2"
-        )
-input("Press Enter to continue...")
-
-torch.cuda.empty_cache()
+print(0.25 ** 0.5)

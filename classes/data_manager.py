@@ -65,9 +65,14 @@ class H5DataManager:
                         case 'update_batch':
                             self._update_data(hdf_file, data)
                         case 'get_available_ids':
-                            self.result_queue.put([int(dataset_name.split('_')[1]) for dataset_name in hdf_file])
+                            self.result_queue.put([int(dataset_name.split('_')[1]) for dataset_name in hdf_file if dataset_name.startswith('convo_')])
                         case 'clear_dataset':
-                            self._clear_dataset(hdf_file)
+                            ids_to_clear = [int(dataset_name.split('_')[1]) for dataset_name in hdf_file if dataset_name.startswith('convo_')]
+                            self._clear_dataset(hdf_file, ids_to_clear)
+                            self.result_queue.put(True)
+                        case 'clear_ids':
+                            self._clear_dataset(hdf_file, data)
+                            self.result_queue.put(True)
                         case 'exit':
                             break
                             
@@ -104,7 +109,6 @@ class H5DataManager:
 
             return disk_data + new_data
                 
-        
         def merge_topk(disk_data: torch.Tensor, new_data: torch.Tensor, disk_indices: torch.Tensor, new_indices: torch.Tensor):
             raw_diff = disk_data.size(0) - new_data.size(0)
             topK = disk_data.size(-1)
@@ -142,6 +146,7 @@ class H5DataManager:
                 merged_indices = torch.cat((merged_indices, rest_indices))
 
             return merged_data.numpy(), merged_indices.numpy()
+        
 
         disk_data, disk_indices = self._load_id(hdf_file, id)
         disk_data = np.exp(disk_data)
@@ -211,12 +216,16 @@ class H5DataManager:
 
         return (shared_batch_memory.name, shared_batch.shape, shared_batch.dtype, batch_indices, batch_padding)
 
-    def _clear_dataset(self, hdf_file: h5py.File):
-        for dataset_name in hdf_file:
+    def _clear_dataset(self, hdf_file: h5py.File, ids_to_clear: list[int] = []):
+        for id in ids_to_clear:
             try:
-                del hdf_file[dataset_name]
+                del hdf_file[f'convo_{id}']
             except:
                 pass
+
+            if f'indices_{id}' in hdf_file:
+                del hdf_file[f'indices_{id}']
+
         self.shared_batches = []
         self.result_queue.put(True)
     
@@ -247,6 +256,11 @@ class H5DataManager:
 
     def purge_dataset(self):
         self.queue.put(('clear_dataset', None))
+        self.got_task.set()
+        return self.result_queue.get()
+    
+    def delete_ids(self, ids: list[int]):
+        self.queue.put(('clear_ids', ids))
         self.got_task.set()
         return self.result_queue.get()
 

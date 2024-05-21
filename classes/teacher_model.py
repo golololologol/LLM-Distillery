@@ -52,7 +52,7 @@ def _batch_creator_worker(inference_queue, batch_size, dataset_chunk: list[Convo
 def _inference_worker(inference_queue, result_queue, made_distributions, done_chunk, model_path, model_name, reserve_vram,
                         device, temperature, crop_to_size, pbar_queue, context_len, batch_size, max_queue_size, seq_chunk_len, enable_topK, topK):
         
-    def _load_model(reserve_vram_gb: list[float] = []):
+    def _load_model(reserve_vram_gb: list[float] = []) -> tuple[ExLlamaV2, ExLlamaV2Cache]:
         pbar_queue.put(("str", f"Loading {model_name}..."))
 
         num_gpus = torch.cuda.device_count()

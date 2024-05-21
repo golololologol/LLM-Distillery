@@ -1,5 +1,5 @@
 from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_divergence
-from fairscale.nn.data_parallel import FullyShardedDataParallel as FSDP
+from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from classes.data_classes import ConvoTokenized
 from classes.data_manager import H5DataManager
@@ -8,6 +8,7 @@ from classes.base_model import BaseModel
 from classes.paths import Paths
 from typing import Optional
 from tqdm import tqdm
+import torch.nn.functional as F
 import numpy as np
 import torch
 import wandb
@@ -45,7 +46,7 @@ class StudentModel(BaseModel):
         self.validation_every_steps = 0
         self.save_every_steps = 0
 
-        # state and progress
+        # state and progress tracking
         self.next_save_step = 0
         self.num_trained_steps = 0
         self.next_val_step = 0
@@ -65,13 +66,17 @@ class StudentModel(BaseModel):
         self.multi_gpu = False
 
 
-        
-
     def _set_postfix(self, postfix: str):
         self.progress_bar.set_postfix_str(postfix)
 
     def _release_postfix(self):
         self.progress_bar.set_postfix_str("")
+
+    def _get_content_indices_tensor(self, content_ranges) -> torch.Tensor:
+        content_indices = []
+        for start, end in content_ranges:
+            content_indices.append(np.arange(start, end))
+        return torch.as_tensor(np.concatenate(content_indices), dtype=torch.long).to(self.device, non_blocking=True)
 
     def _load_model(self, model_path: str = None):
         self._set_postfix("Loading model...")
@@ -399,3 +404,82 @@ class StudentModel(BaseModel):
         pbar.close()
         self.model.train()
         self.next_val_step += self.validation_every_steps
+
+    def get_outliers(self, data_manager: H5DataManager):
+
+        def _load_model_exl() -> tuple[ExLlamaV2, ExLlamaV2Cache]:
+            num_gpus = torch.cuda.device_count()
+            reserve_vram_kb = [int(128 * 1024**2)]*num_gpus
+
+            config = ExLlamaV2Config()
+            config.model_dir = self.model_path
+            config.prepare()
+            config.max_seq_len = self.context_len
+            config.max_batch_size = self.batch_size
+            config.max_input_len = self.seq_chunk_len
+            config.max_attention_size = self.context_len ** 2
+
+            cache = ExLlamaV2Cache(config, reserve_vram_kb)
+            model = ExLlamaV2(config, cache)
+
+            return model, cache
+        
+        def _unload_model_exl(model: ExLlamaV2, cache: ExLlamaV2Cache):
+            model.unload()
+
+            del model
+            del cache
+            torch.cuda.empty_cache()
+
+
+        trainable_ids = data_manager.get_dataset_ids()
+
+        self.dataset.sort(key=lambda convo: convo.length, reverse=True)
+        dataset_chunk = [convo for convo in self.dataset if convo.origin_convo_id in trainable_ids]
+        batched_chunk_convos, id_batches = self._construct_batches(dataset_chunk)
+        data_manager.enqueue_get_batches(id_batches)
+
+        model, cache = _load_model_exl()
+
+        pbar = tqdm(total=self.dataset_len, desc="Getting outliers", leave=False, smoothing=0.06)
+
+        for batch_convos in batched_chunk_convos:
+            device = self.distr_device if self.distr_device else self.device
+
+            sdh_mem_name, batch_shape, batch_dtype, batch_indices, batch_padding = data_manager.read_next_batch()
+            shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
+            teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(device, non_blocking=True)
+
+            max_non_padded_len = max(convo.length for convo in batch_convos)
+            batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
+            batch_tokenized_tensor = torch.from_numpy(batch_tokenized).to(self.device, non_blocking=True)
+
+            batch_logits = model.forward(batch_tokenized_tensor, cache=cache).contiguous()[:, :, :self.crop_to_size].float()
+
+            if not self.distr_device:
+                self.distr_device = batch_logits.device
+
+            for i, convo in enumerate(batch_convos):
+                indices = torch.from_numpy(batch_indices[i]).to(device, non_blocking=True)
+                content_indices = self._get_content_indices_tensor(convo.content_ranges)
+
+                teacher_padding = batch_padding[i]
+
+                convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
+                convo_teacher_logits = teacher_batch_raw[i][:teacher_padding]
+
+                min_len = min(convo_content_logits.size(0), convo_teacher_logits.size(0), indices.size(0) if indices is not None else convo_content_logits.size(0))
+                
+                student_logprobs = F.log_softmax(convo_content_logits, dim=-1)[:min_len]
+                student_gathered = torch.gather(student_logprobs, dim=-1, index=indices[:min_len])
+                teacher_logprobs = F.log_softmax(convo_teacher_logits[:min_len], dim=-1)
+                
+                kl_div = F.kl_div(student_gathered, teacher_logprobs, reduction='none', log_target=True).sum(dim=-1)
+
+
+
+
+                pbar.update(1)
+
+
+        

@@ -179,17 +179,11 @@ class BaseModel:
             self.prompt_format = pf
             self.batch_size = config.get('batch_size', 1)
             self.add_bos = config.get('add_bos', True)
-            self.seq_chunk_len = config.get('seq_chunk_len', 256)
             self.completion = config.get('completion', False)
         
+        self.seq_chunk_len = config.get('seq_chunk_len', 256)
         self.vocab_family = get_vocab_family(model_path=self.model_path)
         self.special_tokens = get_special_tokens(model_path=self.model_path)
-
-    def _get_content_indices_tensor(self, content_ranges) -> torch.Tensor:
-        content_indices = []
-        for start, end in content_ranges:
-            content_indices.append(np.arange(start, end))
-        return torch.as_tensor(np.concatenate(content_indices), dtype=torch.long).to(self.device, non_blocking=True)
     
     def write_dataset_to_file(self, folder: str):
         tokenizer = AutoTokenizer.from_pretrained(self.model_path)

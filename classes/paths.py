@@ -6,7 +6,6 @@ import os
 class Paths:
     '''
     cache\n
-    ├─ tensorboard_logs\n
     ├─ dataset\n
     │   └─ validation\n
     └─ student\n
@@ -15,22 +14,20 @@ class Paths:
         └─ trained\n
     '''
 
-    def __init__(self, cache, clean_start: bool = False, empty_logs: bool = False):
+    def __init__(self, cache, clean_start: bool = False):
         self.cache: str = cache
-        self.logging: str = os.path.join(cache, "tensorboard_logs")
         self.dataset: str = os.path.join(cache, "dataset")
         self.dataset_validation = os.path.join(self.dataset, "validation")
         self.student_root: str = os.path.join(cache, "student")
         self.student_states: str = os.path.join(self.student_root, "states")
         self.student_gguf: str = os.path.join(self.student_root, "gguf")
         self.student_trained: str = os.path.join(self.student_root, "trained")
-        self.initialize_folders(clean_start, empty_logs)
+        self.initialize_folders(clean_start)
     
-    def initialize_folders(self, clean_start, empty_logs=False):
+    def initialize_folders(self, clean_start):
         if clean_start:
-            self.empty_all(empty_logs)
+            self.empty_all()
         os.makedirs(self.cache, exist_ok=True)
-        os.makedirs(self.logging, exist_ok=True)
         os.makedirs(self.dataset, exist_ok=True)
         os.makedirs(self.dataset_validation, exist_ok=True)
         os.makedirs(self.student_root, exist_ok=True)
@@ -61,11 +58,6 @@ class Paths:
     def empty_student_states(self):
         self.empty_folder(self.student_states)
 
-    def empty_logs(self):
-        self.empty_folder(self.logging)
-
-    def empty_all(self, empty_logs=False):
+    def empty_all(self):
         self.empty_dataset()
         self.empty_student_root()
-        if empty_logs:
-            self.empty_logs()
