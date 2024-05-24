@@ -1,6 +1,7 @@
+from peft import LoraConfig, get_peft_model, TaskType
 from utils.dataset_utils import tokenize_dataset
-from classes.teacher_model import TeacherModel
-from classes.student_model import StudentModel
+from classes.teacher.model import TeacherModel
+from classes.student.model import StudentModel
 from classes.data_manager import H5DataManager
 from classes.paths import Paths
 from tqdm import tqdm
@@ -138,8 +139,8 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
     student.device = device
 
 
-def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision,
-                         decay_start, multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers):
+def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, 
+                        data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches):
     student.num_epochs = num_epochs
     student.num_warmup_steps = num_warmup_steps
     student.lr = lr
@@ -159,6 +160,15 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.save_final_state = save_final_state
     student.grad_checkpointing = grad_checkpointing
     student.freeze_layers = freeze_layers
+
+    # Dora
+    student.use_dora = use_gradual_dora
+    student.target_modules = target_modules
+    student.lora_rank = rank
+    student.lora_alpha = alpha
+    student.perma_merge_weight = perma_merge_weight
+    student.perma_merge_every_batches = perma_merge_every_n_batches
+    student.next_merge_step = perma_merge_every_n_batches * student.batch_size
 
 
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
@@ -263,7 +273,7 @@ def main():
     validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
-    student_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+    student_path = r"C:\Users\PC\Downloads\tiny-mistral-200M"
 
     ignore_model_type = True # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
 
@@ -276,7 +286,7 @@ def main():
     enable_topK = True
     save_topK = 200
     device = "cuda:1"
-    reserve_vram = [5, 0.5] # GB
+    reserve_vram = [6, 0.5] # GB
 
     # Collection settings
     encourage_eos = False
@@ -285,11 +295,19 @@ def main():
     num_epochs = 1
     num_warmup_steps = 200
 
-    batch_size = 3
-    grad_accum_batches = 1
+    ## Dora
+    use_gradual_dora = False
+    target_modules = [""]
+    rank = 512
+    alpha = 1024
+    perma_merge_weight = 0.1 # 0.1 = 10% gets merged every merging step
+    perma_merge_every_n_batches = 1
+
+    batch_size = 4
+    grad_accum_batches = 4
     grad_checkpointing = False
     temperature = 1
-    lr = 5e-6
+    lr = 5e-5
     decay_start = 0.9 # wsd only
 
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
@@ -305,7 +323,7 @@ def main():
     save_final_state = True
 
     # Student settings
-    freeze_layers = [".block_sparse_moe.gate"]
+    freeze_layers = []
     add_bos = True
     prompt_format = {
         "SYS_START": "#System:\n",
@@ -327,8 +345,8 @@ def main():
     prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type)
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
-    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start,
-                         multi_gpu, data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers)
+    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs, 
+                        custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches)
 
     sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
@@ -342,7 +360,7 @@ def main():
     ## Validation collecting loop
     
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
-    time.sleep(1)
+    time.sleep(2)
     data_manager = H5DataManager(paths.dataset, device)
 
     if collect_val:

@@ -69,10 +69,8 @@ class H5DataManager:
                         case 'clear_dataset':
                             ids_to_clear = [int(dataset_name.split('_')[1]) for dataset_name in hdf_file if dataset_name.startswith('convo_')]
                             self._clear_dataset(hdf_file, ids_to_clear)
-                            self.result_queue.put(True)
                         case 'clear_ids':
                             self._clear_dataset(hdf_file, data)
-                            self.result_queue.put(True)
                         case 'exit':
                             break
                             
@@ -238,7 +236,9 @@ class H5DataManager:
         self.got_task.set()
     
     def read_next_batch(self):
-        return self.result_queue.get()
+        result = self.result_queue.get()
+        print(result)
+        return result
 
     def write_batch(self, batch: list[Distribution]):
         self.queue.put(('put_batch', batch))
@@ -257,12 +257,10 @@ class H5DataManager:
     def purge_dataset(self):
         self.queue.put(('clear_dataset', None))
         self.got_task.set()
-        return self.result_queue.get()
     
     def delete_ids(self, ids: list[int]):
         self.queue.put(('clear_ids', ids))
         self.got_task.set()
-        return self.result_queue.get()
 
     def close(self):
         self.queue.put(('exit', None))

@@ -154,32 +154,28 @@ class BaseModel:
     def _prepare(self):
         self.model_name = os.path.basename(self.model_path)
 
-        if not os.path.exists(self.model_path) or not is_model_safetensors(self.model_path):
+        if os.path.exists(f"{self.model_path}_safetensors"):
             self.model_path = f"{self.model_path}_safetensors"
-
-            if not os.path.exists(self.model_path):
-                raise FileNotFoundError(f"Model path for {self.model_name} does not exist.")
 
         if not is_model_safetensors(self.model_path):
             self.model_path = convert_model(self.model_path)
 
-        if not self.student:
-            pf = load_prompt_format(self.model_path)
-            if pf is None:
-                print(f"\n{self.model_name} has no prompt format")
-                pf = input_prompt_format()
-                save_prompt_format(pf, self.model_path)
+        pf = load_prompt_format(self.model_path)
+        if pf is None:
+            print(f"\n{self.model_name} has no prompt format")
+            pf = input_prompt_format()
+            save_prompt_format(pf, self.model_path)
 
-            config = load_config(self.model_path)
-            if config is None:
-                print(f"\n{self.model_name} has no config")
-                config = input_config()
-                save_config(config, self.model_path)
+        config = load_config(self.model_path)
+        if config is None:
+            print(f"\n{self.model_name} has no config")
+            config = input_config()
+            save_config(config, self.model_path)
 
-            self.prompt_format = pf
-            self.batch_size = config.get('batch_size', 1)
-            self.add_bos = config.get('add_bos', True)
-            self.completion = config.get('completion', False)
+        self.prompt_format = pf
+        self.batch_size = config.get('batch_size', 1)
+        self.add_bos = config.get('add_bos', True)
+        self.completion = config.get('completion', False)
         
         self.seq_chunk_len = config.get('seq_chunk_len', 256)
         self.vocab_family = get_vocab_family(model_path=self.model_path)

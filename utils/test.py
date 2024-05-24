@@ -3,8 +3,13 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import math
 import torch.nn.functional as F
+from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
 import json
 import codecs
+from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
+from utils.dataset_utils import read_jsonl_lazy
+from tqdm import tqdm
+import multiprocessing as mp
 #from dataset_utils import H5Reader, H5Writer
 
 #d1 = np.random.random(size = (10,2))
@@ -334,4 +339,48 @@ def truncated_kldiv(student_probs, teacher_probs):
 #print(list[1:-1])
 #print(F.cross_entropy(log_soft_1, indices, reduction='none'))
 
-print(0.25 ** 0.5)
+tokenizer = AutoTokenizer.from_pretrained(r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T")
+
+dataset_path = r"C:\Users\PC\Desktop\output-mega_Deduped.jsonl"
+
+def read_jsonl_lazy(file_path):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        for line in file:
+            yield json.loads(line.strip())
+
+def count_tokens_in_convo(convo):
+    num_tokens_in_convo = 0
+    tokens_per_turn = []
+    for turn in convo:
+        turn_tokenized = tokenizer.tokenize(turn)
+        tokens_per_turn.append(len(turn_tokenized))
+        num_tokens_in_convo += len(turn_tokenized)
+    return num_tokens_in_convo, tokens_per_turn
+
+if __name__ == "__main__":
+    num_tokens = 0
+    tokens_per_turn = []
+    tokens_per_convo = []
+
+    with mp.Pool(mp.cpu_count()) as pool:
+        results = list(tqdm(pool.imap(count_tokens_in_convo, (json_obj["conversations"] for json_obj in read_jsonl_lazy(dataset_path))), desc="Counting tokens", smoothing=0.06))
+    
+    for num_tokens_in_convo, tokens in results:
+        tokens_per_convo.append(num_tokens_in_convo)
+        tokens_per_turn.extend(tokens)
+        num_tokens += num_tokens_in_convo
+
+    print(f"Total number of tokens: {num_tokens}")
+    print(f"Average number of tokens per conversation: {sum(tokens_per_convo) / len(tokens_per_convo)}")
+    print(f"Total number of turns: {len(tokens_per_turn)}")
+    print(f"Average number of tokens per turn: {sum(tokens_per_turn) / len(tokens_per_turn)}")
+
+    model = AutoModelForCausalLM.from_pretrained(r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T")
+    config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        inference_mode=False, 
+        r=8, 
+        lora_alpha=32, 
+        )
+    model = get_peft_model(model, config)
+    model.load

@@ -1,4 +1,5 @@
 from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_divergence
+from peft import get_peft_config, get_peft_model, LoraConfig, TaskType, PeftModel
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from classes.data_classes import ConvoTokenized
@@ -7,8 +8,10 @@ from multiprocessing import shared_memory
 from classes.base_model import BaseModel
 from classes.paths import Paths
 from typing import Optional
+from copy import deepcopy
 from tqdm import tqdm
 import torch.nn.functional as F
+import peft.utils as peft_utils
 import numpy as np
 import torch
 import wandb
@@ -16,15 +19,16 @@ import math
 import time
 import os
 
+
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['WANDB_SILENT'] = 'true'
-os.environ['ACCELERATE_USE_FSDP'] = '1'
 
 class StudentModel(BaseModel):
     def __init__(self, model_path: str, paths: Paths, add_bos: bool, prompt_format: dict, batch_size: int):
         super().__init__(model_path, student=True)
 
-        self.model: Optional[AutoModelForCausalLM] = None
+        self.model: Optional[AutoModelForCausalLM|PeftModel] = None
+        self.adapter = None
         self.tokenizer: Optional[AutoTokenizer] = None
         self.add_bos = add_bos
         self.prompt_format = prompt_format
@@ -35,8 +39,8 @@ class StudentModel(BaseModel):
         self.optimizer = None
         self.lr_scheduler_name = ""
         self.lr_scheduler = None
-        self.lr = 0
-        self.decay_start = 0 # wsd only
+        self.lr = 0.0
+        self.decay_start = 0.0 # wsd only
         self.final_lr = 5e-7 # wsd only
 
         self.num_epochs = 0
@@ -51,11 +55,22 @@ class StudentModel(BaseModel):
         self.num_trained_steps = 0
         self.next_val_step = 0
         self.next_accum_step = 0
+        self.next_merge_step = 0
         self.state_path = ""
         self.distr_device = ""
         self.saved_state = False
         self.val_batch_order_ids = []
+
+        # dora
+        self.use_dora = False
+        self.lora_alpha = 0.0
+        self.lora_rank = 0
+        self.target_modules = []
+        self.perma_merge_weight = 0.0
+        self.perma_merge_every_batches = 0
+        self.peft_config = None
         
+        # misc
         self.freeze_layers = []
         self.training_precision_name = ""
         self.custom_reduction = False
@@ -64,6 +79,7 @@ class StudentModel(BaseModel):
         self.save_final_state = False
         self.grad_checkpointing = False
         self.multi_gpu = False
+        
 
 
     def _set_postfix(self, postfix: str):
@@ -83,8 +99,8 @@ class StudentModel(BaseModel):
 
         precision_dict = {
             "fp16": torch.float16,
-            "4bit": torch.bfloat16,
-            "8bit": torch.bfloat16,
+            "4bit": torch.float16,
+            "8bit": torch.float16,
             "fp32": torch.float32,
             "bf16": torch.bfloat16
         }
@@ -95,22 +111,31 @@ class StudentModel(BaseModel):
 
         self.model = AutoModelForCausalLM.from_pretrained(
             path,
-            device_map="balanced_low_0" if self.multi_gpu else self.device,
+            device_map="balanced" if self.multi_gpu else self.device, #"balanced_low_0"
             torch_dtype=train_precision,
             load_in_4bit=self.training_precision_name == "4bit",
-            load_in_8bit=self.training_precision_name == "8bit",
-            attn_implementation="flash_attention_2"
+            load_in_8bit = self.training_precision_name == "8bit",
+            attn_implementation="flash_attention_2" if not self.use_dora else None
         )
-        self.model.train()
 
-        if self.grad_checkpointing:
-            self.model.gradient_checkpointing_enable()
+        if self.use_dora:
+            self.peft_config = LoraConfig(use_dora=True, task_type=TaskType.CAUSAL_LM, lora_alpha=self.lora_alpha, r=self.lora_rank)
 
-        if self.freeze_layers:
-            for name, param in self.model.named_parameters():
-                for freeze_layer in self.freeze_layers:
-                    if freeze_layer in name:
-                        param.requires_grad = False
+            self.model = get_peft_model(self.model, self.peft_config)
+
+            self.model.set_adapter("default")
+            self.model.print_trainable_parameters()
+
+        else:
+            self.model.train()
+            if self.grad_checkpointing:
+                self.model.gradient_checkpointing_enable()
+
+            if self.freeze_layers:
+                for name, param in self.model.named_parameters():
+                    for freeze_layer in self.freeze_layers:
+                        if freeze_layer in name:
+                            param.requires_grad = False
 
         self._release_postfix()
 
@@ -123,9 +148,9 @@ class StudentModel(BaseModel):
         self.optimizer = set_optimizer(
             self.model.parameters(),
             lr=self.lr,
-            betas=(0.7, 0.95),
+            betas=(0.9, 0.999),
             optimizer_name=self.optimizer_name,
-            weight_decay=2e-4
+            weight_decay=2e-5
         )
 
         self._release_postfix()
@@ -154,12 +179,9 @@ class StudentModel(BaseModel):
         if self.num_trained_steps < self.num_training_steps:
             self.paths.empty_student_states()
 
-        state = {
-            'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.lr_scheduler.state_dict()
-        }
-        torch.save(state, os.path.join(self.paths.student_states, "training_state.pt"))
+        torch.save(self.model.state_dict(), os.path.join(self.paths.student_states, "model_state.pt"))
+        torch.save(self.optimizer.state_dict(), os.path.join(self.paths.student_states, "optimizer_state.pt"))
+        torch.save(self.lr_scheduler.state_dict(), os.path.join(self.paths.student_states, "scheduler_state.pt"))
 
         self._release_postfix()
 
@@ -167,7 +189,12 @@ class StudentModel(BaseModel):
         self._set_postfix(f"Saving model at step {step}...")
 
         folder_name = f"{self.model_name}_step_{step}"
-        self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
+
+        if self.use_dora:
+            self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name, "adapter"))
+        else:
+            self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
+
         self.tokenizer.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
 
         self._release_postfix()
@@ -175,16 +202,30 @@ class StudentModel(BaseModel):
     def _load_state(self):
         self._set_postfix("Loading state...")
 
-        state = torch.load(os.path.join(self.paths.student_states, "training_state.pt"))
+        model_state = torch.load(os.path.join(self.paths.student_states, "model_state.pt"), map_location=self.device)
+        optimizer_state = torch.load(os.path.join(self.paths.student_states, "optimizer_state.pt"), map_location=self.device)
+        scheduler_state = torch.load(os.path.join(self.paths.student_states, "scheduler_state.pt"), map_location=self.device)
 
         self._load_model()
-        self.model.load_state_dict(state['model'], assign=True)
+        self.model.load_state_dict(model_state, assign=True)
 
         self._load_optimizer()
-        self.optimizer.load_state_dict(state['optimizer'])
+        self.optimizer.load_state_dict(optimizer_state)
 
         self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_training_steps, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
-        self.lr_scheduler.load_state_dict(state['scheduler'])
+        self.lr_scheduler.load_state_dict(scheduler_state)
+
+        self._release_postfix()
+
+    def _gradual_lora_merge(self):
+        self._set_postfix("Gradually Merging Lora...")
+
+        adapter = peft_utils.save_and_load.get_peft_model_state_dict(self.model)
+
+        diff = deepcopy(adapter)
+
+        for key, value in diff.items():
+            diff[key] = value * self.perma_merge_weight
 
         self._release_postfix()
 
@@ -219,7 +260,7 @@ class StudentModel(BaseModel):
 
         if self.saved_state:
             self._load_state()
-            os.remove(os.path.join(self.paths.student_states, "training_state.pt"))
+            self.paths.empty_student_states()
             self.saved_state = False
         else:
             self._load_model()
@@ -227,7 +268,7 @@ class StudentModel(BaseModel):
             self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_training_steps, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
 
         if self.num_trained_steps == 0:
-            self._validate(validation_data_manager)
+            self._validate_distillation(validation_data_manager)
 
 
         if full_collect:
@@ -238,7 +279,7 @@ class StudentModel(BaseModel):
             batched_chunk_convos, id_batches = self._construct_batches(dataset_chunk)
             data_list.append(batched_chunk_convos)
             data_manager.enqueue_get_batches(id_batches)
-
+                
             for i in range(self.num_epochs):
                 if data_manager_left_shuffles > 0:
                     self._reorder_dataset()
@@ -247,15 +288,14 @@ class StudentModel(BaseModel):
                     data_list.append(batched_chunk_convos)
                     data_manager.enqueue_get_batches(id_batches)
                     data_manager_left_shuffles -= 1
-                    
-                self._run_training_cycle(data_list.pop(0), data_manager, validation_data_manager)
+
+                self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager)
         else:
             self._reorder_dataset()
             dataset_chunk = self.dataset if full_collect else [convo for convo in self.dataset if convo.origin_convo_id in trainable_ids]
             batched_chunk_convos, id_batches = self._construct_batches(dataset_chunk)
             data_manager.enqueue_get_batches(id_batches)
-            self._run_training_cycle(batched_chunk_convos, data_manager, validation_data_manager)
-
+            self._run_distillation_cycle(batched_chunk_convos, data_manager, validation_data_manager)
 
         if not full_collect:
             self._save_state()
@@ -278,7 +318,8 @@ class StudentModel(BaseModel):
             self.logger.finish()
 
     # main training loop
-    def _run_training_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager):
+    def _run_distillation_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager):
+        print("Running distillation cycle")
         for batch_convos in batched_chunk_convos:
             num_steps = len(batch_convos)
             device = self.distr_device if self.distr_device else self.device
@@ -297,8 +338,10 @@ class StudentModel(BaseModel):
             batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
             batch_variance = torch.tensor(0.0).to(device, non_blocking=True)
             batch_certainty_loss = torch.tensor(0.0).to(device, non_blocking=True)
+            print("Done initializing tensors")
 
             batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
+            print("Done forward pass")
 
             if not self.distr_device:
                 self.distr_device = batch_logits.device
@@ -312,45 +355,50 @@ class StudentModel(BaseModel):
                 convo_content_tokens = torch.index_select(batch_tokenized_tensor[i], 0, content_indices)
 
                 combined_loss, cross_entropy_loss, custom_loss, kl_div, variance, certainty_loss = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, custom=self.custom_reduction)
+                print("Done calculate_divergence")
+                divisor = num_steps * self.num_grad_accum_batches
 
-                batch_combined_loss += combined_loss / num_steps * self.num_grad_accum_batches
-                batch_cross_entropy_loss += cross_entropy_loss / num_steps * self.num_grad_accum_batches
-                batch_custom_loss += custom_loss / num_steps * self.num_grad_accum_batches
-                batch_kl_div += kl_div / num_steps * self.num_grad_accum_batches
-                batch_variance += variance / num_steps * self.num_grad_accum_batches
-                batch_certainty_loss += certainty_loss / num_steps * self.num_grad_accum_batches
+                batch_combined_loss += combined_loss / divisor
+                batch_cross_entropy_loss += cross_entropy_loss / divisor
+                batch_custom_loss += custom_loss / divisor
+                batch_kl_div += kl_div / divisor
+                batch_variance += variance / divisor
+                batch_certainty_loss += certainty_loss / divisor
 
                 self.lr_scheduler.step()
-            
-            multiplier = 1 / self.num_grad_accum_batches
+                print("Done lr_scheduler step")
 
-            self.logger.log({"Loss/combined (custom + variance + certainty)": batch_combined_loss * multiplier}, step=self.num_trained_steps)
-            self.logger.log({"Loss/cross entropy": batch_cross_entropy_loss * multiplier}, step=self.num_trained_steps)
-            self.logger.log({"Loss/custom loss": batch_custom_loss * multiplier}, step=self.num_trained_steps)
-            self.logger.log({"Loss/KL divergence": batch_kl_div * multiplier}, step=self.num_trained_steps)
-            self.logger.log({"Loss/variance": batch_variance * multiplier}, step=self.num_trained_steps)
-            self.logger.log({"Loss/certainty loss": batch_certainty_loss * multiplier}, step=self.num_trained_steps)
+            self.logger.log({"Loss/combined (custom + variance + certainty)": batch_combined_loss}, step=self.num_trained_steps)
+            self.logger.log({"Loss/cross entropy": batch_cross_entropy_loss}, step=self.num_trained_steps)
+            self.logger.log({"Loss/custom loss": batch_custom_loss}, step=self.num_trained_steps)
+            self.logger.log({"Loss/KL divergence": batch_kl_div}, step=self.num_trained_steps)
+            self.logger.log({"Loss/variance": batch_variance}, step=self.num_trained_steps)
+            self.logger.log({"Loss/certainty loss": batch_certainty_loss}, step=self.num_trained_steps)
 
             self.logger.log({"Learning rate": self.lr_scheduler.get_last_lr()[0]}, step=self.num_trained_steps)
             self.progress_bar.update(num_steps)
-
+            print("Done logging")
+            
             batch_combined_loss.backward()
+            print("Done backward pass")
 
             self.num_trained_steps += num_steps
 
             if self.num_trained_steps >= self.next_accum_step:
                 self.optimizer.step()
+                print("Done optimizer step")
                 self.optimizer.zero_grad()
+                print("Done optimizer zero_grad")
                 self.next_accum_step += self.num_grad_accum_batches * self.batch_size
-
+                
             if (self.num_trained_steps >= self.next_save_step) and not (self.num_trained_steps >= self.num_training_steps):
                 self._save_model(self.num_trained_steps)
                 self.next_save_step += self.save_every_steps
 
             if self.num_trained_steps >= self.next_val_step:
-                self._validate(validation_data_manager)
+                self._validate_distillation(validation_data_manager)
 
-    def _validate(self, validation_data_manager: H5DataManager):
+    def _validate_distillation(self, validation_data_manager: H5DataManager):
         self.model.eval()
         device = self.distr_device if self.distr_device else self.device
         pbar = tqdm(total=self.validation_dataset_len, desc="Validating", leave=False, smoothing=0.06)
@@ -404,6 +452,18 @@ class StudentModel(BaseModel):
         pbar.close()
         self.model.train()
         self.next_val_step += self.validation_every_steps
+
+
+
+
+
+
+
+
+
+
+
+
 
     def get_outliers(self, data_manager: H5DataManager):
 
@@ -475,9 +535,6 @@ class StudentModel(BaseModel):
                 teacher_logprobs = F.log_softmax(convo_teacher_logits[:min_len], dim=-1)
                 
                 kl_div = F.kl_div(student_gathered, teacher_logprobs, reduction='none', log_target=True).sum(dim=-1)
-
-
-
 
                 pbar.update(1)
 

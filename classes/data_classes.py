@@ -27,5 +27,8 @@ class ConvoTokenized:
         self.cropped_end: bool = cropped_end
         self.length: int = len(tokenized) - padding
         self.len_content: int = sum([end - start for start, end in content_ranges])
-        self.content_sha: str = hashlib.sha256("".join(map(str, self.content_tokens)).encode()).hexdigest()
+        sha_content_tokens = ""
+        for start, end in content_ranges:
+            sha_content_tokens += "".join(map(str, tokenized[start+1:end]))
+        self.content_sha: str = hashlib.sha256(sha_content_tokens.encode()).hexdigest()
         self.origin_convo_id: int = convo_id
