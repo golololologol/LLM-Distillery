@@ -80,6 +80,7 @@ class StudentModel(BaseModel):
         self.save_final_state = False
         self.grad_checkpointing = False
         self.multi_gpu = False
+        self.wand_comment = ""
         
 
 
@@ -253,8 +254,9 @@ class StudentModel(BaseModel):
             validation_data_manager.read_only_mode(self.val_batch_order_ids)
 
         if self.logger is None:
-            comment = f"{self.model_name}_lr_{self.lr}_{time.strftime('%d-%m-%Y_%H-%M-%S')}"
-            self.logger = wandb.init(project="student_training", name=comment, config=self.__dict__, group=self.model_name, reinit=True)
+            name = f"{self.wand_comment} " if self.wand_comment else ""
+            name += f"{self.model_name} lr({self.lr}) ({time.strftime('%H-%M-%S %d-%m-%Y')})"
+            self.logger = wandb.init(project="student_training", name=name, config=self.__dict__, group=self.model_name, reinit=True)
 
         if self.tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)

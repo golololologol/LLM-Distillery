@@ -139,8 +139,10 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
     student.device = device
 
 
-def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs,
-                         custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear):
+def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
+                        validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules,
+                        rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear, wand_comment):
+    
     student.num_epochs = num_epochs
     student.num_warmup_steps = num_warmup_steps
     student.lr = lr
@@ -160,6 +162,7 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.save_final_state = save_final_state
     student.grad_checkpointing = grad_checkpointing
     student.freeze_layers = freeze_layers
+    student.wand_comment = wand_comment
 
     # Dora
     student.use_dora = use_gradual_dora
@@ -279,7 +282,8 @@ def main():
     student_path = r"C:\Users\PC\Downloads\tiny-mistral-200M"
 
     ignore_model_type = True # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
-    rebase_dataset = False # Only use if you know what you are doing. Will skip the check for conversation and teacher checking to use data from disk
+    rebase_dataset = False # Only use if you know what you are doing. Will skip the check for conversation and teacher match to use data from disk
+    wand_comment = "Test" # Comment for wandb: {comment}_ModelName_Time
 
     # General model settings
     context_len = 2*1024
@@ -302,8 +306,8 @@ def main():
     use_gradual_dora = False
     target_all_linear = True
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"] # Only used if target_all_linear is False
-    rank = 32
-    alpha = 32
+    rank = 256
+    alpha = 256
     perma_merge_weight = 0.1 # 0.1 = 10% gets merged every merging step
     perma_merge_every_n_batches = 1
 
@@ -349,8 +353,9 @@ def main():
     prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type)
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
-    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs, 
-                        custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear)
+    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
+                        validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora,
+                        target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear, wand_comment)
 
     sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
