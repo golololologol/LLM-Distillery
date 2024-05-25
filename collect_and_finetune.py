@@ -186,7 +186,7 @@ def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, in
             teacher.sort_dataset_by_map(validation_sorting_map, validation=True)
 
 
-def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: Paths) -> tuple[bool, bool]:
+def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: Paths, rebase_dataset: bool) -> tuple[bool, bool]:
 
     def check_sha(path, current_sha):
         if not os.path.exists(path):
@@ -201,10 +201,12 @@ def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: 
 
         for id, sha in current_sha.items():
             if id not in disk_sha:
-                print(f"ID {id} not found in disk sha")
+                if not rebase_dataset:
+                    print(f"ID {id} not found in disk sha")
                 return False
             if disk_sha[id] != sha:
-                print(f"Disk data ID {id} sha mismatch: {disk_sha[id]} vs {sha}")
+                if not rebase_dataset:
+                    print(f"Disk data ID {id} sha mismatch: {disk_sha[id]} vs {sha}")
                 return False
 
         return True
@@ -355,7 +357,7 @@ def main():
 
     loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb, enable_topK, save_topK)
 
-    collect, collect_val = collect_or_load(student, teachers, paths)
+    collect, collect_val = collect_or_load(student, teachers, paths, rebase_dataset)
     
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
     time.sleep(2)
