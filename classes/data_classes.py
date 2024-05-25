@@ -4,6 +4,9 @@ import torch
 
 
 class Distribution:
+    """
+    Class for probability distribution data.
+    """
     def __init__(self, origin_convo_id: int, length: int = 0, cropped_end: bool = False, content_ranges: list[tuple[int, int]] = [], tokenized: ndarray = None):
         self.distribution: ndarray|torch.Tensor = None
         self.length: int = length
@@ -19,6 +22,9 @@ class Distribution:
 
 
 class ConvoTokenized:
+    """
+    Class for tokenized conversation data.
+    """
     def __init__(self, tokenized: ndarray, content_ranges, padding, cropped_end, convo_id):
         self.tokenized: ndarray = tokenized
         self.content_ranges: list[tuple[int, int]] = content_ranges

@@ -10,6 +10,14 @@ import os
 
 
 class H5DataManager:
+    """
+    DataManager class for handling the distribution data in a HDF5 file.\n
+    This class is designed to be used with the `Distribution` class from `classes/data_classes.py`.\n
+    The data is stored in a HDF5 file with the following format:\n
+    - Each distribution is stored in a dataset with the name `convo_{convo_id}`.\n
+    - The TopK indices are stored in a dataset with the name `indices_{convo_id}`.\n
+    - The distributions are stored as log probabilities to minimize the effect of floating point precision errors.
+    """
     def __init__(self, dataset_path, device, max_queue_size=5):
         self.file_path = os.path.join(dataset_path, "distributions.hdf5")
         self.device = device
@@ -49,8 +57,7 @@ class H5DataManager:
                         case 'read_only_mode':
                             while not self.got_task.is_set():
                                 for batch_ids in data:
-
-                                    while self.queue.qsize() >= self.max_queue_size - 1:
+                                    while self.result_queue.full():
                                         if self.got_task.is_set():
                                             break
                                         time.sleep(0.1)
@@ -71,11 +78,6 @@ class H5DataManager:
                             self._clear_dataset(hdf_file, ids_to_clear)
                         case 'clear_ids':
                             self._clear_dataset(hdf_file, data)
-                        case 'exit':
-                            break
-                            
-                    if task == 'exit':
-                        break
                         
                 self.done_everything.set()
                 
@@ -225,22 +227,35 @@ class H5DataManager:
                 del hdf_file[f'indices_{id}']
 
         self.shared_batches = []
-        self.result_queue.put(True)
     
     def enqueue_get_batches(self, batches: list[list[int]]):
+        """
+        Enqueues a request to get padded batches from the dataset asynchronously.\n
+        Each subsequent batch can be retrieved with `read_next_batch`.
+        """
         self.queue.put(('get_batches', batches))
         self.got_task.set()
 
     def read_only_mode(self, batches: list[list[int]]):
+        """
+        Enables read-only mode for the datamanager.\n
+        It will iterate over the given batch ids indefinitely.
+        """
         self.queue.put(('read_only_mode', batches))
         self.got_task.set()
     
     def read_next_batch(self):
-        result = self.result_queue.get()
-        print(result)
-        return result
+        """
+        Returns the next batch of distributions from the dataset loaded asynchonously.\n
+        To use this function, you must call `enqueue_get_batches` first with a list of batch IDs as List[List[int]].
+        """
+        return self.result_queue.get()
 
     def write_batch(self, batch: list[Distribution]):
+        """
+        Writes a batch of distributions to the dataset.\n
+        Automatically merges the data if the convo_id already exists.
+        """
         self.queue.put(('put_batch', batch))
         self.got_task.set()
 
@@ -249,20 +264,29 @@ class H5DataManager:
         self.got_task.set()
 
     def get_dataset_ids(self) -> list[int]:
+        """
+        Returns a list of all conversation IDs in the dataset.
+        """
         self.done_everything.wait()
         self.queue.put(('get_available_ids', None))
         self.got_task.set()
         return self.result_queue.get()
 
     def purge_dataset(self):
+        """
+        Deletes all distributions from the dataset.
+        """
         self.queue.put(('clear_dataset', None))
         self.got_task.set()
+        self.done_everything.wait()
     
     def delete_ids(self, ids: list[int]):
+        """
+        Deletes distributions with the given IDs from the dataset.
+        """
         self.queue.put(('clear_ids', ids))
         self.got_task.set()
+        self.done_everything.wait()
 
     def close(self):
-        self.queue.put(('exit', None))
-        self.got_task.set()
-        self.loading_process.join()
+        self.loading_process.terminate()

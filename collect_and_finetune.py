@@ -139,8 +139,8 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
     student.device = device
 
 
-def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, 
-                        data_order, validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches):
+def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs,
+                         custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear):
     student.num_epochs = num_epochs
     student.num_warmup_steps = num_warmup_steps
     student.lr = lr
@@ -163,6 +163,7 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
 
     # Dora
     student.use_dora = use_gradual_dora
+    student.target_all_linear = target_all_linear
     student.target_modules = target_modules
     student.lora_rank = rank
     student.lora_alpha = alpha
@@ -294,17 +295,17 @@ def main():
     # Training settings
     num_epochs = 1
     num_warmup_steps = 200
-
     ## Dora
     use_gradual_dora = False
-    target_modules = [""]
-    rank = 512
-    alpha = 1024
+    target_all_linear = True
+    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"] # Only used if target_all_linear is False
+    rank = 32
+    alpha = 32
     perma_merge_weight = 0.1 # 0.1 = 10% gets merged every merging step
     perma_merge_every_n_batches = 1
 
     batch_size = 4
-    grad_accum_batches = 4
+    grad_accum_batches = 1
     grad_checkpointing = False
     temperature = 1
     lr = 5e-5
@@ -346,7 +347,7 @@ def main():
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs, 
-                        custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches)
+                        custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear)
 
     sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
@@ -410,9 +411,7 @@ def main():
     validation_data_manager.close()
     data_manager.close()
 
-    print("\nDone!\n")
-
-    input("Press Enter to close tensorboard and program...")
+    print("\nDone!")
 
     student.close()
 

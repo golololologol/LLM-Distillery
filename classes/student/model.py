@@ -65,6 +65,7 @@ class StudentModel(BaseModel):
         self.use_dora = False
         self.lora_alpha = 0.0
         self.lora_rank = 0
+        self.target_all_linear = False
         self.target_modules = []
         self.perma_merge_weight = 0.0
         self.perma_merge_every_batches = 0
@@ -119,12 +120,14 @@ class StudentModel(BaseModel):
         )
 
         if self.use_dora:
-            self.peft_config = LoraConfig(use_dora=True, task_type=TaskType.CAUSAL_LM, lora_alpha=self.lora_alpha, r=self.lora_rank)
+            target_modules = self.target_modules if not self.target_all_linear else "all-linear"
+            self.peft_config = LoraConfig(use_dora=True, task_type=TaskType.CAUSAL_LM, lora_alpha=self.lora_alpha, r=self.lora_rank, target_modules=target_modules)
 
             self.model = get_peft_model(self.model, self.peft_config)
 
-            self.model.set_adapter("default")
             self.model.print_trainable_parameters()
+
+            self.model.set_adapter("default")
 
         else:
             self.model.train()
@@ -319,7 +322,6 @@ class StudentModel(BaseModel):
 
     # main training loop
     def _run_distillation_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager):
-        print("Running distillation cycle")
         for batch_convos in batched_chunk_convos:
             num_steps = len(batch_convos)
             device = self.distr_device if self.distr_device else self.device
@@ -332,16 +334,11 @@ class StudentModel(BaseModel):
             batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
             batch_tokenized_tensor = torch.from_numpy(batch_tokenized).to(self.device, non_blocking=True)
 
-            batch_combined_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_custom_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_variance = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_certainty_loss = torch.tensor(0.0).to(device, non_blocking=True)
-            print("Done initializing tensors")
 
             batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
-            print("Done forward pass")
 
             if not self.distr_device:
                 self.distr_device = batch_logits.device
@@ -354,41 +351,30 @@ class StudentModel(BaseModel):
                 convo_teacher_logits = teacher_batch_raw[i]
                 convo_content_tokens = torch.index_select(batch_tokenized_tensor[i], 0, content_indices)
 
-                combined_loss, cross_entropy_loss, custom_loss, kl_div, variance, certainty_loss = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, custom=self.custom_reduction)
-                print("Done calculate_divergence")
+                cross_entropy_loss, custom_loss, kl_div = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, custom=self.custom_reduction)
+
                 divisor = num_steps * self.num_grad_accum_batches
 
-                batch_combined_loss += combined_loss / divisor
                 batch_cross_entropy_loss += cross_entropy_loss / divisor
                 batch_custom_loss += custom_loss / divisor
                 batch_kl_div += kl_div / divisor
-                batch_variance += variance / divisor
-                batch_certainty_loss += certainty_loss / divisor
 
                 self.lr_scheduler.step()
-                print("Done lr_scheduler step")
 
-            self.logger.log({"Loss/combined (custom + variance + certainty)": batch_combined_loss}, step=self.num_trained_steps)
-            self.logger.log({"Loss/cross entropy": batch_cross_entropy_loss}, step=self.num_trained_steps)
-            self.logger.log({"Loss/custom loss": batch_custom_loss}, step=self.num_trained_steps)
-            self.logger.log({"Loss/KL divergence": batch_kl_div}, step=self.num_trained_steps)
-            self.logger.log({"Loss/variance": batch_variance}, step=self.num_trained_steps)
-            self.logger.log({"Loss/certainty loss": batch_certainty_loss}, step=self.num_trained_steps)
+            self.logger.log({"Loss/cross entropy": batch_cross_entropy_loss * self.num_grad_accum_batches}, step=self.num_trained_steps)
+            self.logger.log({"Loss/custom loss": batch_custom_loss * self.num_grad_accum_batches}, step=self.num_trained_steps)
+            self.logger.log({"Loss/KL divergence": batch_kl_div * self.num_grad_accum_batches}, step=self.num_trained_steps)
 
             self.logger.log({"Learning rate": self.lr_scheduler.get_last_lr()[0]}, step=self.num_trained_steps)
             self.progress_bar.update(num_steps)
-            print("Done logging")
             
-            batch_combined_loss.backward()
-            print("Done backward pass")
+            batch_custom_loss.backward()
 
             self.num_trained_steps += num_steps
 
             if self.num_trained_steps >= self.next_accum_step:
                 self.optimizer.step()
-                print("Done optimizer step")
                 self.optimizer.zero_grad()
-                print("Done optimizer zero_grad")
                 self.next_accum_step += self.num_grad_accum_batches * self.batch_size
                 
             if (self.num_trained_steps >= self.next_save_step) and not (self.num_trained_steps >= self.num_training_steps):
@@ -404,12 +390,9 @@ class StudentModel(BaseModel):
         pbar = tqdm(total=self.validation_dataset_len, desc="Validating", leave=False, smoothing=0.06)
 
         with torch.no_grad():
-            batch_combined_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_custom_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_variance = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_certainty_loss = torch.tensor(0.0).to(device, non_blocking=True)
 
             for val_convo_batch in self.validation_dataset_batched:
                 sdh_mem_name, batch_shape, batch_dtype, val_batch_indices, batch_padding = validation_data_manager.read_next_batch()
@@ -427,27 +410,21 @@ class StudentModel(BaseModel):
                     val_content_indices = self._get_content_indices_tensor(val_convo.content_ranges)
 
                     val_convo_content_logits = torch.index_select(val_batch_logits[i], 0, val_content_indices) / self.temperature
-                    val_convo_teacher_logits = teacher_batch_raw[i]
+                    val_convo_teacher_logits = teacher_batch_raw[i][:batch_padding[i]]
                     val_convo_content_tokens = torch.index_select(val_batch_tokenized_tensor[i], 0, val_content_indices)
                     
-                    combined_loss, cross_entropy_loss, custom_loss, kl_div, variance, certainty_loss = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits[:batch_padding[i]], val_indices, val_convo_content_tokens, custom=self.custom_reduction)
+                    cross_entropy_loss, custom_loss, kl_div = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, val_indices, val_convo_content_tokens, custom=self.custom_reduction)
                     
-                    batch_combined_loss += combined_loss
                     batch_cross_entropy_loss += cross_entropy_loss
                     batch_custom_loss += custom_loss
                     batch_kl_div += kl_div
-                    batch_variance += variance
-                    batch_certainty_loss += certainty_loss
 
                 pbar.update(len(val_convo_batch))
 
         divisor = len(self.validation_dataset)
-        self.logger.log({"Val Loss/combined (custom + variance + certainty)": batch_combined_loss/divisor}, step=self.num_trained_steps)
         self.logger.log({"Val Loss/cross entropy": batch_cross_entropy_loss/divisor}, step=self.num_trained_steps)
         self.logger.log({"Val Loss/custom loss": batch_custom_loss/divisor}, step=self.num_trained_steps)
         self.logger.log({"Val Loss/KL divergence": batch_kl_div/divisor}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/variance": batch_variance/divisor}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/certainty loss": batch_certainty_loss/divisor}, step=self.num_trained_steps)
 
         pbar.close()
         self.model.train()

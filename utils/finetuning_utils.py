@@ -15,6 +15,11 @@ sys.stdout = sys.__stdout__
 
 
 class WarmupStableDecayLR(LRScheduler):
+    """
+    Implementation of Warmup Stable Decay learning rate scheduler from MiniCPM.\n
+    Has custom cosine warmum instead of linear.\n
+    Paper: https://arxiv.org/pdf/2404.06395
+    """
     def __init__(self, optimizer, total_steps, warmup_steps, decay_start_percentage, final_lr, last_epoch=-1, verbose=False):
         self.total_steps = total_steps
         self.warmup_steps = warmup_steps
@@ -29,7 +34,7 @@ class WarmupStableDecayLR(LRScheduler):
         if self.last_epoch < self.warmup_steps:
             progress = self.last_epoch / self.warmup_steps
             cosine = (0.5 * (1 + math.cos(math.pi + progress * math.pi)))
-            return [max((self.constant_lr * cosine), 1e-7) for group in self.optimizer.param_groups]
+            return [self.constant_lr * cosine for group in self.optimizer.param_groups]
         elif self.warmup_steps <= self.last_epoch <= self.decay_start_step:
             return [self.constant_lr for group in self.optimizer.param_groups]
         elif self.decay_start_step < self.last_epoch < self.total_steps:
@@ -60,33 +65,18 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
                 kl_div = kl_div_raw.mean()
 
         return kl_div
-    
-    def inv_sum_func(student_logprobs: torch.Tensor):
-        return (1 - student_logprobs.exp().sum(dim=-1).mean())
-
-    def certainty_loss_func(inv_sum: torch.Tensor, N_remaining: int, epsilon=1.7e-6, zero_tensor: torch.Tensor = None):
-        if inv_sum > 1e-5:
-            return inv_sum * (inv_sum / (N_remaining * epsilon)).log()
-        else:
-            return zero_tensor
         
     def abomination_loss(kl_div_per_token: torch.Tensor, alpha: float):
         weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha)
 
-        variance = kl_div_per_token.var()
-
         loss = (kl_div_per_token * weights).mean()
 
-        return loss, variance
+        return loss
 
     min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
-    inv_sum = torch.tensor(0.0, dtype=torch.float32).to(student_logits.device, non_blocking=True)
-    certainty_loss = torch.tensor(0.0, dtype=torch.float32).to(student_logits.device, non_blocking=True)
 
     student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
     teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
-
-    N_remaining = student_logprobs.size(-1) - teacher_logprobs.size(-1)
 
     cross_entropy_loss = F.cross_entropy(student_logits[:min_len - 1], convo_content_tokens[1:min_len])
 
@@ -94,32 +84,13 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
         kl_div = total_kl_div(student_logprobs, teacher_logprobs, custom=custom, per_token=True)
         
     else:
-        student_gathered = F.log_softmax(torch.gather(student_logprobs, dim=-1, index=indices[:min_len]), dim=-1)
-
-        inv_sum = inv_sum_func(student_gathered)
-
-        certainty_loss = certainty_loss_func(inv_sum, N_remaining, zero_tensor=certainty_loss)
+        student_gathered = torch.gather(student_logprobs, dim=-1, index=indices[:min_len])
 
         kl_div = total_kl_div(student_gathered, teacher_logprobs, custom=custom, per_token=True)
 
-    custom_loss, variance = abomination_loss(kl_div, 2)
+    custom_loss = abomination_loss(kl_div, 2)
 
-    custom_loss_divis = 1
-    certainty_loss_divis = 1
-    total_divis = 1
-
-    combined_loss = (custom_loss/custom_loss_divis + certainty_loss/certainty_loss_divis) / total_divis
-
-    return combined_loss, cross_entropy_loss, custom_loss, kl_div.mean(), variance, certainty_loss
-
-
-def scale_temperature(current_step, num_training_steps, temperature):
-    temp_scaling_steps = num_training_steps / 2
-    if current_step < temp_scaling_steps and temperature > 1:
-        decay_rate = -np.log(1e-2 / (temperature - 1)) / temp_scaling_steps
-        return 1 + (temperature - 1) * np.exp(-decay_rate * current_step)
-    else:
-        return 1
+    return cross_entropy_loss, custom_loss, kl_div.mean()
 
 
 def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay=1e-2, momentum=0.9, nesterov=True):

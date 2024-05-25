@@ -119,6 +119,9 @@ def input_config():
 
 
 class BaseModel:
+    """
+    Base class for all models, contains common attributes and methods.
+    """
     def __init__(self, model_path: str, student: bool = False):
         self.student: bool = student
         self.model_path: str = model_path
