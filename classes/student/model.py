@@ -255,7 +255,7 @@ class StudentModel(BaseModel):
 
         if self.logger is None:
             name = f"{self.wand_comment} " if self.wand_comment else ""
-            name += f"{self.model_name} lr({self.lr}) ({time.strftime('%H-%M-%S %d-%m-%Y')})"
+            name += f"{self.model_name} lr({self.lr}) ({time.strftime('%H:%M:%S %d.%m.%Y')})"
             self.logger = wandb.init(project="student_training", name=name, config=self.__dict__, group=self.model_name, reinit=True)
 
         if self.tokenizer is None:
