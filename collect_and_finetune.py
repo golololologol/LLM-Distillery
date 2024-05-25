@@ -277,6 +277,7 @@ def main():
     student_path = r"C:\Users\PC\Downloads\tiny-mistral-200M"
 
     ignore_model_type = True # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
+    rebase_dataset = False # Only use if you know what you are doing. Will skip the check for conversation and teacher checking to use data from disk
 
     # General model settings
     context_len = 2*1024
@@ -355,16 +356,15 @@ def main():
     loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb, enable_topK, save_topK)
 
     collect, collect_val = collect_or_load(student, teachers, paths)
-
-    # Main loop
-
-    ## Validation collecting loop
     
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
     time.sleep(2)
     data_manager = H5DataManager(paths.dataset, device)
 
-    if collect_val:
+    # Main loop
+
+    ## Validation collecting loop
+    if collect_val and not rebase_dataset:
         print("Collecting validation data...")
 
         validation_data_manager.purge_dataset()
@@ -377,8 +377,12 @@ def main():
     else:
         print("Using data on disk for validation...")
     
+        if rebase_dataset:
+            save_dataset_metadata(paths.dataset_validation, teachers, student, validation=True)
+    
+
     ## Training collecting loop
-    if collect:
+    if collect and not rebase_dataset:
         print("Collecting all data..." if full_collect else "Collecting data in chunks...")
 
         data_manager.purge_dataset()
@@ -406,6 +410,10 @@ def main():
                     teacher.new_epoch()
     else:
         print("Using data on disk for training...")
+
+        if rebase_dataset:
+            save_dataset_metadata(paths.dataset, teachers, student)
+
         student.train_chunk(data_manager, validation_data_manager, True)
 
     validation_data_manager.close()
