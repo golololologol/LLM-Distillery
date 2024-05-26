@@ -93,7 +93,7 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
     return cross_entropy_loss, custom_loss, kl_div.mean()
 
 
-def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay=1e-2, momentum=0.9, nesterov=True):
+def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay=1e-2, momentum=0.6, nesterov=True):
     optimizer_name = optimizer_name.lower()
     
     optimizer_classes = {
@@ -104,8 +104,11 @@ def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay
         "paged_adamw": bnb.optim.PagedAdam,
         "paged_adamw8bit": bnb.optim.PagedAdamW8bit,
         "paged_adamw32bit": bnb.optim.PagedAdamW32bit,
-        "sgd": torch.optim.SGD,
+        "sgd": bnb.optim.SGD,
+        "rmsprop": bnb.optim.RMSprop,
+        "rmsprop8bit": bnb.optim.RMSprop8bit,
         "rmsprop32bit": bnb.optim.RMSprop32bit,
+        "adagrad": bnb.optim.Adagrad
     }
 
     if optimizer_name in optimizer_classes:
@@ -113,8 +116,10 @@ def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay
             return optimizer_classes[optimizer_name](model_parameters, lr=lr, betas=betas, weight_decay=weight_decay, eps=1e-8)
         elif optimizer_name in ["sgd"]:
             return optimizer_classes[optimizer_name](model_parameters, lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov)
-        elif optimizer_name in ["rmsprop32bit"]:
+        elif optimizer_name in ["rmsprop", "rmsprop8bit", "rmsprop32bit"]:
             return optimizer_classes[optimizer_name](model_parameters, lr=lr, weight_decay=weight_decay, alpha=0.9, eps=1e-10, centered=True)
+        elif optimizer_name in ["adagrad"]:
+            return optimizer_classes[optimizer_name](model_parameters, lr=lr, weight_decay=weight_decay)
     else:
         raise ValueError(f"Invalid optimizer name: {optimizer_name}\nAvailable optimizers: {list(optimizer_classes.keys())}")
     

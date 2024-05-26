@@ -4,7 +4,8 @@ import os
 
 
 class Paths:
-    '''
+    """Class to manage all paths in the project.
+    
     cache\n
     ├─ dataset\n
     │   └─ validation\n
@@ -12,7 +13,7 @@ class Paths:
         ├─ states\n
         ├─ gguf\n
         └─ trained\n
-    '''
+    """
 
     def __init__(self, cache, clean_start: bool = False):
         self.cache: str = cache

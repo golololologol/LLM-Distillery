@@ -80,9 +80,8 @@ class StudentModel(BaseModel):
         self.save_final_state = False
         self.grad_checkpointing = False
         self.multi_gpu = False
-        self.wand_comment = ""
+        self.wandb_comment = ""
         
-
 
     def _set_postfix(self, postfix: str):
         self.progress_bar.set_postfix_str(postfix)
@@ -117,18 +116,28 @@ class StudentModel(BaseModel):
             torch_dtype=train_precision,
             load_in_4bit=self.training_precision_name == "4bit",
             load_in_8bit = self.training_precision_name == "8bit",
-            attn_implementation="flash_attention_2" if not self.use_dora else None
+            attn_implementation="flash_attention_2" if not self.use_dora else "sdpa"
         )
 
         if self.use_dora:
             target_modules = self.target_modules if not self.target_all_linear else "all-linear"
-            self.peft_config = LoraConfig(use_dora=True, task_type=TaskType.CAUSAL_LM, lora_alpha=self.lora_alpha, r=self.lora_rank, target_modules=target_modules)
+            self.peft_config = LoraConfig(
+                use_dora=True,
+                task_type=TaskType.CAUSAL_LM, 
+                lora_alpha=self.lora_alpha, 
+                r=self.lora_rank, 
+                target_modules=target_modules, 
+                bias="none"
+            )
 
             self.model = get_peft_model(self.model, self.peft_config)
 
             self.model.print_trainable_parameters()
 
             self.model.set_adapter("default")
+
+            if not (self.training_precision_name == "8bit" or self.training_precision_name == "4bit"):
+                self.model.half()
 
         else:
             self.model.train()
@@ -141,6 +150,7 @@ class StudentModel(BaseModel):
                         if freeze_layer in name:
                             param.requires_grad = False
 
+        torch.cuda.empty_cache()
         self._release_postfix()
 
     def _unload_model(self):
@@ -152,9 +162,9 @@ class StudentModel(BaseModel):
         self.optimizer = set_optimizer(
             self.model.parameters(),
             lr=self.lr,
-            betas=(0.9, 0.999),
+            betas=(0.2, 0.4),
             optimizer_name=self.optimizer_name,
-            weight_decay=2e-5
+            weight_decay=2e-6
         )
 
         self._release_postfix()
@@ -196,6 +206,7 @@ class StudentModel(BaseModel):
 
         if self.use_dora:
             self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name, "adapter"))
+            self.model.base_model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
         else:
             self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
 
@@ -221,17 +232,28 @@ class StudentModel(BaseModel):
 
         self._release_postfix()
 
-    def _gradual_lora_merge(self):
-        self._set_postfix("Gradually Merging Lora...")
+    def _gradual_lora_merge(self, adapter_name="default"):
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if "base_layer" in name:
+                    lora_A_name = name.replace("base_layer", f"lora_A.{adapter_name}")
+                    lora_B_name = name.replace("base_layer", f"lora_B.{adapter_name}")
+                    magnitude_name = name.replace("base_layer.weight", f"lora_magnitude_vector.{adapter_name}")
 
-        adapter = peft_utils.save_and_load.get_peft_model_state_dict(self.model)
+                    scaler = math.pow(1 - (self.perma_merge_weight/6), 1/3)
+                    magnitude_scaler = math.pow(1 - (self.perma_merge_weight/4), 1/3)
 
-        diff = deepcopy(adapter)
+                    lora_A = self.model.get_parameter(lora_A_name)
+                    lora_B = self.model.get_parameter(lora_B_name)
+                    magnitude = self.model.get_parameter(magnitude_name)
 
-        for key, value in diff.items():
-            diff[key] = value * self.perma_merge_weight
+                    lora_weights = torch.matmul(lora_B, lora_A)
 
-        self._release_postfix()
+                    param.add_(self.perma_merge_weight * (lora_weights * magnitude.view(-1, 1)))
+                    lora_A.mul_(scaler)
+                    lora_B.mul_(scaler)
+                    magnitude.mul_(magnitude_scaler)
+                
 
     def _construct_batches(self, dataset_chunk: list[ConvoTokenized]) -> tuple[list[list[ConvoTokenized]], list[list[int]]]:
         num_batches = math.ceil(len(dataset_chunk) / self.batch_size)
@@ -254,9 +276,9 @@ class StudentModel(BaseModel):
             validation_data_manager.read_only_mode(self.val_batch_order_ids)
 
         if self.logger is None:
-            name = f"{self.wand_comment} " if self.wand_comment else ""
+            name = f"{self.wandb_comment} " if self.wandb_comment else ""
             name += f"{self.model_name} lr({self.lr}) ({time.strftime('%d.%m.%Y / %H:%M:%S')})"
-            self.logger = wandb.init(project="student_training", name=name, config=self.__dict__, group=self.model_name, reinit=True)
+            self.logger = wandb.init(project="student_training", name=name, config=self.__dict__, group=self.model_name, reinit=True, dir=self.paths.cache)
 
         if self.tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
@@ -275,7 +297,7 @@ class StudentModel(BaseModel):
         if self.num_trained_steps == 0:
             self._validate_distillation(validation_data_manager)
 
-
+        # Main training loop
         if full_collect:
             data_manager_left_shuffles = self.num_epochs - 1
             data_list = []
@@ -378,6 +400,10 @@ class StudentModel(BaseModel):
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 self.next_accum_step += self.num_grad_accum_batches * self.batch_size
+
+            if (self.num_trained_steps >= self.next_merge_step and self.use_dora) and self.num_trained_steps >= self.num_warmup_steps:
+                self._gradual_lora_merge()
+                self.next_merge_step += + self.perma_merge_every_batches * self.batch_size
                 
             if (self.num_trained_steps >= self.next_save_step) and not (self.num_trained_steps >= self.num_training_steps):
                 self._save_model(self.num_trained_steps)

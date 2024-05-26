@@ -339,48 +339,23 @@ def truncated_kldiv(student_probs, teacher_probs):
 #print(list[1:-1])
 #print(F.cross_entropy(log_soft_1, indices, reduction='none'))
 
-tokenizer = AutoTokenizer.from_pretrained(r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T")
+scaler = math.sqrt(0.5)
+print(math.pow(0.70, 1/8))
+weights = torch.tensor(([0.1, 0.2, 0.3, 0.4]), dtype=torch.float32)
 
-dataset_path = r"C:\Users\PC\Desktop\output-mega_Deduped.jsonl"
+lora_a = torch.tensor(([0.1, 0.2, 0.2, 0.1]), dtype=torch.float32)
+lora_b = torch.tensor(([0.1, 0.2222, 0.3, 0.4]), dtype=torch.float32)
 
-def read_jsonl_lazy(file_path):
-    with open(file_path, 'r', encoding='utf-8') as file:
-        for line in file:
-            yield json.loads(line.strip())
+lora_weights = torch.matmul(lora_a, lora_b)
 
-def count_tokens_in_convo(convo):
-    num_tokens_in_convo = 0
-    tokens_per_turn = []
-    for turn in convo:
-        turn_tokenized = tokenizer.tokenize(turn)
-        tokens_per_turn.append(len(turn_tokenized))
-        num_tokens_in_convo += len(turn_tokenized)
-    return num_tokens_in_convo, tokens_per_turn
+print(weights + lora_weights)
 
-if __name__ == "__main__":
-    num_tokens = 0
-    tokens_per_turn = []
-    tokens_per_convo = []
+merged_weights = weights + 0.5 * lora_weights
+print(merged_weights)
 
-    with mp.Pool(mp.cpu_count()) as pool:
-        results = list(tqdm(pool.imap(count_tokens_in_convo, (json_obj["conversations"] for json_obj in read_jsonl_lazy(dataset_path))), desc="Counting tokens", smoothing=0.06))
-    
-    for num_tokens_in_convo, tokens in results:
-        tokens_per_convo.append(num_tokens_in_convo)
-        tokens_per_turn.extend(tokens)
-        num_tokens += num_tokens_in_convo
+adjusted_lora_a = lora_a * scaler
+adjusted_lora_b = lora_b * scaler
 
-    print(f"Total number of tokens: {num_tokens}")
-    print(f"Average number of tokens per conversation: {sum(tokens_per_convo) / len(tokens_per_convo)}")
-    print(f"Total number of turns: {len(tokens_per_turn)}")
-    print(f"Average number of tokens per turn: {sum(tokens_per_turn) / len(tokens_per_turn)}")
+adjusted_lora_weights = torch.matmul(adjusted_lora_a, adjusted_lora_b)
 
-    model = AutoModelForCausalLM.from_pretrained(r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T")
-    config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        inference_mode=False, 
-        r=8, 
-        lora_alpha=32, 
-        )
-    model = get_peft_model(model, config)
-    model.load
+print(merged_weights + adjusted_lora_weights)

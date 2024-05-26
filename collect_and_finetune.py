@@ -141,18 +141,18 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
 
 def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
                         validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules,
-                        rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear, wand_comment):
+                        rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear, wandb_comment):
     
     student.num_epochs = num_epochs
     student.num_warmup_steps = num_warmup_steps
     student.lr = lr
-    student.lr_scheduler_name = lr_scheduler
-    student.optimizer_name = optimizer
+    student.lr_scheduler_name = lr_scheduler.lower()
+    student.optimizer_name = optimizer.lower()
     student.num_grad_accum_batches = grad_accum_batches
-    student.training_precision_name = training_precision
+    student.training_precision_name = training_precision.lower()
     student.decay_start = decay_start
     student.multi_gpu = multi_gpu
-    student.data_order = data_order
+    student.data_order = data_order.lower()
     student.validation_every_steps = validate_every_n_epochs * student.dataset_len
     student.next_accum_step = grad_accum_batches * student.batch_size
     student.num_training_steps = num_epochs * student.dataset_len
@@ -162,7 +162,7 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.save_final_state = save_final_state
     student.grad_checkpointing = grad_checkpointing
     student.freeze_layers = freeze_layers
-    student.wand_comment = wand_comment
+    student.wandb_comment = wandb_comment
 
     # Dora
     student.use_dora = use_gradual_dora
@@ -172,12 +172,12 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.lora_alpha = alpha
     student.perma_merge_weight = perma_merge_weight
     student.perma_merge_every_batches = perma_merge_every_n_batches
-    student.next_merge_step = perma_merge_every_n_batches * student.batch_size
+    student.next_merge_step = perma_merge_every_n_batches * student.batch_size + num_warmup_steps
 
 
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
     for teacher in teachers:
-        setattr(teacher, param_name, param_value)
+        setattr(teacher, param_name.lower(), param_value)
 
 
 def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, int], validation_sorting_map: dict[int, int]):
@@ -283,7 +283,6 @@ def main():
 
     ignore_model_type = True # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
     rebase_dataset = False # Only use if you know what you are doing. Will skip the check for conversation and teacher match to use data from disk
-    wand_comment = "Test" # Comment for wandb: {comment}_ModelName_Time
 
     # General model settings
     context_len = 2*1024
@@ -300,12 +299,13 @@ def main():
     encourage_eos = False
 
     # Training settings
-    num_epochs = 1
-    num_warmup_steps = 200
+    num_epochs = 3
+    num_warmup_steps = 50
+
     ## Dora
-    use_gradual_dora = False
+    use_gradual_dora = True
     target_all_linear = True
-    target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"] # Only used if target_all_linear is False
+    target_modules = [] # Only used if target_all_linear is False
     rank = 256
     alpha = 256
     perma_merge_weight = 0.1 # 0.1 = 10% gets merged every merging step
@@ -315,20 +315,21 @@ def main():
     grad_accum_batches = 1
     grad_checkpointing = False
     temperature = 1
-    lr = 5e-5
+    lr = 5e-4
     decay_start = 0.9 # wsd only
 
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
-    optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop32bit"
-    data_order = "shuffle" # "shuffle", "native", "sorted"
-    training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
+    optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
+    data_order = "sorted" # "shuffle", "native", "sorted"
+    training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     
     validate_every_n_epochs = 0.5
-    save_student_every_n_epochs = 1
+    save_student_every_n_epochs = 4
 
     multi_gpu = True
     custom_reduction = True
     save_final_state = True
+    wandb_comment = f"Grad. Dora {perma_merge_weight*100}% ({perma_merge_every_n_batches})" # Comment for wandb: {comment} ModelName lr(lr) (Date/Time)
 
     # Student settings
     freeze_layers = []
@@ -355,7 +356,7 @@ def main():
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
                         validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora,
-                        target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear, wand_comment)
+                        target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear, wandb_comment)
 
     sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
