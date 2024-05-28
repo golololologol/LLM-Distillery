@@ -70,6 +70,7 @@ class StudentModel(BaseModel):
         self.perma_merge_weight = 0.0
         self.perma_merge_every_batches = 0
         self.peft_config = None
+        self.copy_dict = {}
         
         # misc
         self.freeze_layers = []
@@ -116,13 +117,12 @@ class StudentModel(BaseModel):
             torch_dtype=train_precision,
             load_in_4bit=self.training_precision_name == "4bit",
             load_in_8bit = self.training_precision_name == "8bit",
-            attn_implementation="flash_attention_2" if not self.use_dora else "sdpa"
+            attn_implementation="flash_attention_2"
         )
 
         if self.use_dora:
             target_modules = self.target_modules if not self.target_all_linear else "all-linear"
             self.peft_config = LoraConfig(
-                use_dora=True,
                 task_type=TaskType.CAUSAL_LM, 
                 lora_alpha=self.lora_alpha, 
                 r=self.lora_rank, 
@@ -138,6 +138,22 @@ class StudentModel(BaseModel):
 
             if not (self.training_precision_name == "8bit" or self.training_precision_name == "4bit"):
                 self.model.half()
+
+            with torch.no_grad():
+                for name, param in self.model.named_parameters():
+                    if "base_layer" in name:
+                        lora_A_name = name.replace("base_layer", f"lora_A.default")
+                        lora_B_name = name.replace("base_layer", f"lora_B.default")
+
+                        lora_A = self.model.get_parameter(lora_A_name)
+                        lora_B = self.model.get_parameter(lora_B_name)
+
+                        # Create copies of the parameters
+                        lora_A_copy = torch.nn.Parameter(lora_A.clone(), requires_grad=False)
+                        lora_B_copy = torch.nn.Parameter(lora_B.clone(), requires_grad=False)
+
+                        self.copy_dict[lora_A_name] = lora_A_copy
+                        self.copy_dict[lora_B_name] = lora_B_copy
 
         else:
             self.model.train()
@@ -162,9 +178,9 @@ class StudentModel(BaseModel):
         self.optimizer = set_optimizer(
             self.model.parameters(),
             lr=self.lr,
-            betas=(0.2, 0.4),
+            betas=(0, 0),
             optimizer_name=self.optimizer_name,
-            weight_decay=2e-6
+            weight_decay=2e-8
         )
 
         self._release_postfix()
@@ -232,28 +248,32 @@ class StudentModel(BaseModel):
 
         self._release_postfix()
 
+    def rescale_optimizer_state(self, params, scale_factor):
+        for param in params:
+            if param in self.optimizer.state:
+                for state_key in self.optimizer.state[param]:
+                    self.optimizer.state[param][state_key] *= scale_factor
+
     def _gradual_lora_merge(self, adapter_name="default"):
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if "base_layer" in name:
                     lora_A_name = name.replace("base_layer", f"lora_A.{adapter_name}")
                     lora_B_name = name.replace("base_layer", f"lora_B.{adapter_name}")
-                    magnitude_name = name.replace("base_layer.weight", f"lora_magnitude_vector.{adapter_name}")
-
-                    scaler = math.pow(1 - (self.perma_merge_weight/6), 1/3)
-                    magnitude_scaler = math.pow(1 - (self.perma_merge_weight/4), 1/3)
 
                     lora_A = self.model.get_parameter(lora_A_name)
+                    lora_A_copy = self.copy_dict[lora_A_name]
                     lora_B = self.model.get_parameter(lora_B_name)
-                    magnitude = self.model.get_parameter(magnitude_name)
+                    lora_B_copy = self.copy_dict[lora_B_name]
 
-                    lora_weights = torch.matmul(lora_B, lora_A)
+                    lora_A_diff = lora_A - lora_A_copy
+                    lora_B_diff = lora_B - lora_B_copy
 
-                    param.add_(self.perma_merge_weight * (lora_weights * magnitude.view(-1, 1)))
-                    lora_A.mul_(scaler)
-                    lora_B.mul_(scaler)
-                    magnitude.mul_(magnitude_scaler)
-                
+                    lora_diff_weights = torch.matmul(lora_B_diff, lora_A_diff)
+
+                    param.add_(self.perma_merge_weight * lora_diff_weights)
+                    self.copy_dict[lora_A_name] = lora_A.clone()
+                    self.copy_dict[lora_B_name] = lora_B.clone()
 
     def _construct_batches(self, dataset_chunk: list[ConvoTokenized]) -> tuple[list[list[ConvoTokenized]], list[list[int]]]:
         num_batches = math.ceil(len(dataset_chunk) / self.batch_size)
@@ -401,7 +421,7 @@ class StudentModel(BaseModel):
                 self.optimizer.zero_grad()
                 self.next_accum_step += self.num_grad_accum_batches * self.batch_size
 
-            if (self.num_trained_steps >= self.next_merge_step and self.use_dora) and self.num_trained_steps >= self.num_warmup_steps:
+            if self.num_trained_steps >= self.next_merge_step and self.use_dora:
                 self._gradual_lora_merge()
                 self.next_merge_step += + self.perma_merge_every_batches * self.batch_size
                 
@@ -409,7 +429,7 @@ class StudentModel(BaseModel):
                 self._save_model(self.num_trained_steps)
                 self.next_save_step += self.save_every_steps
 
-            if self.num_trained_steps >= self.next_val_step:
+            if self.num_trained_steps >= self.next_val_step or self.num_trained_steps >= self.dataset_len:
                 self._validate_distillation(validation_data_manager)
 
     def _validate_distillation(self, validation_data_manager: H5DataManager):

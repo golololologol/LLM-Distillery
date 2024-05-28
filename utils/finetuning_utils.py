@@ -93,7 +93,7 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
     return cross_entropy_loss, custom_loss, kl_div.mean()
 
 
-def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay=1e-2, momentum=0.6, nesterov=True):
+def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay=1e-2, momentum=0.01, nesterov=False):
     optimizer_name = optimizer_name.lower()
     
     optimizer_classes = {

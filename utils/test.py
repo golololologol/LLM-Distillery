@@ -339,23 +339,29 @@ def truncated_kldiv(student_probs, teacher_probs):
 #print(list[1:-1])
 #print(F.cross_entropy(log_soft_1, indices, reduction='none'))
 
-scaler = math.sqrt(0.5)
-print(math.pow(0.70, 1/8))
-weights = torch.tensor(([0.1, 0.2, 0.3, 0.4]), dtype=torch.float32)
+# Example tensors
+weights = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float32)
+lora_a = torch.tensor([0.1, 0.2, 0.2, 0.1], dtype=torch.float32)
+lora_b = torch.tensor([0.1, 0.2222, 0.3, 0.4], dtype=torch.float32)
+magnitude = torch.tensor([0.4, 0.922, 0.1, 0.74], dtype=torch.float32)
 
-lora_a = torch.tensor(([0.1, 0.2, 0.2, 0.1]), dtype=torch.float32)
-lora_b = torch.tensor(([0.1, 0.2222, 0.3, 0.4]), dtype=torch.float32)
+# Compute the original LoRA contribution
+lora_weights = torch.matmul(lora_a, lora_b) * magnitude
 
-lora_weights = torch.matmul(lora_a, lora_b)
+# Correct final weights with the original LoRA applied
+correct_lora_applied = weights + lora_weights
 
-print(weights + lora_weights)
+# Merge 10% of the LoRA layers into the base weight
+merged_weights = weights + 0.1 * lora_weights
 
-merged_weights = weights + 0.5 * lora_weights
-print(merged_weights)
+# Update the remaining LoRA layers to reflect 90% contribution
+adjusted_magnitude = magnitude * 0.9
 
-adjusted_lora_a = lora_a * scaler
-adjusted_lora_b = lora_b * scaler
+# Compute the adjusted LoRA contribution
+adjusted_lora_weights = torch.matmul(lora_b, lora_a) * adjusted_magnitude
 
-adjusted_lora_weights = torch.matmul(adjusted_lora_a, adjusted_lora_b)
+# Verify the merged weights and adjusted LoRA weights
+final_weights = merged_weights + adjusted_lora_weights
 
-print(merged_weights + adjusted_lora_weights)
+print("Correct Weights: ", correct_lora_applied)
+print("Gradually Merged Weights: ", final_weights)

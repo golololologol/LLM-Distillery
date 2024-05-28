@@ -26,6 +26,7 @@ class H5DataManager:
         self.max_queue_size = max_queue_size
         self.done_everything = multiprocessing.Event()
         self.done_everything.set()
+        self.closing = multiprocessing.Event()
         self.got_task = multiprocessing.Event()
         self.loading_process = get_context("spawn").Process(target=self._process_thread)
         self.shared_batches = []
@@ -47,6 +48,11 @@ class H5DataManager:
                 while not self.queue.empty():
                     task, data = self.queue.get()
 
+                    if self.closing.is_set():
+                        print("Got task to close.")
+                        self.done_everything.set()
+                        break
+
                     match task:
                         case 'get_batch':
                             self.result_queue.put(self._make_outgoing_batch(hdf_file, data))
@@ -58,11 +64,12 @@ class H5DataManager:
                             while not self.got_task.is_set():
                                 for batch_ids in data:
                                     while self.result_queue.full():
-                                        if self.got_task.is_set():
+                                        if self.closing.is_set():
                                             break
                                         time.sleep(0.1)
 
-                                    if self.got_task.is_set():
+                                    if self.closing.is_set():
+                                        print("Read-only mode ended.")
                                         break
 
                                     self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
@@ -78,8 +85,16 @@ class H5DataManager:
                             self._clear_dataset(hdf_file, ids_to_clear)
                         case 'clear_ids':
                             self._clear_dataset(hdf_file, data)
+
+                    if self.closing.is_set():
+                        print("Closing process.")
+                        break
                         
-                self.done_everything.set()
+                    self.done_everything.set()
+
+                if self.closing.is_set():
+                    print("Closing process fully now.")
+                    break
                 
     def _process_distributions(self, hdf_file, batch: list[Distribution]):
         for distribution in batch:
@@ -289,4 +304,6 @@ class H5DataManager:
         self.done_everything.wait()
 
     def close(self):
-        self.loading_process.terminate()
+        self.closing.set()
+        self.got_task.set()
+        self.loading_process.join()

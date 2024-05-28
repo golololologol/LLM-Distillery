@@ -172,7 +172,7 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.lora_alpha = alpha
     student.perma_merge_weight = perma_merge_weight
     student.perma_merge_every_batches = perma_merge_every_n_batches
-    student.next_merge_step = perma_merge_every_n_batches * student.batch_size + num_warmup_steps
+    student.next_merge_step = perma_merge_every_n_batches * student.batch_size
 
 
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
@@ -275,7 +275,7 @@ def main():
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
-    dataset_path = r"C:\Users\PC\Desktop\train_test_small.jsonl"
+    dataset_path = r"C:\Users\PC\Downloads\train_test_small_v2.jsonl"
     validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
@@ -299,7 +299,7 @@ def main():
     encourage_eos = False
 
     # Training settings
-    num_epochs = 3
+    num_epochs = 1
     num_warmup_steps = 50
 
     ## Dora
@@ -308,28 +308,28 @@ def main():
     target_modules = [] # Only used if target_all_linear is False
     rank = 256
     alpha = 256
-    perma_merge_weight = 0.1 # 0.1 = 10% gets merged every merging step
+    perma_merge_weight = 2 # 0.1 = 10% gets merged every merging step
     perma_merge_every_n_batches = 1
 
     batch_size = 4
     grad_accum_batches = 1
     grad_checkpointing = False
     temperature = 1
-    lr = 5e-4
+    lr = 1e-4
     decay_start = 0.9 # wsd only
 
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
-    optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
+    optimizer = "adam" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
     data_order = "sorted" # "shuffle", "native", "sorted"
     training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     
-    validate_every_n_epochs = 0.5
+    validate_every_n_epochs = 0.1
     save_student_every_n_epochs = 4
 
     multi_gpu = True
     custom_reduction = True
-    save_final_state = True
-    wandb_comment = f"Grad. Dora {perma_merge_weight*100}% ({perma_merge_every_n_batches})" # Comment for wandb: {comment} ModelName lr(lr) (Date/Time)
+    save_final_state = False
+    wandb_comment = f"Grad. Lora ({perma_merge_weight*100}%) ({perma_merge_every_n_batches})" # Comment for wandb: {comment} ModelName lr(lr) (Date/Time)    f"Grad. Dora ({perma_merge_weight*100}%) ({perma_merge_every_n_batches})"
 
     # Student settings
     freeze_layers = []
@@ -425,7 +425,9 @@ def main():
         student.train_chunk(data_manager, validation_data_manager, True)
 
     validation_data_manager.close()
+    print("Validation datamanager closed!")
     data_manager.close()
+    print("Training datamanager closed!")
 
     print("\nDone!")
 
