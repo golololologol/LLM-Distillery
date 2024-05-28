@@ -42,27 +42,16 @@ class WarmupStableDecayLR(LRScheduler):
             return [self.constant_lr * lr_scale for group in self.optimizer.param_groups]
         else:
             return [self.final_lr for group in self.optimizer.param_groups]
+        
 
-
-def launch_tensorboard(log_dir):
-    tensorboard = subprocess.Popen(['tensorboard', '--logdir', log_dir, '--bind_all'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return tensorboard
-
-
-def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_content_tokens, custom=False):
-    def total_kl_div(student_logprobs: torch.Tensor, teacher_logprobs: torch.Tensor, custom: bool = False, per_token: bool = False):
+def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_content_tokens):
+    def custom_kl_div(student_logprobs: torch.Tensor, teacher_logprobs: torch.Tensor, per_token: bool = False):
         kl_div_raw = F.kl_div(student_logprobs, teacher_logprobs, reduction='none', log_target=True)
 
         if per_token:
-            if custom:
-                kl_div = kl_div_raw.sum(dim=-1)
-            else:
-                kl_div = kl_div_raw.mean(dim=-1)
+            kl_div = kl_div_raw.sum(dim=-1)
         else:
-            if custom:
-                kl_div = kl_div_raw.sum(dim=-1).mean()
-            else:
-                kl_div = kl_div_raw.mean()
+            kl_div = kl_div_raw.sum(dim=-1).mean()
 
         return kl_div
         
@@ -76,21 +65,29 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
     min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
 
     student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
-    teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
+
+    if indices is not None:
+        teacher_logits_padded = torch.zeros_like(student_logprobs) - 25
+
+        teacher_logits_padded.scatter_(1, indices[:min_len], teacher_logits[:min_len])
+
+        teacher_logprobs = F.log_softmax(teacher_logits_padded, dim=-1)
+    else:
+        teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
 
     cross_entropy_loss = F.cross_entropy(student_logits[:min_len - 1], convo_content_tokens[1:min_len])
 
-    if indices is None:
-        kl_div = total_kl_div(student_logprobs, teacher_logprobs, custom=custom, per_token=True)
-        
-    else:
-        student_gathered = torch.gather(student_logprobs, dim=-1, index=indices[:min_len])
+    kl_div = custom_kl_div(student_logprobs, teacher_logprobs, per_token=True)
+    reverse_kl_div = custom_kl_div(teacher_logprobs, student_logprobs, per_token=True)
 
-        kl_div = total_kl_div(student_gathered, teacher_logprobs, custom=custom, per_token=True)
+    alpha = 1.2
 
-    custom_loss = abomination_loss(kl_div, 2)
+    weighted_kl_div = abomination_loss(kl_div, alpha)
+    weighted_r_kl_div = abomination_loss(reverse_kl_div, alpha)
 
-    return cross_entropy_loss, custom_loss, kl_div.mean()
+    custom_loss = (kl_div + reverse_kl_div)/2
+
+    return custom_loss.mean(), cross_entropy_loss, kl_div.mean(), reverse_kl_div.mean(), weighted_kl_div, weighted_r_kl_div
 
 
 def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay=1e-2, momentum=0.01, nesterov=False):
@@ -124,7 +121,7 @@ def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay
         raise ValueError(f"Invalid optimizer name: {optimizer_name}\nAvailable optimizers: {list(optimizer_classes.keys())}")
     
 
-def set_lr_scheduler(optimizer, lr_scheduler_name, num_warmup_steps, num_training_steps, num_epoch_steps, decay_start=0.5, constant_lr=5e-5, final_lr=5e-7):
+def set_lr_scheduler(optimizer, lr_scheduler_name: str, num_warmup_steps, num_training_steps, num_epoch_steps, decay_start=0.5, constant_lr=5e-5, final_lr=5e-7):
     lr_scheduler_name = lr_scheduler_name.lower()
     
     lr_scheduler_classes = {

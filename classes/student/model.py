@@ -55,27 +55,14 @@ class StudentModel(BaseModel):
         self.num_trained_steps = 0
         self.next_val_step = 0
         self.next_accum_step = 0
-        self.next_merge_step = 0
         self.state_path = ""
         self.distr_device = ""
         self.saved_state = False
         self.val_batch_order_ids = []
-
-        # dora
-        self.use_dora = False
-        self.lora_alpha = 0.0
-        self.lora_rank = 0
-        self.target_all_linear = False
-        self.target_modules = []
-        self.perma_merge_weight = 0.0
-        self.perma_merge_every_batches = 0
-        self.peft_config = None
-        self.copy_dict = {}
         
         # misc
         self.freeze_layers = []
         self.training_precision_name = ""
-        self.custom_reduction = False
         self.logger = None
         self.data_order = ""
         self.save_final_state = False
@@ -120,51 +107,15 @@ class StudentModel(BaseModel):
             attn_implementation="flash_attention_2"
         )
 
-        if self.use_dora:
-            target_modules = self.target_modules if not self.target_all_linear else "all-linear"
-            self.peft_config = LoraConfig(
-                task_type=TaskType.CAUSAL_LM, 
-                lora_alpha=self.lora_alpha, 
-                r=self.lora_rank, 
-                target_modules=target_modules, 
-                bias="none"
-            )
+        self.model.train()
+        if self.grad_checkpointing:
+            self.model.gradient_checkpointing_enable()
 
-            self.model = get_peft_model(self.model, self.peft_config)
-
-            self.model.print_trainable_parameters()
-
-            self.model.set_adapter("default")
-
-            if not (self.training_precision_name == "8bit" or self.training_precision_name == "4bit"):
-                self.model.half()
-
-            with torch.no_grad():
-                for name, param in self.model.named_parameters():
-                    if "base_layer" in name:
-                        lora_A_name = name.replace("base_layer", f"lora_A.default")
-                        lora_B_name = name.replace("base_layer", f"lora_B.default")
-
-                        lora_A = self.model.get_parameter(lora_A_name)
-                        lora_B = self.model.get_parameter(lora_B_name)
-
-                        # Create copies of the parameters
-                        lora_A_copy = torch.nn.Parameter(lora_A.clone(), requires_grad=False)
-                        lora_B_copy = torch.nn.Parameter(lora_B.clone(), requires_grad=False)
-
-                        self.copy_dict[lora_A_name] = lora_A_copy
-                        self.copy_dict[lora_B_name] = lora_B_copy
-
-        else:
-            self.model.train()
-            if self.grad_checkpointing:
-                self.model.gradient_checkpointing_enable()
-
-            if self.freeze_layers:
-                for name, param in self.model.named_parameters():
-                    for freeze_layer in self.freeze_layers:
-                        if freeze_layer in name:
-                            param.requires_grad = False
+        if self.freeze_layers:
+            for name, param in self.model.named_parameters():
+                for freeze_layer in self.freeze_layers:
+                    if freeze_layer in name:
+                        param.requires_grad = False
 
         torch.cuda.empty_cache()
         self._release_postfix()
@@ -178,7 +129,7 @@ class StudentModel(BaseModel):
         self.optimizer = set_optimizer(
             self.model.parameters(),
             lr=self.lr,
-            betas=(0, 0),
+            betas=(0.9, 0.999),
             optimizer_name=self.optimizer_name,
             weight_decay=2e-8
         )
@@ -220,11 +171,7 @@ class StudentModel(BaseModel):
 
         folder_name = f"{self.model_name}_step_{step}"
 
-        if self.use_dora:
-            self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name, "adapter"))
-            self.model.base_model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
-        else:
-            self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
+        self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
 
         self.tokenizer.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
 
@@ -253,27 +200,6 @@ class StudentModel(BaseModel):
             if param in self.optimizer.state:
                 for state_key in self.optimizer.state[param]:
                     self.optimizer.state[param][state_key] *= scale_factor
-
-    def _gradual_lora_merge(self, adapter_name="default"):
-        with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                if "base_layer" in name:
-                    lora_A_name = name.replace("base_layer", f"lora_A.{adapter_name}")
-                    lora_B_name = name.replace("base_layer", f"lora_B.{adapter_name}")
-
-                    lora_A = self.model.get_parameter(lora_A_name)
-                    lora_A_copy = self.copy_dict[lora_A_name]
-                    lora_B = self.model.get_parameter(lora_B_name)
-                    lora_B_copy = self.copy_dict[lora_B_name]
-
-                    lora_A_diff = lora_A - lora_A_copy
-                    lora_B_diff = lora_B - lora_B_copy
-
-                    lora_diff_weights = torch.matmul(lora_B_diff, lora_A_diff)
-
-                    param.add_(self.perma_merge_weight * lora_diff_weights)
-                    self.copy_dict[lora_A_name] = lora_A.clone()
-                    self.copy_dict[lora_B_name] = lora_B.clone()
 
     def _construct_batches(self, dataset_chunk: list[ConvoTokenized]) -> tuple[list[list[ConvoTokenized]], list[list[int]]]:
         num_batches = math.ceil(len(dataset_chunk) / self.batch_size)
@@ -362,6 +288,7 @@ class StudentModel(BaseModel):
 
     def close(self):
         if self.logger is not None:
+            time.sleep(2)
             self.logger.finish()
 
     # main training loop
@@ -381,6 +308,9 @@ class StudentModel(BaseModel):
             batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_custom_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_weighted_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_reverse_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_weighted_r_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
 
             batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
 
@@ -395,19 +325,25 @@ class StudentModel(BaseModel):
                 convo_teacher_logits = teacher_batch_raw[i]
                 convo_content_tokens = torch.index_select(batch_tokenized_tensor[i], 0, content_indices)
 
-                cross_entropy_loss, custom_loss, kl_div = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, custom=self.custom_reduction)
+                custom_loss, cross_entropy_loss, kl_div, reverse_kl_div, weighted_kl_div, weighted_r_kl_div = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens)
 
                 divisor = num_steps * self.num_grad_accum_batches
 
                 batch_cross_entropy_loss += cross_entropy_loss / divisor
                 batch_custom_loss += custom_loss / divisor
                 batch_kl_div += kl_div / divisor
+                batch_weighted_kl_div += weighted_kl_div / divisor
+                batch_reverse_kl_div += reverse_kl_div / divisor
+                batch_weighted_r_kl_div += weighted_r_kl_div / divisor
 
                 self.lr_scheduler.step()
 
             self.logger.log({"Loss/cross entropy": batch_cross_entropy_loss * self.num_grad_accum_batches}, step=self.num_trained_steps)
             self.logger.log({"Loss/custom loss": batch_custom_loss * self.num_grad_accum_batches}, step=self.num_trained_steps)
             self.logger.log({"Loss/KL divergence": batch_kl_div * self.num_grad_accum_batches}, step=self.num_trained_steps)
+            self.logger.log({"Loss/weighted KL divergence": batch_weighted_kl_div * self.num_grad_accum_batches}, step=self.num_trained_steps)
+            self.logger.log({"Loss/reverse KL divergence": batch_reverse_kl_div * self.num_grad_accum_batches}, step=self.num_trained_steps)
+            self.logger.log({"Loss/weighted rev. KL divergence": batch_weighted_r_kl_div * self.num_grad_accum_batches}, step=self.num_trained_steps)
 
             self.logger.log({"Learning rate": self.lr_scheduler.get_last_lr()[0]}, step=self.num_trained_steps)
             self.progress_bar.update(num_steps)
@@ -420,10 +356,6 @@ class StudentModel(BaseModel):
                 self.optimizer.step()
                 self.optimizer.zero_grad()
                 self.next_accum_step += self.num_grad_accum_batches * self.batch_size
-
-            if self.num_trained_steps >= self.next_merge_step and self.use_dora:
-                self._gradual_lora_merge()
-                self.next_merge_step += + self.perma_merge_every_batches * self.batch_size
                 
             if (self.num_trained_steps >= self.next_save_step) and not (self.num_trained_steps >= self.num_training_steps):
                 self._save_model(self.num_trained_steps)
@@ -441,6 +373,9 @@ class StudentModel(BaseModel):
             batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_custom_loss = torch.tensor(0.0).to(device, non_blocking=True)
             batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_weighted_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_reverse_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
+            batch_weighted_r_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
 
             for val_convo_batch in self.validation_dataset_batched:
                 sdh_mem_name, batch_shape, batch_dtype, val_batch_indices, batch_padding = validation_data_manager.read_next_batch()
@@ -461,11 +396,14 @@ class StudentModel(BaseModel):
                     val_convo_teacher_logits = teacher_batch_raw[i][:batch_padding[i]]
                     val_convo_content_tokens = torch.index_select(val_batch_tokenized_tensor[i], 0, val_content_indices)
                     
-                    cross_entropy_loss, custom_loss, kl_div = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, val_indices, val_convo_content_tokens, custom=self.custom_reduction)
+                    custom_loss, cross_entropy_loss, kl_div, reverse_kl_div, weighted_kl_div, weighted_r_kl_div = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, val_indices, val_convo_content_tokens)
                     
                     batch_cross_entropy_loss += cross_entropy_loss
                     batch_custom_loss += custom_loss
                     batch_kl_div += kl_div
+                    batch_weighted_kl_div += weighted_kl_div
+                    batch_reverse_kl_div += reverse_kl_div
+                    batch_weighted_r_kl_div += weighted_r_kl_div
 
                 pbar.update(len(val_convo_batch))
 
@@ -473,6 +411,9 @@ class StudentModel(BaseModel):
         self.logger.log({"Val Loss/cross entropy": batch_cross_entropy_loss/divisor}, step=self.num_trained_steps)
         self.logger.log({"Val Loss/custom loss": batch_custom_loss/divisor}, step=self.num_trained_steps)
         self.logger.log({"Val Loss/KL divergence": batch_kl_div/divisor}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/weighted KL divergence": batch_weighted_kl_div/divisor}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/reverse KL divergence": batch_reverse_kl_div/divisor}, step=self.num_trained_steps)
+        self.logger.log({"Val Loss/weighted rev. KL divergence": batch_weighted_r_kl_div/divisor}, step=self.num_trained_steps)
 
         pbar.close()
         self.model.train()

@@ -140,8 +140,7 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
 
 
 def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
-                        validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora, target_modules,
-                        rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear, wandb_comment):
+                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment):
     
     student.num_epochs = num_epochs
     student.num_warmup_steps = num_warmup_steps
@@ -156,23 +155,12 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.validation_every_steps = validate_every_n_epochs * student.dataset_len
     student.next_accum_step = grad_accum_batches * student.batch_size
     student.num_training_steps = num_epochs * student.dataset_len
-    student.custom_reduction = custom_reduction
     student.save_every_steps = save_student_every_n_epochs * student.dataset_len
     student.next_save_step = save_student_every_n_epochs * student.dataset_len
     student.save_final_state = save_final_state
     student.grad_checkpointing = grad_checkpointing
     student.freeze_layers = freeze_layers
     student.wandb_comment = wandb_comment
-
-    # Dora
-    student.use_dora = use_gradual_dora
-    student.target_all_linear = target_all_linear
-    student.target_modules = target_modules
-    student.lora_rank = rank
-    student.lora_alpha = alpha
-    student.perma_merge_weight = perma_merge_weight
-    student.perma_merge_every_batches = perma_merge_every_n_batches
-    student.next_merge_step = perma_merge_every_n_batches * student.batch_size
 
 
 def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
@@ -302,15 +290,6 @@ def main():
     num_epochs = 1
     num_warmup_steps = 50
 
-    ## Dora
-    use_gradual_dora = True
-    target_all_linear = True
-    target_modules = [] # Only used if target_all_linear is False
-    rank = 256
-    alpha = 256
-    perma_merge_weight = 2 # 0.1 = 10% gets merged every merging step
-    perma_merge_every_n_batches = 1
-
     batch_size = 4
     grad_accum_batches = 1
     grad_checkpointing = False
@@ -319,7 +298,7 @@ def main():
     decay_start = 0.9 # wsd only
 
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
-    optimizer = "adam" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
+    optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
     data_order = "sorted" # "shuffle", "native", "sorted"
     training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     
@@ -327,9 +306,8 @@ def main():
     save_student_every_n_epochs = 4
 
     multi_gpu = True
-    custom_reduction = True
     save_final_state = False
-    wandb_comment = f"Grad. Lora ({perma_merge_weight*100}%) ({perma_merge_every_n_batches})" # Comment for wandb: {comment} ModelName lr(lr) (Date/Time)    f"Grad. Dora ({perma_merge_weight*100}%) ({perma_merge_every_n_batches})"
+    wandb_comment = f"FFT" # Comment for wandb: {comment} ModelName lr(lr) (Date/Time)
 
     # Student settings
     freeze_layers = []
@@ -355,8 +333,7 @@ def main():
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
-                        validate_every_n_epochs, custom_reduction, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, use_gradual_dora,
-                        target_modules, rank, alpha, perma_merge_weight, perma_merge_every_n_batches, target_all_linear, wandb_comment)
+                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment)
 
     sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
     sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)

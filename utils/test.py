@@ -339,29 +339,18 @@ def truncated_kldiv(student_probs, teacher_probs):
 #print(list[1:-1])
 #print(F.cross_entropy(log_soft_1, indices, reduction='none'))
 
-# Example tensors
-weights = torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float32)
-lora_a = torch.tensor([0.1, 0.2, 0.2, 0.1], dtype=torch.float32)
-lora_b = torch.tensor([0.1, 0.2222, 0.3, 0.4], dtype=torch.float32)
-magnitude = torch.tensor([0.4, 0.922, 0.1, 0.74], dtype=torch.float32)
-
-# Compute the original LoRA contribution
-lora_weights = torch.matmul(lora_a, lora_b) * magnitude
-
-# Correct final weights with the original LoRA applied
-correct_lora_applied = weights + lora_weights
-
-# Merge 10% of the LoRA layers into the base weight
-merged_weights = weights + 0.1 * lora_weights
-
-# Update the remaining LoRA layers to reflect 90% contribution
-adjusted_magnitude = magnitude * 0.9
-
-# Compute the adjusted LoRA contribution
-adjusted_lora_weights = torch.matmul(lora_b, lora_a) * adjusted_magnitude
-
-# Verify the merged weights and adjusted LoRA weights
-final_weights = merged_weights + adjusted_lora_weights
-
-print("Correct Weights: ", correct_lora_applied)
-print("Gradually Merged Weights: ", final_weights)
+losses = torch.tensor(([0.01, 0.3]), dtype=torch.float32)
+power = 0.2
+add = 1
+weights = (losses/losses.max() + add).pow(power)
+transformed_weights = ((10/weights) + 1).pow(power)
+weighted_losses = losses * weights
+weighted_losses_transformed = losses * transformed_weights
+mean_losses = (weighted_losses + weighted_losses_transformed)/2
+print(f"Losses: [0.01, 0.3], power {power}, add {add}")
+print(f"Weights: ((losses/losses.max()) + {add}).pow({power}):", weights)
+print(f"Transformed weights: ((1/weights) + 1).pow(power): {transformed_weights}")
+print(f"Losses * Weights: {weighted_losses}")
+print(f"Losses * Transformed weights: {weighted_losses_transformed}")
+print(f"Mean of both: {mean_losses}")
+print(f"Total mean: {mean_losses.mean()}")
