@@ -28,7 +28,7 @@ class H5DataManager:
         self.done_everything.set()
         self.closing = multiprocessing.Event()
         self.got_task = multiprocessing.Event()
-        self.loading_process = get_context("spawn").Process(target=self._process_thread, daemon=True)
+        self.loading_process = get_context("spawn").Process(target=self._process_thread)
         self.shared_batches = []
 
         self.loading_process.start()
@@ -86,8 +86,11 @@ class H5DataManager:
 
                     if self.closing.is_set():
                         break
-                        
-                self.done_everything.set()
+                
+                if self.queue.empty():
+                    self.done_everything.set()
+                else:
+                    self.got_task.set()
 
                 if self.closing.is_set():
                     for shared_batch in self.shared_batches:

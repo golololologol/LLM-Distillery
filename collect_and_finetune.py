@@ -146,7 +146,7 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
 
 
 def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
-                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment):
+                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha):
     
     student.num_epochs = num_epochs
     student.num_warmup_steps = math.ceil(num_warmup_steps / (grad_accum_batches * student.batch_size))
@@ -168,6 +168,7 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.grad_checkpointing = grad_checkpointing
     student.freeze_layers = freeze_layers
     student.wandb_comment = wandb_comment
+    student.alpha = alpha
 
 
 def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: Paths, rebase_dataset: bool) -> tuple[bool, bool]:
@@ -276,7 +277,7 @@ def main():
     device = "cuda:1"
 
     # Collection settings
-    num_inference_workers = 3
+    num_inference_workers = 2 # 3 IS ABSOLUTE MAX IT CAN GO
     reserve_vram = [6, 0.5] # GB
     encourage_eos = False
 
@@ -290,6 +291,7 @@ def main():
     temperature = 1
     lr = 1e-4
     decay_start = 0.9 # wsd only
+    alpha = 1.2 # weighted losses
 
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
@@ -327,14 +329,14 @@ def main():
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
-                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment)
+                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha)
 
     student.reorder_dataset()
 
     loop_ids, full_collect = calculate_loop_ids(student, max_cache_size_gb, enable_topK, save_topK)
 
     collect, collect_val = collect_or_load(student, teachers, paths, rebase_dataset)
-    
+
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
     time.sleep(2)
     data_manager = H5DataManager(paths.dataset, device)

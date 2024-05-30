@@ -54,8 +54,10 @@ class TeacherModel(BaseModel):
 
             workers = self._start_workers(done_chunk, num_inference_workers, made_distributions, model_loaded, start_inference, inference_queue, result_queue, disk_queue, pbar_queue, dataset_chunk)
 
-            while not done_chunk.is_set():
+            while True:
                 self._manage_queues(disk_queue, pbar_queue)
+                if done_chunk.is_set() and disk_queue.empty() and pbar_queue.empty():
+                    break
 
             self.data_manager.done_everything.wait()
             self._stop_workers(*workers)
@@ -73,13 +75,12 @@ class TeacherModel(BaseModel):
     def _manage_queues(self, disk_queue, pbar_queue):
         while not disk_queue.empty():
             batch_content_distributions = disk_queue.get()
-            disk_queue.task_done()
             self.data_manager.write_batch(batch_content_distributions)
 
         while not pbar_queue.empty():
             action, value = pbar_queue.get()
-            pbar_queue.task_done()
             self._pbar_actions(action, value)
+        time.sleep(0.1)
 
     def _pbar_actions(self, action: str, value: int):
         if action == "increment":
@@ -99,10 +100,10 @@ class TeacherModel(BaseModel):
         gc.collect()
     
     def _start_workers(self, done_chunk, num_inference_workers, made_distributions, model_loaded, start_inference, inference_queue, result_queue, disk_queue, pbar_queue, dataset_chunk: list[ConvoTokenized]):
-        self.progress_bar.set_postfix_str(f"Starting workers for {self.model_name[:30]}...")
+        self.progress_bar.set_postfix_str(f"Starting workers for {self.model_name[:20]}...")
 
-        batch_creator = multiprocessing.Process(target=_batch_creator_worker, args=(inference_queue, self.batch_size, dataset_chunk))
-        result_processor = multiprocessing.Process(target=_result_processor_worker, args=(result_queue, made_distributions, done_chunk, disk_queue, self.encourage_eos, self.student_eos_id, pbar_queue, self.max_queue_size, self.batch_size))
+        batch_creator = multiprocessing.Process(target=_batch_creator_worker, args=(inference_queue, self.batch_size, dataset_chunk, num_inference_workers))
+        result_processor = multiprocessing.Process(target=_result_processor_worker, args=(result_queue, made_distributions, done_chunk, disk_queue, self.encourage_eos, self.student_eos_id, pbar_queue, self.max_queue_size, self.batch_size, num_inference_workers))
 
         batch_creator.start()
         
@@ -117,7 +118,7 @@ class TeacherModel(BaseModel):
                 info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
                 gpus_mem_free.append(info.free)
 
-            worker = get_context("spawn").Process(target=_inference_worker, args=(inference_queue, result_queue, made_distributions, model_loaded, start_inference, done_chunk, self.model_path, self.model_name, self.reserve_vram, gpus_mem_free, 
+            worker = get_context("spawn").Process(target=_inference_worker, args=(inference_queue, result_queue, made_distributions, model_loaded, start_inference, done_chunk, self.model_path, self.model_name[:20], self.reserve_vram, gpus_mem_free, 
                                                                              self.temperature, self.crop_to_size, pbar_queue, self.context_len, self.batch_size, self.max_queue_size, self.seq_chunk_len, self.enable_topK, self.topK), daemon=True)
             time.sleep(1)
             worker.start()

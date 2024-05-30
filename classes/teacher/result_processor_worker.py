@@ -5,7 +5,7 @@ from tqdm import tqdm
 import numpy as np
 
 
-def _result_processor_worker(result_queue, made_distributions, done_chunk_writes, disk_queue, encourage_eos, student_eos_id, pbar_queue: tqdm, max_queue_size: int, batch_size: int):
+def _result_processor_worker(result_queue, made_distributions, done_chunk_writes, disk_queue, encourage_eos, student_eos_id, pbar_queue: tqdm, max_queue_size: int, batch_size: int, num_inference_workers: int):
     def _get_content_indices_np(content_ranges) -> ndarray:
         content_indices = []
         for start, end in content_ranges:
@@ -30,7 +30,7 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
             np.copyto(shd_distr, distribution.distribution)
             shared_list.append(shd_mem)
 
-            if len(shared_list) > max_queue_size + 30:
+            if len(shared_list) > max_queue_size + 40:
                 shared_list.pop(0)
 
             del distribution.distribution
@@ -76,6 +76,7 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
     
     exit_flag = False
     shared_list = []
+    num_inference_exits = 0
 
     while True:
         made_distributions.wait()
@@ -84,9 +85,13 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
             result_queue.task_done()
 
             if batch_distributions is None:
-                exit_flag = True
-                done_chunk_writes.set()
-                break
+                num_inference_exits += 1
+                if num_inference_exits == num_inference_workers:
+                    exit_flag = True
+                    done_chunk_writes.set()
+                    break
+                else:
+                    continue
 
             logp_shd_mem = shared_memory.SharedMemory(name=shd_mem_name)
             batch_logprobs_np = np.ndarray(batch_logp_shape, dtype=batch_logp_dtype, buffer=logp_shd_mem.buf)

@@ -4,7 +4,7 @@ import numpy as np
 import math
 
 
-def _batch_creator_worker(inference_queue, batch_size, dataset_chunk: list[ConvoTokenized]):
+def _batch_creator_worker(inference_queue, batch_size, dataset_chunk: list[ConvoTokenized], num_inference_workers):
     def _prepare_batch_for_inference(convo_id, batch_size, dataset_chunk: list[ConvoTokenized]) -> tuple[ndarray, list[Distribution], int]:
         batch_tokenized: list[ndarray] = []
         batch_distributions: list[Distribution] = []
@@ -32,4 +32,5 @@ def _batch_creator_worker(inference_queue, batch_size, dataset_chunk: list[Convo
         inference_queue.put((batch_tokenized, batch_distributions))
         convo_id += batch_size
 
-    inference_queue.put((None, None))
+    for _ in range(num_inference_workers):
+        inference_queue.put((None, None))

@@ -84,24 +84,23 @@ def tokenize_convo(args):
             if text:
                 text_tokenized = good_encode(text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
                 conversation_tokenized = np.concatenate((conversation_tokenized, text_tokenized))
-                conversation_content_ranges.append((0, len(text_tokenized)))
+                conversation_content_ranges.append((0, len(conversation_tokenized)))
+                return convo_id, conversation_tokenized, conversation_content_ranges, empty
             else:
                 empty = True
 
-            return convo_id, conversation_tokenized, conversation_content_ranges, empty
-
         else:
             empty = True
-            return convo_id, conversation_tokenized, conversation_content_ranges, empty
     
     elif model.completion and not student:
         empty = True
-        return convo_id, conversation_tokenized, conversation_content_ranges, empty
 
     num_turns = len(json_item["conversations"])
 
     if num_turns == 0:
         empty = True
+
+    if empty:
         return convo_id, conversation_tokenized, conversation_content_ranges, empty
     
     reversed = ("reversed" in tags) or json_item.get("reversed", False)

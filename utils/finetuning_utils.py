@@ -44,7 +44,7 @@ class WarmupStableDecayLR(LRScheduler):
             return [self.final_lr for group in self.optimizer.param_groups]
         
 
-def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_content_tokens) -> dict[str, torch.Tensor]:
+def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_content_tokens: torch.Tensor, alpha: torch.Tensor) -> dict[str, torch.Tensor]:
     def custom_kl_div(student_logprobs: torch.Tensor, teacher_logprobs: torch.Tensor, per_token: bool = False):
         kl_div_raw = F.kl_div(student_logprobs, teacher_logprobs, reduction='none', log_target=True)
 
@@ -55,12 +55,18 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
 
         return kl_div
         
-    def abomination_loss(kl_div_per_token: torch.Tensor, alpha: float):
+    def abomination_loss(kl_div_per_token: torch.Tensor, alpha: torch.Tensor, CE_loss: torch.Tensor):
+        corrected_CE_loss = torch.cat((CE_loss, alpha))
+
         weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha)
+
+        weights = weights + corrected_CE_loss
 
         loss = (kl_div_per_token * weights).mean()
 
         return loss
+    
+    alpha = torch.tensor([alpha], dtype=torch.float32).to(student_logits.device, non_blocking=True)
 
     min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
 
@@ -75,26 +81,28 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
     else:
         teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
 
-    cross_entropy_loss = F.cross_entropy(student_logits[:min_len - 1], convo_content_tokens[1:min_len])
+    CE_loss = F.cross_entropy(student_logits[:min_len - 1], convo_content_tokens[1:min_len], reduction='none')
+    teacher_CE_loss = F.cross_entropy(teacher_logprobs[:min_len - 1], convo_content_tokens[1:min_len], reduction='none')
+    abs_CE_diff = torch.abs(CE_loss - teacher_CE_loss)
 
     kl_div = custom_kl_div(student_logprobs, teacher_logprobs, per_token=True)
     reverse_kl_div = custom_kl_div(teacher_logprobs, student_logprobs, per_token=True)
 
-    alpha = 1.2
+    weighted_kl_div = abomination_loss(kl_div, alpha, abs_CE_diff)
+    weighted_r_kl_div = abomination_loss(reverse_kl_div, alpha, abs_CE_diff)
 
-    weighted_kl_div = abomination_loss(kl_div, alpha)
-    weighted_r_kl_div = abomination_loss(reverse_kl_div, alpha)
-
-    custom_loss = (kl_div + reverse_kl_div)/2
+    custom_loss = (weighted_kl_div + weighted_r_kl_div)/2
 
     loss_dict = {
-        "train_loss": custom_loss.mean(), # DO NOT REMOVE  This is the loss that will be backpropagated every batch at Losses.backward()
-        "custom loss": custom_loss.mean(),
-        "CE loss": cross_entropy_loss,
+        "train_loss": custom_loss, # DO NOT REMOVE  The loss under "train_loss" key is used for backprop every batch at Losses.backward()
+        "custom loss": custom_loss,
+        "CE loss": CE_loss.mean(),
         "kl_div": kl_div.mean(),
         "reverse kl_div": reverse_kl_div.mean(),
         "weighted kl_div": weighted_kl_div,
-        "weighted rev. kl_div": weighted_r_kl_div
+        "weighted rev. kl_div": weighted_r_kl_div,
+        "teacher CE loss": teacher_CE_loss.mean(),
+        "abs CE diff": abs_CE_diff.mean(),
     }
 
     return loss_dict

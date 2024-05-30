@@ -32,6 +32,7 @@ class StudentModel(BaseModel):
         self.prompt_format = prompt_format
         self.batch_size = batch_size
         self.paths: Paths = paths
+        self.losses: Losses = None
 
         self.optimizer_name = ""
         self.optimizer = None
@@ -40,6 +41,7 @@ class StudentModel(BaseModel):
         self.lr = 0.0
         self.decay_start = 0.0 # wsd only
         self.final_lr = 5e-7 # wsd only
+        self.alpha: float = 1
 
         self.num_epochs = 0
         self.total_training_steps = 0
@@ -191,12 +193,6 @@ class StudentModel(BaseModel):
 
         self._release_postfix()
 
-    def rescale_optimizer_state(self, params, scale_factor):
-        for param in params:
-            if param in self.optimizer.state:
-                for state_key in self.optimizer.state[param]:
-                    self.optimizer.state[param][state_key] *= scale_factor
-
     def _construct_batches(self, dataset_chunk: list[ConvoTokenized]) -> tuple[list[list[ConvoTokenized]], list[list[int]]]:
         num_batches = math.ceil(len(dataset_chunk) / self.batch_size)
         convo_batches = []
@@ -227,7 +223,8 @@ class StudentModel(BaseModel):
 
         if self.logger is None:
             name = f"{self.wandb_comment} " if self.wandb_comment else ""
-            name += f"{self.model_name} lr({self.lr}) ({time.strftime('%d.%m.%Y / %H:%M:%S')})"
+            model_name = self.model_name if len(self.model_name) <= 20 else f"{self.model_name[:20]}..."
+            name += f"{model_name} lr({self.lr}) ({time.strftime('%d.%m.%Y / %H:%M:%S')})"
             self.logger = wandb.init(project="student_training", name=name, config=self.__dict__, group=self.model_name, reinit=True, dir=self.paths.cache)
 
         if self.tokenizer is None:
@@ -244,10 +241,11 @@ class StudentModel(BaseModel):
             self._load_optimizer()
             self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_grad_accum_batches, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
 
+        if self.losses is None:
+            self.losses = Losses(self.logger)
+
         if self.num_trained_steps == 0:
             self._validate_distillation(validation_data_manager)
-        
-        losses = Losses(self.logger)
         
         # Main training loop
         if full_collect:
@@ -259,14 +257,16 @@ class StudentModel(BaseModel):
                     data_list = self._prefetch_dataset_chunk(data_manager, data_list, full_collect, trainable_ids)
                     data_manager_left_shuffles -= 1
 
-                updated_grads = self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager, losses)
+                updated_grads = self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager)
         else:
             data_list = self._prefetch_dataset_chunk(data_manager, [], full_collect, trainable_ids)
-            updated_grads = self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager, losses)
+            updated_grads = self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager)
 
         if not updated_grads:
             self.optimizer.step()
             self.optimizer.zero_grad()
+            self.losses.log(self.num_trained_steps)
+            self.losses.empty()
 
         if not full_collect:
             self._save_state()
@@ -290,7 +290,7 @@ class StudentModel(BaseModel):
             self.logger.finish()
 
     # main training loop
-    def _run_distillation_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager, losses: Losses) -> bool:
+    def _run_distillation_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager) -> bool:
 
         for batch_convos in batched_chunk_convos:
             updated_grads = False
@@ -316,11 +316,11 @@ class StudentModel(BaseModel):
                 convo_teacher_logits = teacher_batch_raw[i]
                 convo_content_tokens = torch.index_select(batch_tokenized_tensor[i], 0, content_indices)
 
-                loss_dict = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens)
+                loss_dict = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, self.alpha)
 
-                losses.add_losses(loss_dict)
+                self.losses.add_losses(loss_dict)
             
-            losses.backward(divisor=self.batch_size*self.grad_accum)
+            self.losses.backward(divisor=self.batch_size*self.grad_accum)
             
             self.progress_bar.update(batch_steps)
 
@@ -331,8 +331,8 @@ class StudentModel(BaseModel):
                 self.optimizer.zero_grad()
 
                 self.logger.log({"Learning Rate": self.optimizer.param_groups[0]['lr']}, step=self.num_trained_steps)
-                losses.log(self.num_trained_steps)
-                losses.empty()
+                self.losses.log(self.num_trained_steps)
+                self.losses.empty()
 
                 self.lr_scheduler.step()
 
@@ -376,7 +376,7 @@ class StudentModel(BaseModel):
                     val_convo_teacher_logits = teacher_batch_raw[i][:batch_padding[i]]
                     val_convo_content_tokens = torch.index_select(val_batch_tokenized_tensor[i], 0, val_content_indices)
                     
-                    loss_dict = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, val_indices, val_convo_content_tokens)
+                    loss_dict = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, val_indices, val_convo_content_tokens, self.alpha)
                     
                     losses.add_losses(loss_dict)
                     
