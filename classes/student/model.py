@@ -140,7 +140,7 @@ class StudentModel(BaseModel):
         self.validation_dataset.sort(key=lambda convo: convo.length, reverse=True)
         self.validation_dataset_sorted = True
     
-    def _reorder_dataset(self):
+    def reorder_dataset(self):
         if self.dataset_sorted:
             return
         if self.data_order == "shuffle":
@@ -210,7 +210,7 @@ class StudentModel(BaseModel):
         return convo_batches, id_batches
     
     def _prefetch_dataset_chunk(self, data_manager: H5DataManager, data_list: list, full_collect, trainable_ids) -> list:
-            self._reorder_dataset()
+            self.reorder_dataset()
             dataset_chunk = self.dataset if full_collect else [convo for convo in self.dataset if convo.origin_convo_id in trainable_ids]
             batched_chunk_convos, id_batches = self._construct_batches(dataset_chunk)
             data_list.append(batched_chunk_convos)
@@ -256,7 +256,6 @@ class StudentModel(BaseModel):
                 
             for i in range(self.num_epochs):
                 if data_manager_left_shuffles > 0:
-                    self._reorder_dataset()
                     data_list = self._prefetch_dataset_chunk(data_manager, data_list, full_collect, trainable_ids)
                     data_manager_left_shuffles -= 1
 

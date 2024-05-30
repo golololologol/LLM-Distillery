@@ -30,7 +30,7 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
             np.copyto(shd_distr, distribution.distribution)
             shared_list.append(shd_mem)
 
-            if len(shared_list) > max_queue_size + 20:
+            if len(shared_list) > max_queue_size + 30:
                 shared_list.pop(0)
 
             del distribution.distribution

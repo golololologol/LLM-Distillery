@@ -5,11 +5,16 @@ import math
 import torch.nn.functional as F
 from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
 import json
+import nvidia_smi
 import codecs
-from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
+from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config, ExLlamaV2Cache, ExLlamaV2
 from utils.dataset_utils import read_jsonl_lazy
 from tqdm import tqdm
 import multiprocessing as mp
+
+# init cuda
+if not torch.cuda.is_initialized():
+    torch.cuda.init()
 #from dataset_utils import H5Reader, H5Writer
 
 #d1 = np.random.random(size = (10,2))
@@ -339,22 +344,40 @@ def truncated_kldiv(student_probs, teacher_probs):
 #print(list[1:-1])
 #print(F.cross_entropy(log_soft_1, indices, reduction='none'))
 
-losses = torch.tensor(([0.01, 0.3]), dtype=torch.float32)
-power = 0.2
-add = 1
-weights = (losses/losses.max() + add).pow(power)
-transformed_weights = ((10/weights) + 1).pow(power)
-weighted_losses = losses * weights
-weighted_losses_transformed = losses * transformed_weights
-mean_losses = (weighted_losses + weighted_losses_transformed)/2
-print(f"Losses: [0.01, 0.3], power {power}, add {add}")
-print(f"Weights: ((losses/losses.max()) + {add}).pow({power}):", weights)
-print(f"Transformed weights: ((1/weights) + 1).pow(power): {transformed_weights}")
-print(f"Losses * Weights: {weighted_losses}")
-print(f"Losses * Transformed weights: {weighted_losses_transformed}")
-print(f"Mean of both: {mean_losses}")
-print(f"Total mean: {mean_losses.mean()}")
+#losses = torch.tensor(([0.01, 0.3]), dtype=torch.float32)
+#power = 0.2
+#add = 1
+#weights = (losses/losses.max() + add).pow(power)
+#transformed_weights = ((10/weights) + 1).pow(power)
+#weighted_losses = losses * weights
+#weighted_losses_transformed = losses * transformed_weights
+#mean_losses = (weighted_losses + weighted_losses_transformed)/2
+#print(f"Losses: [0.01, 0.3], power {power}, add {add}")
+#print(f"Weights: ((losses/losses.max()) + {add}).pow({power}):", weights)
+#print(f"Transformed weights: ((1/weights) + 1).pow(power): {transformed_weights}")
+#print(f"Losses * Weights: {weighted_losses}")
+#print(f"Losses * Transformed weights: {weighted_losses_transformed}")
+#print(f"Mean of both: {mean_losses}")
+#print(f"Total mean: {mean_losses.mean()}")
 
-model: LlamaForCausalLM = LlamaForCausalLM.from_pretrained("HuggingFaceH4/zephyr-7b-gemma-v0.1")
-# check on which device the model expects the input
-model.load_state_dict()
+# load exllama model
+path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+
+
+config = ExLlamaV2Config()
+config.model_dir = path
+config.prepare()
+config.max_seq_len = 2048
+config.max_batch_size = 1
+config.max_input_len = 2048
+config.max_attention_size = 2048 ** 2 
+
+model = ExLlamaV2(config)
+cache = ExLlamaV2Cache(model, 1, 2048, lazy=True)
+
+model.load([0.1, 12])
+print(torch.cuda.memory_reserved(1))
+print(torch.cuda.memory_allocated(1))
+print(torch.cuda.memory_summary(1))
+print(nvidia_smi.nvmlDeviceGetMemoryInfo(1).free)
+input("Press enter to continue")

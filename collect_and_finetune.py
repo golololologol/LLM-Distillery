@@ -5,11 +5,13 @@ from classes.data_manager import H5DataManager
 from classes.paths import Paths
 from tqdm import tqdm
 import multiprocessing
+import nvidia_smi
 import math
 import time
 import json
 import os
 
+nvidia_smi.nvmlInit()
     
 def calculate_loop_ids(student: StudentModel, max_cache_size_gb, enable_topK, save_topK):
     
@@ -250,15 +252,15 @@ def save_dataset_metadata(path, teachers: list[TeacherModel], student: StudentMo
 
 def main():
     cache_folder = r"C:\Users\PC\Desktop\cache"
-    max_cache_size_gb = 0.1
+    max_cache_size_gb = 320
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
     dataset_path = r"C:\Users\PC\Downloads\train_test_small_v2.jsonl"
     validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
-    teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
-    student_path = r"C:\Users\PC\Downloads\tiny-mistral-200M"
+    teacher_models_folder = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+    student_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
 
     ignore_model_type = True # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
     rebase_dataset = False # Only use if you know what you are doing. Will skip the check for conversation and teacher match to use data from disk
@@ -272,9 +274,10 @@ def main():
     enable_topK = True
     save_topK = 200
     device = "cuda:1"
-    reserve_vram = [6, 0.5] # GB
 
     # Collection settings
+    num_inference_workers = 3
+    reserve_vram = [6, 0.5] # GB
     encourage_eos = False
 
     # Training settings
@@ -326,7 +329,7 @@ def main():
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
                         validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment)
 
-    student._reorder_dataset()
+    student.reorder_dataset()
 
     loop_ids, full_collect = calculate_loop_ids(student, max_cache_size_gb, enable_topK, save_topK)
 
@@ -345,7 +348,7 @@ def main():
         validation_data_manager.purge_dataset()
 
         for teacher in teachers:
-            teacher.process_chunk(reserve_vram, data_manager=validation_data_manager, validation=True)
+            teacher.process_chunk(reserve_vram, num_inference_workers, data_manager=validation_data_manager, validation=True)
 
         save_dataset_metadata(paths.dataset_validation, teachers, student, validation=True)
 
@@ -364,7 +367,7 @@ def main():
 
         if full_collect:
             for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):
-                teacher.process_chunk(reserve_vram, full_collect=True, data_manager=data_manager)
+                teacher.process_chunk(reserve_vram, num_inference_workers, full_collect=True, data_manager=data_manager)
 
             save_dataset_metadata(paths.dataset, teachers, student)
 
@@ -377,7 +380,7 @@ def main():
                     data_manager.purge_dataset()
 
                     for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=2, leave=False):
-                        teacher.process_chunk(reserve_vram, ids_to_collect=chunk_ids, data_manager=data_manager)
+                        teacher.process_chunk(reserve_vram, num_inference_workers, ids_to_collect=chunk_ids, data_manager=data_manager)
 
                     student.train_chunk(data_manager, validation_data_manager, full_collect)
 
