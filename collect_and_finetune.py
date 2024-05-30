@@ -1,4 +1,3 @@
-from peft import LoraConfig, get_peft_model, TaskType
 from utils.dataset_utils import tokenize_dataset
 from classes.teacher.model import TeacherModel
 from classes.student.model import StudentModel
@@ -6,39 +5,44 @@ from classes.data_manager import H5DataManager
 from classes.paths import Paths
 from tqdm import tqdm
 import multiprocessing
+import math
 import time
 import json
 import os
 
     
-def calculate_loop_stops(teacher: TeacherModel, max_cache_size_gb, enable_topK, save_topK):
+def calculate_loop_ids(student: StudentModel, max_cache_size_gb, enable_topK, save_topK):
     
     if enable_topK:
         kb_per_distr_val = (0.001953125 * 3) / 1.7 # storage of one FP16 value * 3 (for int32 index) / 1.7 (avg compression ratio)
         distr_size_kb = kb_per_distr_val * save_topK
     else:
         kb_per_distr_val = 0.001953125 / 1.55 # storage of one FP16 value / 1.55 (avg compression ratio)
-        distr_size_kb = kb_per_distr_val * teacher.crop_to_size
+        distr_size_kb = kb_per_distr_val * student.crop_to_size
     max_cache_size_kb = max_cache_size_gb * 1e6
     cache_size_kb = 0
     full_collect = False
-    loop_stops = []
-    
-    for id, convo in enumerate(teacher.dataset):
+    loop_ids = []
+    chunk_ids = []
+
+    for convo in student.dataset:
         convo_kb = distr_size_kb * convo.len_content
         cache_size_kb += convo_kb
         
         if cache_size_kb >= max_cache_size_kb:
-            loop_stops.append(id+1)
+            loop_ids.append(chunk_ids)
+            chunk_ids = []
             cache_size_kb = 0
+        
+        chunk_ids.append(convo.origin_convo_id)
     
-    if not loop_stops:
+    if not loop_ids:
         full_collect = True
 
-    if loop_stops and loop_stops[-1] != len(teacher.dataset):
-        loop_stops.append(len(teacher.dataset))
+    if chunk_ids:
+        loop_ids.append(chunk_ids)
 
-    return loop_stops, full_collect
+    return loop_ids, full_collect
 
 
 def get_teachers(models_folder) -> list[TeacherModel]:
@@ -143,38 +147,25 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
                         validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment):
     
     student.num_epochs = num_epochs
-    student.num_warmup_steps = num_warmup_steps
+    student.num_warmup_steps = math.ceil(num_warmup_steps / (grad_accum_batches * student.batch_size))
+    student.total_training_steps = num_epochs * student.dataset_len
     student.lr = lr
     student.lr_scheduler_name = lr_scheduler.lower()
     student.optimizer_name = optimizer.lower()
-    student.num_grad_accum_batches = grad_accum_batches
+    student.grad_accum = grad_accum_batches
+    student.num_grad_accum_batches = math.ceil(student.total_training_steps / grad_accum_batches)
     student.training_precision_name = training_precision.lower()
     student.decay_start = decay_start
     student.multi_gpu = multi_gpu
     student.data_order = data_order.lower()
     student.validation_every_steps = validate_every_n_epochs * student.dataset_len
     student.next_accum_step = grad_accum_batches * student.batch_size
-    student.num_training_steps = num_epochs * student.dataset_len
     student.save_every_steps = save_student_every_n_epochs * student.dataset_len
     student.next_save_step = save_student_every_n_epochs * student.dataset_len
     student.save_final_state = save_final_state
     student.grad_checkpointing = grad_checkpointing
     student.freeze_layers = freeze_layers
     student.wandb_comment = wandb_comment
-
-
-def rewrite_teachers_param(teachers: list[TeacherModel], param_name, param_value):
-    for teacher in teachers:
-        setattr(teacher, param_name.lower(), param_value)
-
-
-def sort_datasets_by_map(teachers: list[TeacherModel], sorting_map: dict[int, int], validation_sorting_map: dict[int, int]):
-    for teacher in teachers:
-        if not teacher.dataset_sorted:
-           teacher.sort_dataset_by_map(sorting_map)
-        
-        if not teacher.validation_dataset_sorted:
-            teacher.sort_dataset_by_map(validation_sorting_map, validation=True)
 
 
 def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: Paths, rebase_dataset: bool) -> tuple[bool, bool]:
@@ -259,7 +250,7 @@ def save_dataset_metadata(path, teachers: list[TeacherModel], student: StudentMo
 
 def main():
     cache_folder = r"C:\Users\PC\Desktop\cache"
-    max_cache_size_gb = 300
+    max_cache_size_gb = 0.1
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
@@ -290,7 +281,7 @@ def main():
     num_epochs = 1
     num_warmup_steps = 50
 
-    batch_size = 4
+    batch_size = 2
     grad_accum_batches = 1
     grad_checkpointing = False
     temperature = 1
@@ -335,10 +326,9 @@ def main():
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
                         validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment)
 
-    sorting_map, validation_sorting_map = teachers[0].sort_dataset_by_len()
-    sort_datasets_by_map(teachers, sorting_map, validation_sorting_map)
+    student._reorder_dataset()
 
-    loop_stops, full_collect = calculate_loop_stops(teachers[0], max_cache_size_gb, enable_topK, save_topK)
+    loop_ids, full_collect = calculate_loop_ids(student, max_cache_size_gb, enable_topK, save_topK)
 
     collect, collect_val = collect_or_load(student, teachers, paths, rebase_dataset)
     
@@ -355,7 +345,7 @@ def main():
         validation_data_manager.purge_dataset()
 
         for teacher in teachers:
-            teacher.process_chunk(reserve_vram, full_collect=True, data_manager=validation_data_manager, validation=True)
+            teacher.process_chunk(reserve_vram, data_manager=validation_data_manager, validation=True)
 
         save_dataset_metadata(paths.dataset_validation, teachers, student, validation=True)
 
@@ -365,7 +355,7 @@ def main():
         if rebase_dataset:
             save_dataset_metadata(paths.dataset_validation, teachers, student, validation=True)
     
-
+    
     ## Training collecting loop
     if collect and not rebase_dataset:
         print("Collecting all data..." if full_collect else "Collecting data in chunks...")
@@ -383,16 +373,14 @@ def main():
         else:
             for epoch in tqdm(range(num_epochs), desc="Epochs", smoothing=0.06, position=0):
 
-                for stop in tqdm(loop_stops, desc="Chunks", smoothing=0.06, position=1, leave=False):
+                for chunk_ids in tqdm(loop_ids, desc="Chunks", smoothing=0.06, position=1, leave=False):
                     data_manager.purge_dataset()
 
                     for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=2, leave=False):
-                        teacher.process_chunk(reserve_vram, next_stop_id=stop, data_manager=data_manager)
+                        teacher.process_chunk(reserve_vram, ids_to_collect=chunk_ids, data_manager=data_manager)
 
                     student.train_chunk(data_manager, validation_data_manager, full_collect)
 
-                for teacher in teachers:
-                    teacher.new_epoch()
     else:
         print("Using data on disk for training...")
 
@@ -402,9 +390,7 @@ def main():
         student.train_chunk(data_manager, validation_data_manager, True)
 
     validation_data_manager.close()
-    print("Validation datamanager closed!")
     data_manager.close()
-    print("Training datamanager closed!")
 
     print("\nDone!")
 

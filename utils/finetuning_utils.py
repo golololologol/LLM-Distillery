@@ -44,7 +44,7 @@ class WarmupStableDecayLR(LRScheduler):
             return [self.final_lr for group in self.optimizer.param_groups]
         
 
-def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_content_tokens):
+def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_content_tokens) -> dict[str, torch.Tensor]:
     def custom_kl_div(student_logprobs: torch.Tensor, teacher_logprobs: torch.Tensor, per_token: bool = False):
         kl_div_raw = F.kl_div(student_logprobs, teacher_logprobs, reduction='none', log_target=True)
 
@@ -87,7 +87,17 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
 
     custom_loss = (kl_div + reverse_kl_div)/2
 
-    return custom_loss.mean(), cross_entropy_loss, kl_div.mean(), reverse_kl_div.mean(), weighted_kl_div, weighted_r_kl_div
+    loss_dict = {
+        "train_loss": custom_loss.mean(), # DO NOT REMOVE  This is the loss that will be backpropagated every batch at Losses.backward()
+        "custom loss": custom_loss.mean(),
+        "CE loss": cross_entropy_loss,
+        "kl_div": kl_div.mean(),
+        "reverse kl_div": reverse_kl_div.mean(),
+        "weighted kl_div": weighted_kl_div,
+        "weighted rev. kl_div": weighted_r_kl_div
+    }
+
+    return loss_dict
 
 
 def set_optimizer(model_parameters, lr, betas, optimizer_name: str, weight_decay=1e-2, momentum=0.01, nesterov=False):

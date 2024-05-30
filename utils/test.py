@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
 import math
 import torch.nn.functional as F
 from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
@@ -354,3 +354,7 @@ print(f"Losses * Weights: {weighted_losses}")
 print(f"Losses * Transformed weights: {weighted_losses_transformed}")
 print(f"Mean of both: {mean_losses}")
 print(f"Total mean: {mean_losses.mean()}")
+
+model: LlamaForCausalLM = LlamaForCausalLM.from_pretrained("HuggingFaceH4/zephyr-7b-gemma-v0.1")
+# check on which device the model expects the input
+model.load_state_dict()

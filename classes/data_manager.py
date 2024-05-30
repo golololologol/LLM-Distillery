@@ -28,7 +28,7 @@ class H5DataManager:
         self.done_everything.set()
         self.closing = multiprocessing.Event()
         self.got_task = multiprocessing.Event()
-        self.loading_process = get_context("spawn").Process(target=self._process_thread)
+        self.loading_process = get_context("spawn").Process(target=self._process_thread, daemon=True)
         self.shared_batches = []
 
         self.loading_process.start()
@@ -49,7 +49,6 @@ class H5DataManager:
                     task, data = self.queue.get()
 
                     if self.closing.is_set():
-                        print("Got task to close.")
                         self.done_everything.set()
                         break
 
@@ -69,7 +68,6 @@ class H5DataManager:
                                         time.sleep(0.1)
 
                                     if self.closing.is_set():
-                                        print("Read-only mode ended.")
                                         break
 
                                     self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
@@ -87,13 +85,14 @@ class H5DataManager:
                             self._clear_dataset(hdf_file, data)
 
                     if self.closing.is_set():
-                        print("Closing process.")
                         break
                         
-                    self.done_everything.set()
+                self.done_everything.set()
 
                 if self.closing.is_set():
-                    print("Closing process fully now.")
+                    for shared_batch in self.shared_batches:
+                        shared_batch.close()
+                        shared_batch.unlink()
                     break
                 
     def _process_distributions(self, hdf_file, batch: list[Distribution]):
@@ -282,7 +281,6 @@ class H5DataManager:
         """
         Returns a list of all conversation IDs in the dataset.
         """
-        self.done_everything.wait()
         self.queue.put(('get_available_ids', None))
         self.got_task.set()
         return self.result_queue.get()
@@ -305,5 +303,5 @@ class H5DataManager:
 
     def close(self):
         self.closing.set()
+        self.queue.put(('close', None))
         self.got_task.set()
-        self.loading_process.join()

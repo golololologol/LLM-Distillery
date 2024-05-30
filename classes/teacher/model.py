@@ -26,13 +26,13 @@ class TeacherModel(BaseModel):
         self.reserve_vram = []
         self.max_queue_size = max_queue_size
 
-    def process_chunk(self, reserve_vram_gb: list[float] = [], next_stop_id: int = 1, data_manager = None, full_collect: bool = False, validation: bool = False):
-        if full_collect:
-            num_to_process = self.validation_dataset_len if validation else self.dataset_len
-        else:
-            num_to_process = next_stop_id - self.stop_id
+    def process_chunk(self, reserve_vram_gb: list[float] = [], ids_to_collect: list = [], full_collect: bool = False, data_manager = None, validation: bool = False):
+        self._sort_datasets_by_len()
 
-        dataset_chunk = (self.validation_dataset if validation else self.dataset)[self.stop_id:self.stop_id+num_to_process]
+        dataset_chunk = (self.validation_dataset if validation else self.dataset)
+
+        if not validation and not full_collect:
+            dataset_chunk = [convo for convo in dataset_chunk if convo.origin_convo_id in ids_to_collect]
 
         with multiprocessing.Manager() as manager:
             done_chunk = manager.Event()
@@ -42,7 +42,7 @@ class TeacherModel(BaseModel):
             disk_queue = manager.Queue(self.max_queue_size)
             pbar_queue = manager.Queue(self.max_queue_size)
 
-            self.progress_bar = tqdm(total=num_to_process, desc="Convos", smoothing=0.06, leave=False)
+            self.progress_bar = tqdm(total=len(dataset_chunk), desc="Convos", smoothing=0.06, leave=False)
             self.data_manager = data_manager
             self.reserve_vram = reserve_vram_gb
 
@@ -55,29 +55,14 @@ class TeacherModel(BaseModel):
             self._stop_workers(*workers)
             self.progress_bar.close()
 
-            if not validation:
-                self.stop_id = next_stop_id
-    
-    def new_epoch(self):
-        self.stop_id = 0
-
-    def sort_dataset_by_len(self):
-        self.validation_dataset.sort(key=lambda convo: convo.length, reverse=True)
-        self.validation_dataset_sorted = True
-        validation_sorting_map = {convo.origin_convo_id: i for i, convo in enumerate(self.validation_dataset)}
-
-        self.dataset.sort(key=lambda convo: convo.length, reverse=True)
-        self.dataset_sorted = True
-        sorting_map = {convo.origin_convo_id: i for i, convo in enumerate(self.dataset)}
-        return sorting_map, validation_sorting_map
-    
-    def sort_dataset_by_map(self, sorting_map: dict[int, int], validation: bool = False):
-        if validation:
-            self.validation_dataset.sort(key=lambda convo: sorting_map[convo.origin_convo_id])
-            self.validation_dataset_sorted = True
-        else:
-            self.dataset.sort(key=lambda convo: sorting_map[convo.origin_convo_id])
+    def _sort_datasets_by_len(self):
+        if not self.dataset_sorted:
+            self.dataset.sort(key=lambda convo: convo.length, reverse=True)
             self.dataset_sorted = True
+
+        if not self.validation_dataset_sorted:
+            self.validation_dataset.sort(key=lambda convo: convo.length, reverse=True)
+            self.validation_dataset_sorted = True
 
     def _manage_queues(self, disk_queue, pbar_queue):
         while not disk_queue.empty():

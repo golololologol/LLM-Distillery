@@ -1,17 +1,15 @@
 from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_divergence
-from peft import get_peft_config, get_peft_model, LoraConfig, TaskType, PeftModel
 from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from classes.data_classes import ConvoTokenized
 from classes.data_manager import H5DataManager
 from multiprocessing import shared_memory
 from classes.base_model import BaseModel
+from classes.losses import Losses
 from classes.paths import Paths
 from typing import Optional
-from copy import deepcopy
 from tqdm import tqdm
 import torch.nn.functional as F
-import peft.utils as peft_utils
 import numpy as np
 import torch
 import wandb
@@ -27,7 +25,7 @@ class StudentModel(BaseModel):
     def __init__(self, model_path: str, paths: Paths, add_bos: bool, prompt_format: dict, batch_size: int):
         super().__init__(model_path, student=True)
 
-        self.model: Optional[AutoModelForCausalLM|PeftModel] = None
+        self.model: Optional[AutoModelForCausalLM] = None
         self.adapter = None
         self.tokenizer: Optional[AutoTokenizer] = None
         self.add_bos = add_bos
@@ -44,8 +42,9 @@ class StudentModel(BaseModel):
         self.final_lr = 5e-7 # wsd only
 
         self.num_epochs = 0
-        self.num_training_steps = 0
+        self.total_training_steps = 0
         self.num_warmup_steps = 0
+        self.grad_accum = 0
         self.num_grad_accum_batches = 0
         self.validation_every_steps = 0
         self.save_every_steps = 0
@@ -56,7 +55,6 @@ class StudentModel(BaseModel):
         self.next_val_step = 0
         self.next_accum_step = 0
         self.state_path = ""
-        self.distr_device = ""
         self.saved_state = False
         self.val_batch_order_ids = []
         
@@ -77,13 +75,13 @@ class StudentModel(BaseModel):
     def _release_postfix(self):
         self.progress_bar.set_postfix_str("")
 
-    def _get_content_indices_tensor(self, content_ranges) -> torch.Tensor:
+    def _get_content_indices_tensor(self, content_ranges, device) -> torch.Tensor:
         content_indices = []
         for start, end in content_ranges:
             content_indices.append(np.arange(start, end))
-        return torch.as_tensor(np.concatenate(content_indices), dtype=torch.long).to(self.device, non_blocking=True)
+        return torch.as_tensor(np.concatenate(content_indices), dtype=torch.long).to(device, non_blocking=True)
 
-    def _load_model(self, model_path: str = None):
+    def _load_model(self, model_path: str = None, load_empty: bool = False):
         self._set_postfix("Loading model...")
 
         precision_dict = {
@@ -117,7 +115,6 @@ class StudentModel(BaseModel):
                     if freeze_layer in name:
                         param.requires_grad = False
 
-        torch.cuda.empty_cache()
         self._release_postfix()
 
     def _unload_model(self):
@@ -157,7 +154,7 @@ class StudentModel(BaseModel):
     def _save_state(self):
         self._set_postfix("Saving state...")
 
-        if self.num_trained_steps < self.num_training_steps:
+        if self.num_trained_steps < self.total_training_steps:
             self.paths.empty_student_states()
 
         torch.save(self.model.state_dict(), os.path.join(self.paths.student_states, "model_state.pt"))
@@ -180,17 +177,16 @@ class StudentModel(BaseModel):
     def _load_state(self):
         self._set_postfix("Loading state...")
 
-        model_state = torch.load(os.path.join(self.paths.student_states, "model_state.pt"), map_location=self.device)
-        optimizer_state = torch.load(os.path.join(self.paths.student_states, "optimizer_state.pt"), map_location=self.device)
-        scheduler_state = torch.load(os.path.join(self.paths.student_states, "scheduler_state.pt"), map_location=self.device)
-
         self._load_model()
+        model_state = torch.load(os.path.join(self.paths.student_states, "model_state.pt"), map_location=self.model.hf_device_map)
         self.model.load_state_dict(model_state, assign=True)
 
         self._load_optimizer()
+        optimizer_state = torch.load(os.path.join(self.paths.student_states, "optimizer_state.pt"))
         self.optimizer.load_state_dict(optimizer_state)
 
-        self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_training_steps, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
+        self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_grad_accum_batches, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
+        scheduler_state = torch.load(os.path.join(self.paths.student_states, "scheduler_state.pt"))
         self.lr_scheduler.load_state_dict(scheduler_state)
 
         self._release_postfix()
@@ -212,6 +208,14 @@ class StudentModel(BaseModel):
             id_batches.append([convo.origin_convo_id for convo in batch])
 
         return convo_batches, id_batches
+    
+    def _prefetch_dataset_chunk(self, data_manager: H5DataManager, data_list: list, full_collect, trainable_ids) -> list:
+            self._reorder_dataset()
+            dataset_chunk = self.dataset if full_collect else [convo for convo in self.dataset if convo.origin_convo_id in trainable_ids]
+            batched_chunk_convos, id_batches = self._construct_batches(dataset_chunk)
+            data_list.append(batched_chunk_convos)
+            data_manager.enqueue_get_batches(id_batches)
+            return data_list
 
     def train_chunk(self, data_manager: H5DataManager, validation_data_manager: H5DataManager, full_collect):
         trainable_ids = data_manager.get_dataset_ids()
@@ -229,7 +233,7 @@ class StudentModel(BaseModel):
         if self.tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
 
-        self.progress_bar = tqdm(total=self.num_training_steps, initial=self.num_trained_steps, desc="Training", smoothing=0.06, leave=False)
+        self.progress_bar = tqdm(total=self.total_training_steps, initial=self.num_trained_steps, desc="Training", smoothing=0.06, leave=False)
 
         if self.saved_state:
             self._load_state()
@@ -238,43 +242,38 @@ class StudentModel(BaseModel):
         else:
             self._load_model()
             self._load_optimizer()
-            self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_training_steps, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
+            self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_grad_accum_batches, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
 
         if self.num_trained_steps == 0:
             self._validate_distillation(validation_data_manager)
-
+        
+        losses = Losses(self.logger)
+        
         # Main training loop
         if full_collect:
             data_manager_left_shuffles = self.num_epochs - 1
-            data_list = []
-            self._reorder_dataset()
-            dataset_chunk = self.dataset if full_collect else [convo for convo in self.dataset if convo.origin_convo_id in trainable_ids]
-            batched_chunk_convos, id_batches = self._construct_batches(dataset_chunk)
-            data_list.append(batched_chunk_convos)
-            data_manager.enqueue_get_batches(id_batches)
+            data_list = self._prefetch_dataset_chunk(data_manager, [], full_collect, trainable_ids)
                 
             for i in range(self.num_epochs):
                 if data_manager_left_shuffles > 0:
                     self._reorder_dataset()
-                    dataset_chunk = self.dataset if full_collect else [convo for convo in self.dataset if convo.origin_convo_id in trainable_ids]
-                    batched_chunk_convos, id_batches = self._construct_batches(dataset_chunk)
-                    data_list.append(batched_chunk_convos)
-                    data_manager.enqueue_get_batches(id_batches)
+                    data_list = self._prefetch_dataset_chunk(data_manager, data_list, full_collect, trainable_ids)
                     data_manager_left_shuffles -= 1
 
-                self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager)
+                updated_grads = self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager, losses)
         else:
-            self._reorder_dataset()
-            dataset_chunk = self.dataset if full_collect else [convo for convo in self.dataset if convo.origin_convo_id in trainable_ids]
-            batched_chunk_convos, id_batches = self._construct_batches(dataset_chunk)
-            data_manager.enqueue_get_batches(id_batches)
-            self._run_distillation_cycle(batched_chunk_convos, data_manager, validation_data_manager)
+            data_list = self._prefetch_dataset_chunk(data_manager, [], full_collect, trainable_ids)
+            updated_grads = self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager, losses)
+
+        if not updated_grads:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
         if not full_collect:
             self._save_state()
             self.saved_state = True
 
-        if self.num_trained_steps >= self.num_training_steps:
+        if self.num_trained_steps >= self.total_training_steps:
             self._save_model("final")
             if self.save_final_state:
                 self._save_state()
@@ -292,128 +291,100 @@ class StudentModel(BaseModel):
             self.logger.finish()
 
     # main training loop
-    def _run_distillation_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager):
-        for batch_convos in batched_chunk_convos:
-            num_steps = len(batch_convos)
-            device = self.distr_device if self.distr_device else self.device
+    def _run_distillation_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager, losses: Losses) -> bool:
 
-            sdh_mem_name, batch_shape, batch_dtype, batch_indices, batch_padding = data_manager.read_next_batch()
-            shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
-            teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(device, non_blocking=True)
+        for batch_convos in batched_chunk_convos:
+            updated_grads = False
+            batch_steps = len(batch_convos)
 
             max_non_padded_len = max(convo.length for convo in batch_convos)
             batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
             batch_tokenized_tensor = torch.from_numpy(batch_tokenized).to(self.device, non_blocking=True)
 
-            batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_custom_loss = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_weighted_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_reverse_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_weighted_r_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
-
             batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
+            
+            logits_device = batch_logits.device
 
-            if not self.distr_device:
-                self.distr_device = batch_logits.device
+            sdh_mem_name, batch_shape, batch_dtype, batch_indices, batch_padding = data_manager.read_next_batch()
+            shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
+            teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(logits_device, non_blocking=True)
 
             for i, convo in enumerate(batch_convos):
-                indices = torch.from_numpy(batch_indices[i]).to(device, non_blocking=True)
-                content_indices = self._get_content_indices_tensor(convo.content_ranges)
+                indices = torch.from_numpy(batch_indices[i]).to(logits_device, non_blocking=True)
+                content_indices = self._get_content_indices_tensor(convo.content_ranges, logits_device)
 
                 convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
                 convo_teacher_logits = teacher_batch_raw[i]
                 convo_content_tokens = torch.index_select(batch_tokenized_tensor[i], 0, content_indices)
 
-                custom_loss, cross_entropy_loss, kl_div, reverse_kl_div, weighted_kl_div, weighted_r_kl_div = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens)
+                loss_dict = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens)
 
-                divisor = num_steps * self.num_grad_accum_batches
-
-                batch_cross_entropy_loss += cross_entropy_loss / divisor
-                batch_custom_loss += custom_loss / divisor
-                batch_kl_div += kl_div / divisor
-                batch_weighted_kl_div += weighted_kl_div / divisor
-                batch_reverse_kl_div += reverse_kl_div / divisor
-                batch_weighted_r_kl_div += weighted_r_kl_div / divisor
-
-                self.lr_scheduler.step()
-
-            self.logger.log({"Loss/cross entropy": batch_cross_entropy_loss * self.num_grad_accum_batches}, step=self.num_trained_steps)
-            self.logger.log({"Loss/custom loss": batch_custom_loss * self.num_grad_accum_batches}, step=self.num_trained_steps)
-            self.logger.log({"Loss/KL divergence": batch_kl_div * self.num_grad_accum_batches}, step=self.num_trained_steps)
-            self.logger.log({"Loss/weighted KL divergence": batch_weighted_kl_div * self.num_grad_accum_batches}, step=self.num_trained_steps)
-            self.logger.log({"Loss/reverse KL divergence": batch_reverse_kl_div * self.num_grad_accum_batches}, step=self.num_trained_steps)
-            self.logger.log({"Loss/weighted rev. KL divergence": batch_weighted_r_kl_div * self.num_grad_accum_batches}, step=self.num_trained_steps)
-
-            self.logger.log({"Learning rate": self.lr_scheduler.get_last_lr()[0]}, step=self.num_trained_steps)
-            self.progress_bar.update(num_steps)
+                losses.add_losses(loss_dict)
             
-            batch_custom_loss.backward()
+            losses.backward(divisor=self.batch_size*self.grad_accum)
+            
+            self.progress_bar.update(batch_steps)
 
-            self.num_trained_steps += num_steps
+            self.num_trained_steps += batch_steps
 
             if self.num_trained_steps >= self.next_accum_step:
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-                self.next_accum_step += self.num_grad_accum_batches * self.batch_size
+
+                self.logger.log({"Learning Rate": self.optimizer.param_groups[0]['lr']}, step=self.num_trained_steps)
+                losses.log(self.num_trained_steps)
+                losses.empty()
+
+                self.lr_scheduler.step()
+
+                updated_grads = True
+                self.next_accum_step += self.grad_accum * self.batch_size
                 
-            if (self.num_trained_steps >= self.next_save_step) and not (self.num_trained_steps >= self.num_training_steps):
+            if (self.num_trained_steps >= self.next_save_step) and not (self.num_trained_steps >= self.total_training_steps):
                 self._save_model(self.num_trained_steps)
                 self.next_save_step += self.save_every_steps
 
-            if self.num_trained_steps >= self.next_val_step or self.num_trained_steps >= self.dataset_len:
+            if self.num_trained_steps >= self.next_val_step:
                 self._validate_distillation(validation_data_manager)
+
+        return updated_grads
 
     def _validate_distillation(self, validation_data_manager: H5DataManager):
         self.model.eval()
-        device = self.distr_device if self.distr_device else self.device
         pbar = tqdm(total=self.validation_dataset_len, desc="Validating", leave=False, smoothing=0.06)
+        losses = Losses(self.logger, validation=True)
 
         with torch.no_grad():
-            batch_cross_entropy_loss = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_custom_loss = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_weighted_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_reverse_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
-            batch_weighted_r_kl_div = torch.tensor(0.0).to(device, non_blocking=True)
 
             for val_convo_batch in self.validation_dataset_batched:
-                sdh_mem_name, batch_shape, batch_dtype, val_batch_indices, batch_padding = validation_data_manager.read_next_batch()
-                shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
-                teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(device, non_blocking=True)
-
                 val_max_non_padded_len = max(convo.length for convo in val_convo_batch)
                 val_batch_tokenized = np.array([convo.tokenized[:val_max_non_padded_len] for convo in val_convo_batch])
-                val_batch_tokenized_tensor = torch.from_numpy(val_batch_tokenized).to(self.device, non_blocking=True)
+                val_batch_tokenized_tensor = torch.from_numpy(val_batch_tokenized).to(self.device, non_blocking=False)
 
                 val_batch_logits = self.model(val_batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
 
+                logits_device = val_batch_logits.device
+
+                sdh_mem_name, batch_shape, batch_dtype, val_batch_indices, batch_padding = validation_data_manager.read_next_batch()
+                shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
+                teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(logits_device, non_blocking=True)
+
                 for i, val_convo in enumerate(val_convo_batch):
-                    val_indices = torch.from_numpy(val_batch_indices[i]).to(device, non_blocking=True)
-                    val_content_indices = self._get_content_indices_tensor(val_convo.content_ranges)
+                    val_indices = torch.from_numpy(val_batch_indices[i]).to(logits_device, non_blocking=True)
+                    val_content_indices = self._get_content_indices_tensor(val_convo.content_ranges, logits_device)
 
                     val_convo_content_logits = torch.index_select(val_batch_logits[i], 0, val_content_indices) / self.temperature
                     val_convo_teacher_logits = teacher_batch_raw[i][:batch_padding[i]]
                     val_convo_content_tokens = torch.index_select(val_batch_tokenized_tensor[i], 0, val_content_indices)
                     
-                    custom_loss, cross_entropy_loss, kl_div, reverse_kl_div, weighted_kl_div, weighted_r_kl_div = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, val_indices, val_convo_content_tokens)
+                    loss_dict = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, val_indices, val_convo_content_tokens)
                     
-                    batch_cross_entropy_loss += cross_entropy_loss
-                    batch_custom_loss += custom_loss
-                    batch_kl_div += kl_div
-                    batch_weighted_kl_div += weighted_kl_div
-                    batch_reverse_kl_div += reverse_kl_div
-                    batch_weighted_r_kl_div += weighted_r_kl_div
-
+                    losses.add_losses(loss_dict)
+                    
                 pbar.update(len(val_convo_batch))
 
-        divisor = len(self.validation_dataset)
-        self.logger.log({"Val Loss/cross entropy": batch_cross_entropy_loss/divisor}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/custom loss": batch_custom_loss/divisor}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/KL divergence": batch_kl_div/divisor}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/weighted KL divergence": batch_weighted_kl_div/divisor}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/reverse KL divergence": batch_reverse_kl_div/divisor}, step=self.num_trained_steps)
-        self.logger.log({"Val Loss/weighted rev. KL divergence": batch_weighted_r_kl_div/divisor}, step=self.num_trained_steps)
+        losses.log(self.num_trained_steps)
+        losses.empty()
 
         pbar.close()
         self.model.train()
