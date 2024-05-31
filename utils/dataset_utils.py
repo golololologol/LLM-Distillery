@@ -113,12 +113,13 @@ def tokenize_sample(args):
     sys_content = json_item.get("init", "")
     if sys_content:
         sys_content_tokenized = good_encode(sys_content.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
-        conversation_tokenized[num_toks:len(pf['SYS_START']) + num_toks] = pf['SYS_START']
-        num_toks += len(pf['SYS_START'])
-        conversation_tokenized[num_toks:num_toks + len(sys_content_tokenized)] = sys_content_tokenized
-        num_toks += len(sys_content_tokenized)
-        conversation_tokenized[num_toks:num_toks + len(pf['SYS_END'])] = pf['SYS_END']
-        num_toks += len(pf['SYS_END'])
+        sys_tokenized = np.zeros(len(pf['SYS_START']) + len(sys_content_tokenized) + len(pf['SYS_END']), dtype=np.int64)
+        sys_tokenized[:len(pf['SYS_START'])] = pf['SYS_START']
+        sys_tokenized[len(pf['SYS_START']):len(pf['SYS_START']) + len(sys_content_tokenized)] = sys_content_tokenized
+        sys_tokenized[len(pf['SYS_START']) + len(sys_content_tokenized):] = pf['SYS_END']
+        sys_tokenized = sys_tokenized[:context_len - num_toks]
+        conversation_tokenized[num_toks:num_toks + len(sys_tokenized)] = sys_tokenized
+        num_toks += len(sys_tokenized)
         if save_sys_range:
             conversation_content_ranges.append((len(pf['SYS_START']) + start_idx, num_toks - len(pf['SYS_END'])))
         start_idx = num_toks - 1

@@ -69,6 +69,8 @@ class StudentModel(BaseModel):
         self.grad_checkpointing = False
         self.multi_gpu = False
         self.wandb_comment = ""
+        self.device_map_name = ""
+        self.max_memory = {}
         
 
     def _set_postfix(self, postfix: str):
@@ -100,11 +102,12 @@ class StudentModel(BaseModel):
 
         self.model = AutoModelForCausalLM.from_pretrained(
             path,
-            device_map="balanced" if self.multi_gpu else self.device, #"balanced_low_0"
+            device_map=self.device_map_name if self.multi_gpu else self.device, #"balanced_low_0", "balanced"
             torch_dtype=train_precision,
             load_in_4bit=self.training_precision_name == "4bit",
             load_in_8bit = self.training_precision_name == "8bit",
-            attn_implementation="flash_attention_2"
+            attn_implementation="flash_attention_2",
+            max_memory = self.max_memory
         )
 
         self.model.train()

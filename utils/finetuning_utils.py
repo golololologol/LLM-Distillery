@@ -56,7 +56,7 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
         return kl_div
         
     def abomination_loss(kl_div_per_token: torch.Tensor, alpha: torch.Tensor, CE_loss: torch.Tensor):
-        corrected_CE_loss = torch.cat((CE_loss, alpha))
+        corrected_CE_loss = torch.cat((CE_loss, torch.zeros(1, device=CE_loss.device)))
 
         weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha)
 
@@ -66,8 +66,6 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
 
         return loss
     
-    alpha = torch.tensor([alpha], dtype=torch.float32).to(student_logits.device, non_blocking=True)
-
     min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
 
     student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)

@@ -362,11 +362,6 @@ def truncated_kldiv(student_probs, teacher_probs):
 
 # load exllama model
 tensor = torch.tensor(([0.0004, 10.1, 1.2], [1.5, 2.3, 3.4]))
-max_val = tensor.sum(dim=-1).max()
-max_norm = tensor/max_val
+tensor2 = torch.tensor(([1, 0.5, 0.5], [0.5, 1, 0.5]))
 
-sum_val = tensor.sum(dim=-1)
-sum_norm = tensor/sum_val.unsqueeze(-1)
-
-print(f"Max norm: {max_norm.tolist()}")
-print(f"Sum norm: {sum_norm.tolist()}")
+diff = tensor - tensor2

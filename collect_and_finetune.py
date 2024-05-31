@@ -146,7 +146,7 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
 
 
 def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
-                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha):
+                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory):
     
     student.num_epochs = num_epochs
     student.num_warmup_steps = math.ceil(num_warmup_steps / (grad_accum_batches * student.batch_size))
@@ -169,6 +169,8 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.freeze_layers = freeze_layers
     student.wandb_comment = wandb_comment
     student.alpha = alpha
+    student.device_map_name = device_map
+    student.max_memory = max_memory
 
 
 def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: Paths, rebase_dataset: bool) -> tuple[bool, bool]:
@@ -257,7 +259,7 @@ def main():
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
-    dataset_path = r"C:\Users\PC\Downloads\train_test_small_v2.jsonl"
+    dataset_path = r"C:\Users\PC\Converted_random_samples_4k.jsonl"
     validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
@@ -301,6 +303,8 @@ def main():
     validate_every_n_epochs = 0.1
     save_student_every_n_epochs = 4
 
+    device_map = "balanced" # "balanced", "balanced_low_0"
+    max_memory = {0: '20GB', 1: '20GB', 'cpu': '200GB'} # {0: '20GB', 1: '60GB', 2: '60GB', 3: '60GB', 'cpu': '200GB'}
     multi_gpu = True
     save_final_state = False
     wandb_comment = f"FFT" # Comment for wandb: {comment} ModelName lr(lr) (Date/Time)
@@ -329,7 +333,7 @@ def main():
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
-                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha)
+                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory)
 
     student.reorder_dataset()
 
