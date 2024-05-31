@@ -112,13 +112,13 @@ class TeacherModel(BaseModel):
         for _ in range(num_inference_workers):
             model_loaded.clear()
 
-            gpus_mem_free = []
+            gpus_mem_used = []
             for i in range(torch.cuda.device_count()):
                 handle = nvidia_smi.nvmlDeviceGetHandleByIndex(i)
                 info = nvidia_smi.nvmlDeviceGetMemoryInfo(handle)
-                gpus_mem_free.append(info.free)
+                gpus_mem_used.append(info.used)
 
-            worker = get_context("spawn").Process(target=_inference_worker, args=(inference_queue, result_queue, made_distributions, model_loaded, start_inference, done_chunk, self.model_path, self.model_name[:20], self.reserve_vram, gpus_mem_free, 
+            worker = get_context("spawn").Process(target=_inference_worker, args=(inference_queue, result_queue, made_distributions, model_loaded, start_inference, done_chunk, self.model_path, self.model_name[:20], self.reserve_vram, gpus_mem_used, 
                                                                              self.temperature, self.crop_to_size, pbar_queue, self.context_len, self.batch_size, self.max_queue_size, self.seq_chunk_len, self.enable_topK, self.topK), daemon=True)
             time.sleep(1)
             worker.start()

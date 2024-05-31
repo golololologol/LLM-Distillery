@@ -1,8 +1,8 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
 from utils.vocab_utils import get_special_tokens
 from classes.data_classes import ConvoTokenized
 from multiprocessing import cpu_count
-from multiprocessing.pool import ThreadPool as Pool
 from classes.base_model import BaseModel
 from transformers import AutoTokenizer
 from tqdm import tqdm
@@ -61,15 +61,18 @@ def encode_prompt_format(prompt_format: dict, sp_toks: dict, tokenizer) -> dict[
         prompt_format[key] = good_encode(value, sp_toks, tokenizer)
     return prompt_format
 
-def tokenize_convo(args):
+def tokenize_sample(args):
     convo_id, json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, model, ignore_model_type = args
 
+    conversation_tokenized = np.zeros(context_len, dtype=np.int64)
+
     if model.add_bos:
-        conversation_tokenized = np.array([sp_toks["bos_id"]], dtype=np.int64)
-        start_index = 0
+        conversation_tokenized[0] = sp_toks["bos_id"]
+        num_toks = 1
+        start_idx = 0
     else:
-        conversation_tokenized = np.array([], dtype=np.int64)
-        start_index = -1
+        num_toks = 0
+        start_idx = -1
 
     conversation_content_ranges = []
     tags = json_item.get("tags", [])
@@ -83,9 +86,10 @@ def tokenize_convo(args):
 
             if text:
                 text_tokenized = good_encode(text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
-                conversation_tokenized = np.concatenate((conversation_tokenized, text_tokenized))
-                conversation_content_ranges.append((0, len(conversation_tokenized)))
-                return convo_id, conversation_tokenized, conversation_content_ranges, empty
+                conversation_tokenized[num_toks:num_toks + len(text_tokenized)] = text_tokenized
+                num_toks += len(text_tokenized)
+                conversation_content_ranges.append((0, num_toks))
+                return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
             else:
                 empty = True
 
@@ -101,23 +105,30 @@ def tokenize_convo(args):
         empty = True
 
     if empty:
-        return convo_id, conversation_tokenized, conversation_content_ranges, empty
+        return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
+    
+
     
     reversed = ("reversed" in tags) or json_item.get("reversed", False)
 
     sys_content = json_item.get("init", "")
     if sys_content:
         sys_content_tokenized = good_encode(sys_content.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
-        conversation_tokenized = np.concatenate((conversation_tokenized, pf['SYS_START'], sys_content_tokenized, pf['SYS_END']))
+        conversation_tokenized[num_toks:len(pf['SYS_START']) + num_toks] = pf['SYS_START']
+        num_toks += len(pf['SYS_START'])
+        conversation_tokenized[num_toks:num_toks + len(sys_content_tokenized)] = sys_content_tokenized
+        num_toks += len(sys_content_tokenized)
+        conversation_tokenized[num_toks:num_toks + len(pf['SYS_END'])] = pf['SYS_END']
+        num_toks += len(pf['SYS_END'])
         if save_sys_range:
-            conversation_content_ranges.append((len(pf['SYS_START']) + start_index, len(conversation_tokenized) - len(pf['SYS_END'])))
-        start_index = len(conversation_tokenized) - 1
+            conversation_content_ranges.append((len(pf['SYS_START']) + start_idx, num_toks - len(pf['SYS_END'])))
+        start_idx = num_toks - 1
 
     for i, turn in enumerate(json_item["conversations"]):
 
         if turn == "":
             empty = True
-            return convo_id, conversation_tokenized, conversation_content_ranges, empty
+            return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
 
         if reversed:
             assistant = (i + 1) % 2
@@ -129,34 +140,39 @@ def tokenize_convo(args):
         turn_tokenized = good_encode(turn.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
         turn_len = len(turn_tokenized)
 
-        full_turn_tokenized = np.concatenate((turn_start_tokenized, turn_tokenized, turn_end_tokenized))
-        end_index = start_index + len(full_turn_tokenized)
+        full_turn_tokenized = np.zeros(len(turn_start_tokenized) + turn_len + len(turn_end_tokenized), dtype=np.int64)
+        full_turn_tokenized[:len(turn_start_tokenized)] = turn_start_tokenized
+        full_turn_tokenized[len(turn_start_tokenized):len(turn_start_tokenized) + turn_len] = turn_tokenized
+        full_turn_tokenized[len(turn_start_tokenized) + turn_len:] = turn_end_tokenized
+        end_idx = start_idx + len(full_turn_tokenized)
 
         if save_assistant_range and assistant:
-            content_start_index = start_index + len(pf['ASSISTANT_START'])
+            content_start_index = start_idx + len(pf['ASSISTANT_START'])
             content_end_index = content_start_index + turn_len + 1
             conversation_content_ranges.append((content_start_index, content_end_index))
         if save_user_range and not assistant:
-            content_start_index = start_index + len(pf['USER_START'])
+            content_start_index = start_idx + len(pf['USER_START'])
             content_end_index = content_start_index + turn_len + 1
             conversation_content_ranges.append((content_start_index, content_end_index))
 
-        start_index = end_index
+        start_idx = end_idx
 
-        if len(conversation_tokenized) > 0:
-            conversation_tokenized = np.concatenate((conversation_tokenized, full_turn_tokenized))
-        else:
-            conversation_tokenized = full_turn_tokenized
+        if num_toks + len(full_turn_tokenized) > context_len:
+            conversation_tokenized[num_toks:] = full_turn_tokenized[:context_len - num_toks]
+            num_toks = context_len
+            break
+
+        conversation_tokenized[num_toks:num_toks + len(full_turn_tokenized)] = full_turn_tokenized
+        num_toks += len(full_turn_tokenized)
     
     if not conversation_content_ranges:
         empty = True
-        return convo_id, conversation_tokenized, conversation_content_ranges, empty
+        return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
 
     if conversation_content_ranges[0][0] > context_len:
         empty = True
 
-    return convo_id, conversation_tokenized, conversation_content_ranges, empty
-
+    return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
 
 def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, model: BaseModel, ignore_model_type) -> tuple[list[ConvoTokenized], set[int]]:
     try:
@@ -173,47 +189,33 @@ def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range,
     dataset = []
     ids = set()
 
-    with Pool(cpu_count()) as pool:
-        results = tqdm(
-                pool.map(
-                    tokenize_convo,
-                    (
-                        (convo_id, item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, model, ignore_model_type)
-                        for convo_id, item in enumerate(read_jsonl(dataset_path))
-                    )
-                ),
-                desc="Tokenizing",
-                unit="convo",
-                smoothing=0.06,
-                leave=False
-                )
+    def generate_tasks():
+        for convo_id, item in enumerate(read_jsonl(dataset_path)):
+            yield (convo_id, item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, model, ignore_model_type)
 
-    for convo_id, conversation_tokenized, conversation_content_ranges, empty in results:
-        
-        if empty:
-            continue
+    with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
+        futures = {executor.submit(tokenize_sample, task): task for task in generate_tasks()}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Tokenizing", unit="convo", smoothing=0.06, leave=False):
+            convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty = future.result()
+            
+            if empty:
+                continue
 
-        num_pad_tokens = 0
-        cropped_end = False
+            num_pad_tokens = context_len - num_toks
+            cropped_end = False
 
-        if len(conversation_tokenized) > context_len:
-            conversation_tokenized = conversation_tokenized[:context_len]
-        else:
-            num_pad_tokens = context_len - len(conversation_tokenized)
-            conversation_tokenized = np.concatenate((conversation_tokenized, np.array([sp_toks["eos_id"]] * num_pad_tokens, dtype=np.int64)))
+            corrected_content_ranges = []
+            for start, end in conversation_content_ranges:
+                if start > context_len:
+                    break
+                if end > context_len:
+                    end = context_len
+                    cropped_end = True
+                corrected_content_ranges.append((start, end))
 
-        corrected_content_ranges = []
-        for start, end in conversation_content_ranges:
-            if start > context_len:
-                break
-            if end > context_len:
-                end = context_len
-                cropped_end = True
-            corrected_content_ranges.append((start, end))
-
-        conversation = ConvoTokenized(conversation_tokenized, corrected_content_ranges, num_pad_tokens, cropped_end, convo_id)
-        ids.add(convo_id)
-        dataset.append(conversation)
+            conversation = ConvoTokenized(conversation_tokenized, corrected_content_ranges, num_pad_tokens, cropped_end, convo_id)
+            ids.add(convo_id)
+            dataset.append(conversation)
 
     if not dataset:
         raise ValueError("No conversations were tokenized.\nIf you are using a completion model, make sure the completion tag is present in the conversations of your dataset.")

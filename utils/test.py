@@ -361,23 +361,12 @@ def truncated_kldiv(student_probs, teacher_probs):
 #print(f"Total mean: {mean_losses.mean()}")
 
 # load exllama model
-path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+tensor = torch.tensor(([0.0004, 10.1, 1.2], [1.5, 2.3, 3.4]))
+max_val = tensor.sum(dim=-1).max()
+max_norm = tensor/max_val
 
+sum_val = tensor.sum(dim=-1)
+sum_norm = tensor/sum_val.unsqueeze(-1)
 
-config = ExLlamaV2Config()
-config.model_dir = path
-config.prepare()
-config.max_seq_len = 2048
-config.max_batch_size = 1
-config.max_input_len = 2048
-config.max_attention_size = 2048 ** 2 
-
-model = ExLlamaV2(config)
-cache = ExLlamaV2Cache(model, 1, 2048, lazy=True)
-
-model.load([0.1, 12])
-print(torch.cuda.memory_reserved(1))
-print(torch.cuda.memory_allocated(1))
-print(torch.cuda.memory_summary(1))
-print(nvidia_smi.nvmlDeviceGetMemoryInfo(1).free)
-input("Press enter to continue")
+print(f"Max norm: {max_norm.tolist()}")
+print(f"Sum norm: {sum_norm.tolist()}")

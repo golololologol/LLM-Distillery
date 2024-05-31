@@ -257,10 +257,10 @@ def main():
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
-    dataset_path = r"C:\Users\PC\Downloads\train_test_small_v2.jsonl"
+    dataset_path = r"C:\Users\PC\Documents\distil_dataset_v1.jsonl"
     validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
 
-    teacher_models_folder = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+    teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
     student_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
 
     ignore_model_type = True # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
@@ -273,23 +273,23 @@ def main():
     save_assistant_range = True
     crop_distr_to_size = 32000
     enable_topK = True
-    save_topK = 200
+    save_topK = 300
     device = "cuda:1"
 
     # Collection settings
-    num_inference_workers = 2 # 3 IS ABSOLUTE MAX IT CAN GO
-    reserve_vram = [6, 0.5] # GB
+    num_inference_workers = 1 # 3 IS ABSOLUTE MAX IT CAN GO
+    reserve_vram = [4, 0.5] # GB, reserving ordered as [cuda:0, cuda:1, cuda:2, cuda:3, ...]
     encourage_eos = False
 
     # Training settings
     num_epochs = 1
     num_warmup_steps = 50
 
-    batch_size = 2
-    grad_accum_batches = 1
+    batch_size = 4
+    grad_accum_batches = 4
     grad_checkpointing = False
     temperature = 1
-    lr = 1e-4
+    lr = 8e-6
     decay_start = 0.9 # wsd only
     alpha = 1.2 # weighted losses
 

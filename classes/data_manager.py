@@ -27,7 +27,6 @@ class H5DataManager:
         self.done_everything = multiprocessing.Event()
         self.done_everything.set()
         self.closing = multiprocessing.Event()
-        self.got_task = multiprocessing.Event()
         self.loading_process = get_context("spawn").Process(target=self._process_thread)
         self.shared_batches = []
 
@@ -35,15 +34,11 @@ class H5DataManager:
 
     def _process_thread(self):
         with h5py.File(self.file_path, 'a') as hdf_file:
-
-            if not self.queue.empty():
-                self.got_task.set()
-
             while True:
-                self.got_task.wait()
-                self.got_task.clear()
+                if self.queue.empty():
+                    continue
+
                 self.done_everything.clear()
-                task = None
 
                 while not self.queue.empty():
                     task, data = self.queue.get()
@@ -58,9 +53,8 @@ class H5DataManager:
                         case 'get_batches':
                             for batch_ids in data:
                                 self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
-                            self.got_task.wait()
                         case 'read_only_mode':
-                            while not self.got_task.is_set():
+                            while self.queue.empty():
                                 for batch_ids in data:
                                     while self.result_queue.full():
                                         if self.closing.is_set():
@@ -89,8 +83,6 @@ class H5DataManager:
                 
                 if self.queue.empty():
                     self.done_everything.set()
-                else:
-                    self.got_task.set()
 
                 if self.closing.is_set():
                     for shared_batch in self.shared_batches:
@@ -251,7 +243,6 @@ class H5DataManager:
         Each subsequent batch can be retrieved with `read_next_batch`.
         """
         self.queue.put(('get_batches', batches))
-        self.got_task.set()
 
     def read_only_mode(self, batches: list[list[int]]):
         """
@@ -259,7 +250,6 @@ class H5DataManager:
         It will iterate over the given batch ids indefinitely.
         """
         self.queue.put(('read_only_mode', batches))
-        self.got_task.set()
     
     def read_next_batch(self):
         """
@@ -274,26 +264,34 @@ class H5DataManager:
         Automatically merges the data if the convo_id already exists.
         """
         self.queue.put(('put_batch', batch))
-        self.got_task.set()
 
     def update_batch(self, batch: list[Distribution]):
         self.queue.put(('update_batch', batch))
-        self.got_task.set()
 
     def get_dataset_ids(self) -> list[int]:
         """
         Returns a list of all conversation IDs in the dataset.
         """
         self.queue.put(('get_available_ids', None))
-        self.got_task.set()
         return self.result_queue.get()
 
     def purge_dataset(self):
         """
         Deletes all distributions from the dataset.
         """
+        true_replies = ['y', 'yes', 'ye', '1', 'true', 't']
+
+        reply = input("Are you sure you want to delete all distributions from the dataset? (y/n): ")
+
+        if reply.lower() not in true_replies:
+            return
+        
+        reply = input("Are you REALLY sure you want to delete all distributions from the dataset? (y/n): ")
+
+        if reply.lower() not in true_replies:
+            return
+        
         self.queue.put(('clear_dataset', None))
-        self.got_task.set()
         self.done_everything.wait()
     
     def delete_ids(self, ids: list[int]):
@@ -301,10 +299,8 @@ class H5DataManager:
         Deletes distributions with the given IDs from the dataset.
         """
         self.queue.put(('clear_ids', ids))
-        self.got_task.set()
         self.done_everything.wait()
 
     def close(self):
         self.closing.set()
         self.queue.put(('close', None))
-        self.got_task.set()

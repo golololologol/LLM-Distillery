@@ -7,7 +7,7 @@ import torch
 
 
 def _inference_worker(inference_queue, result_queue, made_distributions, model_loaded, start_inference, done_chunk, model_path, model_name, reserve_vram_gb,
-                        gpus_mem_free, temperature, crop_to_size, pbar_queue, context_len, batch_size, max_queue_size, seq_chunk_len, enable_topK, topK):
+                        gpus_mem_used, temperature, crop_to_size, pbar_queue, context_len, batch_size, max_queue_size, seq_chunk_len, enable_topK, topK):
         
     def _load_model(model_loaded) -> tuple[ExLlamaV2, ExLlamaV2Cache]:
         pbar_queue.put(("str", f"Loading {model_name}..."))
@@ -23,9 +23,8 @@ def _inference_worker(inference_queue, result_queue, made_distributions, model_l
                 reserve_vram_bytes[i] = int(reserve_gb * 1024**3)
 
         for i, reserve_bytes in enumerate(reserve_vram_bytes):
-            free_mem = gpus_mem_free[i]
-            if reserve_bytes > free_mem :
-                reserve_vram_bytes[i] = int(free_mem * 0.98)
+            used_mem = gpus_mem_used[i]
+            reserve_vram_bytes[i] = used_mem
 
         config = ExLlamaV2Config()
         config.model_dir = model_path
