@@ -85,7 +85,7 @@ def tokenize_sample(args):
             text = json_item.get("conversations", [""])[0]
 
             if text:
-                text_tokenized = good_encode(text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
+                text_tokenized = good_encode(text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)[:context_len - num_toks]
                 conversation_tokenized[num_toks:num_toks + len(text_tokenized)] = text_tokenized
                 num_toks += len(text_tokenized)
                 conversation_content_ranges.append((0, num_toks))
@@ -107,7 +107,6 @@ def tokenize_sample(args):
     if empty:
         return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
     
-
     
     reversed = ("reversed" in tags) or json_item.get("reversed", False)
 

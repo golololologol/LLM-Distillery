@@ -83,13 +83,14 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
 
     CE_loss = F.cross_entropy(student_logits[:min_len - 1], convo_content_tokens[1:min_len], reduction='none')
     teacher_CE_loss = F.cross_entropy(teacher_logprobs[:min_len - 1], convo_content_tokens[1:min_len], reduction='none')
-    abs_CE_diff = torch.abs(CE_loss - teacher_CE_loss)
+    CE_diff = CE_loss - teacher_CE_loss
+    CE_diff[CE_diff < 0] = 0
 
     kl_div = custom_kl_div(student_logprobs, teacher_logprobs, per_token=True)
     reverse_kl_div = custom_kl_div(teacher_logprobs, student_logprobs, per_token=True)
 
-    weighted_kl_div = abomination_loss(kl_div, alpha, abs_CE_diff)
-    weighted_r_kl_div = abomination_loss(reverse_kl_div, alpha, abs_CE_diff)
+    weighted_kl_div = abomination_loss(kl_div, alpha, CE_diff)
+    weighted_r_kl_div = abomination_loss(reverse_kl_div, alpha, CE_diff)
 
     custom_loss = (weighted_kl_div + weighted_r_kl_div)/2
 
@@ -102,7 +103,7 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
         "weighted kl_div": weighted_kl_div,
         "weighted rev. kl_div": weighted_r_kl_div,
         "teacher CE loss": teacher_CE_loss.mean(),
-        "abs CE diff": abs_CE_diff.mean(),
+        "CE diff": CE_diff.mean(),
     }
 
     return loss_dict
