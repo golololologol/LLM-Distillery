@@ -70,7 +70,11 @@ class StudentModel(BaseModel):
         self.multi_gpu = False
         self.wandb_comment = ""
         self.device_map_name = ""
+        self.device_map = {}
         self.max_memory = {}
+        self.distr_device = ""
+        self.input_device = ""
+        self.num_gpu0_layers = 0
         
 
     def _set_postfix(self, postfix: str):
@@ -100,15 +104,69 @@ class StudentModel(BaseModel):
 
         path = model_path if model_path is not None else self.model_path
 
+        if self.device_map:
+            device_map = self.device_map
+        else:
+            device_map = self.device_map_name if self.multi_gpu else self.device
+
+        if not self.device_map and self.device_map_name == "custom":
+            model = AutoModelForCausalLM.from_pretrained(
+                path,
+                device_map="auto",
+                torch_dtype=train_precision,
+                load_in_4bit=self.training_precision_name == "4bit",
+                load_in_8bit = self.training_precision_name == "8bit",
+                max_memory = self.max_memory
+                )
+
+            layer_names = list(model.hf_device_map.keys())
+
+            del model
+            torch.cuda.empty_cache()
+
+            num_layers = len(layer_names)
+            num_gpus = torch.cuda.device_count()
+
+            # Distribute layers across GPUs
+            custom_device_map = {}
+            remaining_layers = num_layers - self.num_gpu0_layers
+            layers_per_gpu = math.ceil(remaining_layers / (num_gpus - 1))
+
+            # Assign layers to GPU 0
+            layer_index = 0
+            for _ in range(self.num_gpu0_layers):
+                custom_device_map[layer_names[layer_index]] = 0
+                layer_index += 1
+
+            # Assign remaining layers to other GPUs
+            gpu_id = 1
+            while layer_index < num_layers:
+                for _ in range(layers_per_gpu):
+                    if layer_index >= num_layers:
+                        break
+                    custom_device_map[layer_names[layer_index]] = gpu_id
+                    layer_index += 1
+                gpu_id += 1
+
+            self.device_map = custom_device_map
+            device_map = custom_device_map
+
         self.model = AutoModelForCausalLM.from_pretrained(
             path,
-            device_map=self.device_map_name if self.multi_gpu else self.device, #"balanced_low_0", "balanced"
+            device_map=device_map,
             torch_dtype=train_precision,
             load_in_4bit=self.training_precision_name == "4bit",
             load_in_8bit = self.training_precision_name == "8bit",
             attn_implementation="flash_attention_2",
             max_memory = self.max_memory
         )
+
+        if not self.device_map:
+            self.device_map = self.model.hf_device_map
+
+        if not self.input_device:
+            first_layer = list(self.device_map.keys())[0]
+            self.input_device = f"cuda:{self.device_map[first_layer]}"
 
         self.model.train()
         if self.grad_checkpointing:
@@ -183,7 +241,7 @@ class StudentModel(BaseModel):
         self._set_postfix("Loading state...")
 
         self._load_model()
-        model_state = torch.load(os.path.join(self.paths.student_states, "model_state.pt"), map_location=self.model.hf_device_map)
+        model_state = torch.load(os.path.join(self.paths.student_states, "model_state.pt"))
         self.model.load_state_dict(model_state, assign=True)
 
         self._load_optimizer()
@@ -218,6 +276,7 @@ class StudentModel(BaseModel):
 
     def train_chunk(self, data_manager: H5DataManager, validation_data_manager: H5DataManager, full_collect):
         trainable_ids = data_manager.get_dataset_ids()
+        self.distr_device = ""
 
         if not self.validation_dataset_sorted:
             self._sort_val_dataset_by_len()
@@ -294,27 +353,30 @@ class StudentModel(BaseModel):
 
     # main training loop
     def _run_distillation_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager) -> bool:
-
         for batch_convos in batched_chunk_convos:
             updated_grads = False
             batch_steps = len(batch_convos)
-
-            max_non_padded_len = max(convo.length for convo in batch_convos)
-            batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
-            batch_tokenized_tensor = torch.from_numpy(batch_tokenized).to(self.device, non_blocking=True)
-
-            batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
-            
-            logits_device = batch_logits.device
+            logits_device = self.distr_device if self.distr_device else self.device
 
             sdh_mem_name, batch_shape, batch_dtype, batch_indices, batch_padding = data_manager.read_next_batch()
             shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
             teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(logits_device, non_blocking=True)
 
+            max_non_padded_len = max(convo.length for convo in batch_convos)
+            batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
+            batch_tokenized_tensor = torch.from_numpy(batch_tokenized).to(self.input_device, non_blocking=True)
+
+            batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
+            
+            if not self.distr_device:
+                self.distr_device = batch_logits.device
+                logits_device = self.distr_device
+                teacher_batch_raw = teacher_batch_raw.to(logits_device, non_blocking=True)
+            
             for i, convo in enumerate(batch_convos):
                 indices = torch.from_numpy(batch_indices[i]).to(logits_device, non_blocking=True)
                 content_indices = self._get_content_indices_tensor(convo.content_ranges, logits_device)
-
+                
                 convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
                 convo_teacher_logits = teacher_batch_raw[i]
                 convo_content_tokens = torch.index_select(batch_tokenized_tensor[i], 0, content_indices)
@@ -357,19 +419,23 @@ class StudentModel(BaseModel):
         losses = Losses(self.logger, validation=True)
 
         with torch.no_grad():
-
             for val_convo_batch in self.validation_dataset_batched:
-                val_max_non_padded_len = max(convo.length for convo in val_convo_batch)
-                val_batch_tokenized = np.array([convo.tokenized[:val_max_non_padded_len] for convo in val_convo_batch])
-                val_batch_tokenized_tensor = torch.from_numpy(val_batch_tokenized).to(self.device, non_blocking=False)
-
-                val_batch_logits = self.model(val_batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
-
-                logits_device = val_batch_logits.device
+                logits_device = self.distr_device if self.distr_device else self.device
 
                 sdh_mem_name, batch_shape, batch_dtype, val_batch_indices, batch_padding = validation_data_manager.read_next_batch()
                 shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
                 teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(logits_device, non_blocking=True)
+
+                val_max_non_padded_len = max(convo.length for convo in val_convo_batch)
+                val_batch_tokenized = np.array([convo.tokenized[:val_max_non_padded_len] for convo in val_convo_batch])
+                val_batch_tokenized_tensor = torch.from_numpy(val_batch_tokenized).to(self.input_device, non_blocking=True)
+
+                val_batch_logits = self.model(val_batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
+                
+                if not self.distr_device:
+                    self.distr_device = val_batch_logits.device
+                    logits_device = self.distr_device
+                    teacher_batch_raw = teacher_batch_raw.to(logits_device, non_blocking=True)
 
                 for i, val_convo in enumerate(val_convo_batch):
                     val_indices = torch.from_numpy(val_batch_indices[i]).to(logits_device, non_blocking=True)

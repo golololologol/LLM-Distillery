@@ -17,7 +17,7 @@ sys.stdout = sys.__stdout__
 class WarmupStableDecayLR(LRScheduler):
     """
     Implementation of Warmup Stable Decay learning rate scheduler from MiniCPM.\n
-    Has custom cosine warmum instead of linear.\n
+    Has custom cosine warmup instead of linear.\n
     Paper: https://arxiv.org/pdf/2404.06395
     """
     def __init__(self, optimizer, total_steps, warmup_steps, decay_start_percentage, final_lr, last_epoch=-1, verbose=False):
@@ -67,11 +67,16 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
         return loss
     
     min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
+    eps = 1e-8
 
     student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
 
     if indices is not None:
-        teacher_logits_padded = torch.zeros_like(student_logprobs) - 25
+        rev_sum_topK = (1 - teacher_logits.exp().sum(dim=-1)).clamp(eps)
+        num_pad_logits = student_logits.size(-1) - teacher_logits.size(-1)
+        pad_logits = (rev_sum_topK / num_pad_logits).log()
+
+        teacher_logits_padded = torch.zeros_like(student_logprobs) + pad_logits.unsqueeze(-1)
 
         teacher_logits_padded.scatter_(1, indices[:min_len], teacher_logits[:min_len])
 
@@ -82,13 +87,13 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
     CE_loss = F.cross_entropy(student_logits[:min_len - 1], convo_content_tokens[1:min_len], reduction='none')
     teacher_CE_loss = F.cross_entropy(teacher_logprobs[:min_len - 1], convo_content_tokens[1:min_len], reduction='none')
     CE_diff = CE_loss - teacher_CE_loss
-    CE_diff[CE_diff < 0] = 0
+    corrected_CE_diff = torch.where(CE_diff < 0, torch.zeros_like(CE_diff), CE_diff)
 
     kl_div = custom_kl_div(student_logprobs, teacher_logprobs, per_token=True)
     reverse_kl_div = custom_kl_div(teacher_logprobs, student_logprobs, per_token=True)
 
-    weighted_kl_div = abomination_loss(kl_div, alpha, CE_diff)
-    weighted_r_kl_div = abomination_loss(reverse_kl_div, alpha, CE_diff)
+    weighted_kl_div = abomination_loss(kl_div, alpha, corrected_CE_diff)
+    weighted_r_kl_div = abomination_loss(reverse_kl_div, alpha, corrected_CE_diff)
 
     custom_loss = (weighted_kl_div + weighted_r_kl_div)/2
 

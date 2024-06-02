@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM, LlamaTokenizer, AutoConfig
 import math
 import torch.nn.functional as F
 from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
@@ -10,6 +10,7 @@ import codecs
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config, ExLlamaV2Cache, ExLlamaV2
 from utils.dataset_utils import read_jsonl_lazy
 from tqdm import tqdm
+from collections import defaultdict
 import multiprocessing as mp
 
 # init cuda
@@ -360,8 +361,62 @@ def truncated_kldiv(student_probs, teacher_probs):
 #print(f"Mean of both: {mean_losses}")
 #print(f"Total mean: {mean_losses.mean()}")
 
-# load exllama model
-tensor = torch.tensor(([0.0004, 10.1, 1.2], [1.5, 2.3, 3.4]))
-tensor2 = torch.tensor(([1, 0.5, 0.5], [0.5, 1, 0.5]))
+#dict1 = {1: 1, 'b': 2, 'c': 4, 'd': 5, 'a': 5}
 
-diff = tensor - tensor2
+#grouped_dict = defaultdict(list)
+#for key, value in dict1.items():
+#    grouped_dict[value].append(key)
+
+#print(grouped_dict.items())
+#print(dict1)
+
+model_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+
+model = LlamaForCausalLM.from_pretrained(
+    model_path,
+    device_map="auto",
+    attn_implementation="flash_attention_2"
+)
+
+layer_names = list(model.hf_device_map.keys())
+print(model.hf_device_map, "\n")
+del model
+
+torch.cuda.empty_cache()
+
+num_layers = len(layer_names)
+num_gpus = 3
+num_gpu0_layers = 2
+
+# Distribute layers across GPUs
+custom_device_map = {}
+remaining_layers = num_layers - num_gpu0_layers
+layers_per_gpu = math.ceil(remaining_layers / (num_gpus - 1))
+
+# Assign layers to GPU 0
+layer_index = 0
+for _ in range(num_gpu0_layers):
+    custom_device_map[layer_names[layer_index]] = 0
+    layer_index += 1
+
+# Assign remaining layers to other GPUs
+gpu_id = 1
+while layer_index < num_layers:
+    for _ in range(layers_per_gpu):
+        if layer_index >= num_layers:
+            break
+        custom_device_map[layer_names[layer_index]] = gpu_id
+        layer_index += 1
+    gpu_id += 1
+
+print(custom_device_map)
+
+input("Press Enter to continue...")
+
+model = AutoModelForCausalLM.from_pretrained(
+    model_path,
+    device_map=custom_device_map,
+    attn_implementation="flash_attention_2"
+)
+print(model.hf_device_map)
+input("Press Enter to continue...")

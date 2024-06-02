@@ -208,3 +208,27 @@ class BaseModel:
                     file.write(json.dumps(convo_dict, ensure_ascii=False) + "\n")
                     file_content.write(json.dumps(content_convo_dict, ensure_ascii=False) + "\n")
 
+    def write_validation_dataset_to_file(self, folder: str):
+        tokenizer = AutoTokenizer.from_pretrained(self.model_path)
+        path = os.path.join(folder, "tokenized_validation_dataset.jsonl")
+        path_content = os.path.join(folder, "content_tokenized_validation_dataset.jsonl")
+        with open(path, 'w', encoding='utf-8') as file:
+            with open(path_content, 'w', encoding='utf-8') as file_content:
+                for convo in tqdm(self.validation_dataset, desc="Writing validation dataset to file"):
+                    convo_dict = {
+                        "tokenized": convo.tokenized.tolist(),
+                        "decoded": [tokenizer.decode(convo.tokenized)],
+                        "content_ranges": convo.content_ranges,
+                        "content_indices": [list(range(start, end)) for start, end in convo.content_ranges],
+                        "content_decoded": [tokenizer.decode(convo.tokenized[start:end]) for start, end in convo.content_ranges],
+                        "padding": convo.padding,
+                        "cropped_end": convo.cropped_end,
+                        "origin_convo_id": convo.origin_convo_id
+                    }
+
+                    content_convo_dict = convo_dict.copy()
+                    content_convo_dict.pop("tokenized")
+
+                    file.write(json.dumps(convo_dict, ensure_ascii=False) + "\n")
+                    file_content.write(json.dumps(content_convo_dict, ensure_ascii=False) + "\n")
+

@@ -146,7 +146,7 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
 
 
 def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
-                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory):
+                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers):
     
     student.num_epochs = num_epochs
     student.num_warmup_steps = math.ceil(num_warmup_steps / (grad_accum_batches * student.batch_size))
@@ -171,6 +171,7 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.alpha = alpha
     student.device_map_name = device_map
     student.max_memory = max_memory
+    student.num_gpu0_layers = num_gpu0_layers
 
 
 def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: Paths, rebase_dataset: bool) -> tuple[bool, bool]:
@@ -260,7 +261,7 @@ def main():
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
     dataset_path = r"C:\Users\PC\Converted_random_samples_4k.jsonl"
-    validation_dataset_path = r"C:\Users\PC\Desktop\val_test.jsonl"
+    validation_dataset_path = r"C:\Users\PC\val_completion.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
     student_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
@@ -288,12 +289,13 @@ def main():
     num_warmup_steps = 50
 
     batch_size = 4
-    grad_accum_batches = 4
+    grad_accum_batches = 1
     grad_checkpointing = False
     temperature = 1
-    lr = 8e-6
+    lr = 3e-6
     decay_start = 0.9 # wsd only
-    alpha = 1.2 # weighted losses
+    alpha = 0.5 # weighted losses
+    
 
     lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
@@ -303,7 +305,8 @@ def main():
     validate_every_n_epochs = 0.1
     save_student_every_n_epochs = 4
 
-    device_map = "balanced" # "balanced", "balanced_low_0"
+    num_gpu0_layers = 5 # Used only if device_map is set to "custom"
+    device_map = "custom" # "balanced", "balanced_low_0", "custom"
     max_memory = {0: '20GB', 1: '20GB', 'cpu': '200GB'} # {0: '20GB', 1: '60GB', 2: '60GB', 3: '60GB', 'cpu': '200GB'}
     multi_gpu = True
     save_final_state = False
@@ -333,10 +336,10 @@ def main():
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
-                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory)
+                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers)
 
     student.reorder_dataset()
-
+    
     loop_ids, full_collect = calculate_loop_ids(student, max_cache_size_gb, enable_topK, save_topK)
 
     collect, collect_val = collect_or_load(student, teachers, paths, rebase_dataset)
@@ -368,7 +371,7 @@ def main():
     ## Training collecting loop
     if collect and not rebase_dataset:
         print("Collecting all data..." if full_collect else "Collecting data in chunks...")
-
+        
         data_manager.purge_dataset()
 
         if full_collect:
