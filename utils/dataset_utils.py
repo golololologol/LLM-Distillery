@@ -220,4 +220,6 @@ def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range,
     if not dataset:
         raise ValueError("No conversations were tokenized.\nIf you are using a completion model, make sure the completion tag is present in the conversations of your dataset.")
     
+    dataset.sort(key=lambda x: x.origin_convo_id)
+
     return dataset, ids

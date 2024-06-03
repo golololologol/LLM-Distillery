@@ -48,6 +48,7 @@ class StudentModel(BaseModel):
         self.num_warmup_steps = 0
         self.grad_accum = 0
         self.num_grad_accum_batches = 0
+        self.eff_batch_size = 0
         self.validation_every_steps = 0
         self.save_every_steps = 0
 
@@ -385,7 +386,7 @@ class StudentModel(BaseModel):
 
                 self.losses.add_losses(loss_dict)
             
-            self.losses.backward(divisor=self.batch_size*self.grad_accum)
+            self.losses.backward(divisor=self.eff_batch_size)
             
             self.progress_bar.update(batch_steps)
 
@@ -402,7 +403,7 @@ class StudentModel(BaseModel):
                 self.lr_scheduler.step()
 
                 updated_grads = True
-                self.next_accum_step += self.grad_accum * self.batch_size
+                self.next_accum_step += self.eff_batch_size
                 
             if (self.num_trained_steps >= self.next_save_step) and not (self.num_trained_steps >= self.total_training_steps):
                 self._save_model(self.num_trained_steps)

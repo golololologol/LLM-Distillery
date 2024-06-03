@@ -149,19 +149,20 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
                         validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers):
     
     student.num_epochs = num_epochs
-    student.num_warmup_steps = math.ceil(num_warmup_steps / (grad_accum_batches * student.batch_size))
+    student.eff_batch_size = grad_accum_batches * student.batch_size
+    student.num_warmup_steps = math.ceil(num_warmup_steps / student.eff_batch_size)
     student.total_training_steps = num_epochs * student.dataset_len
     student.lr = lr
     student.lr_scheduler_name = lr_scheduler.lower()
     student.optimizer_name = optimizer.lower()
     student.grad_accum = grad_accum_batches
-    student.num_grad_accum_batches = math.ceil(student.total_training_steps / grad_accum_batches)
+    student.num_grad_accum_batches = math.ceil(student.total_training_steps / student.eff_batch_size)
     student.training_precision_name = training_precision.lower()
     student.decay_start = decay_start
     student.multi_gpu = multi_gpu
     student.data_order = data_order.lower()
     student.validation_every_steps = validate_every_n_epochs * student.dataset_len
-    student.next_accum_step = grad_accum_batches * student.batch_size
+    student.next_accum_step = student.eff_batch_size
     student.save_every_steps = save_student_every_n_epochs * student.dataset_len
     student.next_save_step = save_student_every_n_epochs * student.dataset_len
     student.save_final_state = save_final_state
@@ -292,12 +293,11 @@ def main():
     grad_accum_batches = 1
     grad_checkpointing = False
     temperature = 1
-    lr = 3e-6
+    lr = 1e-6
     decay_start = 0.9 # wsd only
-    alpha = 0.5 # weighted losses
+    alpha = 2 # weighted losses
     
-
-    lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
+    lr_scheduler = "cosine" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
     data_order = "sorted" # "shuffle", "native", "sorted"
     training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit", "8bit"
@@ -305,7 +305,7 @@ def main():
     validate_every_n_epochs = 0.1
     save_student_every_n_epochs = 4
 
-    num_gpu0_layers = 5 # Used only if device_map is set to "custom"
+    num_gpu0_layers = 7 # Used only if device_map is set to "custom"
     device_map = "custom" # "balanced", "balanced_low_0", "custom"
     max_memory = {0: '20GB', 1: '20GB', 'cpu': '200GB'} # {0: '20GB', 1: '60GB', 2: '60GB', 3: '60GB', 'cpu': '200GB'}
     multi_gpu = True
