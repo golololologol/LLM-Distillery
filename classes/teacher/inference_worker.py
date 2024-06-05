@@ -24,7 +24,7 @@ def _inference_worker(inference_queue, result_queue, made_distributions, model_l
 
         for i, reserve_bytes in enumerate(reserve_vram_bytes):
             used_mem = gpus_mem_used[i]
-            reserve_vram_bytes[i] = used_mem
+            reserve_vram_bytes[i] = used_mem + reserve_bytes
 
         config = ExLlamaV2Config()
         config.model_dir = model_path
@@ -55,7 +55,6 @@ def _inference_worker(inference_queue, result_queue, made_distributions, model_l
         torch.cuda.empty_cache()
 
     def _inference(model: ExLlamaV2, cache: ExLlamaV2Cache, batch_tokenized_np: ndarray) -> ndarray:
-        #assert model is not None, f"{model_name}: Model has not been loaded yet."
         cache.current_seq_len = 0
         batch_tokenized = torch.from_numpy(batch_tokenized_np)
 
@@ -77,8 +76,6 @@ def _inference_worker(inference_queue, result_queue, made_distributions, model_l
         return shd_mem.name, batch_logp_data.shape, batch_logp_data.dtype, shd_mem, indices
 
     model, cache = _load_model(model_loaded)
-
-    start_inference.wait()
 
     pbar_queue.put(("str", f"Generating..."))
 
@@ -109,3 +106,4 @@ def _inference_worker(inference_queue, result_queue, made_distributions, model_l
             
         result_queue.put((shd_mem_name, batch_logp_shape, batch_logp_dtype, batch_distributions, indices_np))
         made_distributions.set()
+        start_inference.wait()

@@ -12,7 +12,7 @@ def _batch_creator_worker(inference_queue, batch_size, dataset_chunk: list[Convo
         batch_convos = dataset_chunk[convo_id:convo_id+batch_size]
 
         for convo in batch_convos:
-            batch_distributions.append(Distribution(convo.origin_convo_id, convo.length, convo.cropped_end, convo.content_ranges, convo.tokenized))
+            batch_distributions.append(Distribution(convo.origin_convo_id, convo.length, convo.cropped_end, convo.content_ranges, convo.tokenized, convo.content_sha))
             batch_tokenized.append(convo.tokenized)
 
         # Crop to the convos to one that has the least non-padding tokens

@@ -22,18 +22,11 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
             distribution.indices = distribution.indices[:distribution.length] if distribution.indices is not None else None
             distribution.indices = distribution.indices[content_indices] if distribution.indices is not None else None
 
-            shd_mem = shared_memory.SharedMemory(create=True, size=distribution.distribution.nbytes)
-            distribution.shd_mem_name = shd_mem.name
-            distribution.distr_shape = distribution.distribution.shape
-            distribution.distr_dtype = distribution.distribution.dtype
-            shd_distr = np.ndarray(distribution.distr_shape, dtype=distribution.distr_dtype, buffer=shd_mem.buf)
-            np.copyto(shd_distr, distribution.distribution)
+            shd_mem = distribution.to_shd_mem()
             shared_list.append(shd_mem)
 
             if len(shared_list) > max_queue_size + 40:
                 shared_list.pop(0)
-
-            del distribution.distribution
 
             batch_content_distributions.append(distribution)
 

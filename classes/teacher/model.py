@@ -30,13 +30,13 @@ class TeacherModel(BaseModel):
         self.reserve_vram = []
         self.max_queue_size = max_queue_size
 
-    def process_chunk(self, reserve_vram_gb: list[float] = [], num_inference_workers: int = 1, ids_to_collect: list = [], full_collect: bool = False, data_manager = None, validation: bool = False):
+    def process_chunk(self, reserve_vram_gb: list[float] = [], num_inference_workers: int = 1, ids_to_collect: list = [], data_manager = None, validation: bool = False):
         self._sort_datasets_by_len()
 
         dataset_chunk = (self.validation_dataset if validation else self.dataset)
-
-        if not validation and not full_collect:
-            dataset_chunk = [convo for convo in dataset_chunk if convo.origin_convo_id in ids_to_collect]
+        print(ids_to_collect)
+        dataset_chunk = [convo for convo in dataset_chunk if convo.origin_convo_id in ids_to_collect]
+        print(len(dataset_chunk))
 
         with multiprocessing.Manager() as manager:
             done_chunk = manager.Event()

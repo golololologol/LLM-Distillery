@@ -29,6 +29,8 @@ class H5DataManager:
         self.closing = multiprocessing.Event()
         self.loading_process = get_context("spawn").Process(target=self._process_thread)
         self.shared_batches = []
+        self.distr_key = "distributions"
+        self.indices_key = "indices"
 
         self.loading_process.start()
 
@@ -71,12 +73,16 @@ class H5DataManager:
                         case 'update_batch':
                             self._update_data(hdf_file, data)
                         case 'get_available_ids':
-                            self.result_queue.put([int(dataset_name.split('_')[1]) for dataset_name in hdf_file if dataset_name.startswith('convo_')])
+                            self.result_queue.put([int(group.split('_')[1]) for group in hdf_file])
                         case 'clear_dataset':
-                            ids_to_clear = [int(dataset_name.split('_')[1]) for dataset_name in hdf_file if dataset_name.startswith('convo_')]
+                            ids_to_clear = [int(group.split('_')[1]) for group in hdf_file]
                             self._clear_dataset(hdf_file, ids_to_clear)
                         case 'clear_ids':
                             self._clear_dataset(hdf_file, data)
+                        case 'rename_ids':
+                            self._rename_ids(hdf_file, data)
+                        case 'get_available_shas':
+                            self.result_queue.put(self._get_shas(hdf_file))
 
                     if self.closing.is_set():
                         break
@@ -92,8 +98,7 @@ class H5DataManager:
                 
     def _process_distributions(self, hdf_file, batch: list[Distribution]):
         for distribution in batch:
-            distr_shd_mem = shared_memory.SharedMemory(name=distribution.shd_mem_name)
-            distribution.distribution = np.ndarray(distribution.distr_shape, dtype=distribution.distr_dtype, buffer=distr_shd_mem.buf)
+            shd_mem = distribution.from_shd_mem()
 
             id = distribution.origin_convo_id
             name = f'convo_{id}'
@@ -101,10 +106,10 @@ class H5DataManager:
                 merged_data, merged_indices = self._merge_data(hdf_file, distribution, id)
                 self._save_data(hdf_file, merged_data, id, merged_indices)
             else:
-                self._save_data(hdf_file, distribution.distribution, id, distribution.indices)
+                self._save_data(hdf_file, distribution.distribution, id, distribution.indices, distribution.content_sha)
 
-            distr_shd_mem.close()
-            distr_shd_mem.unlink()
+            shd_mem.close()
+            shd_mem.unlink()
 
     def _merge_data(self, hdf_file, new_distribution: Distribution, id):
 
@@ -173,34 +178,58 @@ class H5DataManager:
     
     def _update_data(self, hdf_file, batch: list[Distribution]):
         for distribution in batch:
-            distr_shd_mem = shared_memory.SharedMemory(name=distribution.shd_mem_name)
-            distribution.distribution = np.ndarray(distribution.distr_shape, dtype=distribution.distr_dtype, buffer=distr_shd_mem.buf)
+            shd_mem = distribution.from_shd_mem()
 
-            self._save_data(hdf_file, distribution.distribution, distribution.origin_convo_id, distribution.indices)
+            self._save_data(hdf_file, distribution.distribution, distribution.origin_convo_id, distribution.indices, distribution.content_sha)
 
-            distr_shd_mem.close()
-            distr_shd_mem.unlink()
+            shd_mem.close()
+            shd_mem.unlink()
+        
+    def _get_shas(self, hdf_file):
+        shas = {}
+        for group in hdf_file:
+            shas[int(group.split('_')[1])] = hdf_file[group].attrs['content_sha']
+        return shas
 
-    def _save_data(self, hdf_file: h5py.File, data: np.ndarray, convo_id: int, indices):
-        dataset_name = f'convo_{convo_id}'
+    def _save_data(self, hdf_file: h5py.File, data: np.ndarray, convo_id: int, indices: np.ndarray, content_sha: str):
+        group_key = f'convo_{convo_id}'
         compression_opts = 6
 
-        if dataset_name in hdf_file:
-            del hdf_file[dataset_name]
-        hdf_file.create_dataset(dataset_name, data=data, compression='gzip', compression_opts=compression_opts, dtype=np.float16)
+        # Create or get the group
+        if group_key not in hdf_file:
+            group = hdf_file.create_group(group_key)
+        else:
+            group = hdf_file[group_key]
 
+        if content_sha is not None:
+            group.attrs['content_sha'] = content_sha
+
+        # Create or replace the dataset for data
+        if self.distr_key in group:
+            del group[self.distr_key]
+        group.create_dataset(self.distr_key, data=data, compression='gzip', compression_opts=compression_opts, dtype=np.float16)
+
+        # Create or replace the dataset for indices, if provided
         if indices is not None:
-            indices_name = f'indices_{convo_id}'
-            if indices_name in hdf_file:
-                del hdf_file[indices_name]
-            hdf_file.create_dataset(indices_name, data=indices, compression='gzip', compression_opts=compression_opts, dtype=np.int32)
+            if self.indices_key in group:
+                del group[self.indices_key]
+            group.create_dataset(self.indices_key, data=indices, compression='gzip', compression_opts=compression_opts, dtype=np.int32)
     
     def _load_id(self, hdf_file, convo_id: int) -> np.ndarray:
-        data = np.array(hdf_file[f'convo_{convo_id}'], dtype=np.float32) if f'convo_{convo_id}' in hdf_file else None
-        indices = np.array(hdf_file[f'indices_{convo_id}'], dtype=np.int64) if f'indices_{convo_id}' in hdf_file else None
-        if data is None:
+        group_key = f'convo_{convo_id}'
+    
+        if not group_key in hdf_file:
             raise ValueError(f"Convo ID {convo_id} not found in dataset.")
-        return data, indices
+        
+        group = hdf_file[group_key]
+
+        distributions = np.array(group[self.distr_key], dtype=np.float32) if self.distr_key in group else None
+        indices = np.array(group[self.indices_key], dtype=np.int64) if self.indices_key in group else None
+
+        if distributions is None:
+            raise ValueError(f"Convo ID {convo_id} has no distributions in dataset.")
+
+        return distributions, indices
     
     def _make_outgoing_batch(self, hdf_file, batch_ids: list[int]) -> tuple[str, tuple[int, int], np.dtype]:
         batch = []
@@ -236,6 +265,14 @@ class H5DataManager:
                 del hdf_file[f'indices_{id}']
 
         self.shared_batches = []
+
+    def _rename_ids(self, hdf_file: h5py.File, ids_to_rename: dict[int, int]):
+        for old_id, new_id in ids_to_rename.items():
+            hdf_file.move(f'convo_{old_id}', f'convo_{new_id}_moved')
+
+        for old_id, new_id in ids_to_rename.items():
+            hdf_file.move(f'convo_{new_id}_moved', f'convo_{new_id}')
+
     
     def enqueue_get_batches(self, batches: list[list[int]]):
         """
@@ -300,6 +337,28 @@ class H5DataManager:
         """
         self.queue.put(('clear_ids', ids))
         self.done_everything.wait()
+
+    def sync(self, ids_to_delete, ids_to_rename):
+        """
+        Deletes and renames the given IDs in the dataset.\n
+        Used for syncing the h5 file with the current dataset.\n
+        This function is synchronous and will block until the operation is complete.
+        """
+        self.done_everything.wait()
+        self.queue.put(('clear_ids', ids_to_delete))
+
+        self.done_everything.wait()
+        self.queue.put(('rename_ids', ids_to_rename))
+        
+        self.done_everything.wait()
+
+    def get_available_shas(self) -> dict[str, str]:
+        """
+        Returns a dictionary of all conversation IDs and their content SHA hashes.
+        """
+        self.done_everything.wait()
+        self.queue.put(('get_available_shas', None))
+        return self.result_queue.get()
 
     def close(self):
         self.closing.set()

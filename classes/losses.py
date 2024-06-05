@@ -31,6 +31,12 @@ class Losses:
             raise ValueError("No losses to add to the loss dictionary.")
 
         self.num_steps_accumulated += 1
+        
+        for key, value in new_losses.items():
+            if key == "train_loss":
+                continue
+            else:
+                new_losses[key] = value.detach()
 
         if not self.loss_dict:
             self.loss_dict = new_losses

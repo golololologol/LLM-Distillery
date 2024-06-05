@@ -1,3 +1,4 @@
+from multiprocessing import shared_memory
 from numpy import ndarray
 import hashlib
 import torch
@@ -7,7 +8,7 @@ class Distribution:
     """
     Class for probability distribution data.
     """
-    def __init__(self, origin_convo_id: int, length: int = 0, cropped_end: bool = False, content_ranges: list[tuple[int, int]] = [], tokenized: ndarray = None):
+    def __init__(self, origin_convo_id: int, length: int = 0, cropped_end: bool = False, content_ranges: list[tuple[int, int]] = [], tokenized: ndarray = None, content_sha: str = ""):
         self.distribution: ndarray|torch.Tensor = None
         self.length: int = length
         self.tokenized: ndarray = tokenized
@@ -19,7 +20,28 @@ class Distribution:
         self.distr_shape = None
         self.distr_dtype = None
         self.indices = None
+        self.content_sha: str = content_sha
 
+    def to_shd_mem(self) -> shared_memory.SharedMemory:
+        """
+        Put the distribution into shared memory.
+        """
+        shd_mem = shared_memory.SharedMemory(create=True, size=self.distribution.nbytes)
+        self.shd_mem_name = shd_mem.name
+        self.distr_shape = self.distribution.shape
+        self.distr_dtype = self.distribution.dtype
+        shd_distr = ndarray(self.distr_shape, dtype=self.distr_dtype, buffer=shd_mem.buf)
+        shd_distr[:] = self.distribution
+        del self.distribution
+        return shd_mem
+
+    def from_shd_mem(self) -> shared_memory.SharedMemory:
+        """
+        Retrieve the distribution from shared memory.
+        """
+        shd_mem = shared_memory.SharedMemory(name=self.shd_mem_name)
+        self.distribution = ndarray(self.distr_shape, dtype=self.distr_dtype, buffer=shd_mem.buf)
+        return shd_mem
 
 class ConvoTokenized:
     """
@@ -28,6 +50,8 @@ class ConvoTokenized:
     def __init__(self, tokenized: ndarray, content_ranges, padding, cropped_end, convo_id):
         self.tokenized: ndarray = tokenized
         self.content_ranges: list[tuple[int, int]] = content_ranges
+        self.CE_token_ranges: list[tuple[int, int]] = [(start+1, end) for start, end in content_ranges]
+        self.CE_distr_ranges: list[tuple[int, int]] = [(start, end-1) for start, end in content_ranges]
         self.content_tokens: list[int] = [token for start, end in content_ranges for token in tokenized[start:end]]
         self.padding: int = padding
         self.cropped_end: bool = cropped_end

@@ -385,7 +385,17 @@ class StudentModel(BaseModel):
                 loss_dict = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, self.alpha)
 
                 self.losses.add_losses(loss_dict)
-            
+
+                del loss_dict
+                del convo_content_logits
+                del convo_teacher_logits
+                del convo_content_tokens
+                del indices
+                del content_indices
+
+            del batch_logits
+            del teacher_batch_raw
+
             self.losses.backward(divisor=self.eff_batch_size)
             
             self.progress_bar.update(batch_steps)
@@ -404,6 +414,9 @@ class StudentModel(BaseModel):
 
                 updated_grads = True
                 self.next_accum_step += self.eff_batch_size
+
+            shd_mem.close()
+            shd_mem.unlink()
                 
             if (self.num_trained_steps >= self.next_save_step) and not (self.num_trained_steps >= self.total_training_steps):
                 self._save_model(self.num_trained_steps)
@@ -449,8 +462,20 @@ class StudentModel(BaseModel):
                     loss_dict = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, val_indices, val_convo_content_tokens, self.alpha)
                     
                     losses.add_losses(loss_dict)
+                    del loss_dict
+                    del val_convo_content_logits
+                    del val_convo_teacher_logits
+                    del val_convo_content_tokens
+                    del val_indices
+                    del val_content_indices
+
+                del val_batch_logits
+                del teacher_batch_raw
                     
                 pbar.update(len(val_convo_batch))
+                shd_mem.close()
+                shd_mem.unlink()
+
 
         losses.log(self.num_trained_steps)
         losses.empty()

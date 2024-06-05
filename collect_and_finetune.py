@@ -175,30 +175,43 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.num_gpu0_layers = num_gpu0_layers
 
 
-def collect_or_load(student, teachers, paths, rebase_dataset):
-    
-    def check_sha(path, current_sha):
-        if not os.path.exists(path):
-            print(f"File not found: {path}")
-            return False
+def calculate_sync(student_dataset, metadata_path, teachers, data_manager: H5DataManager):
+    def check_shas(disk_sha: dict[str, str], current_sha: dict[str, str]):
+        # Create reverse mappings from SHA to set of IDs
+        sha_to_ids1 = {}
+        sha_to_ids2 = {}
+        for id1, sha1 in disk_sha.items():
+            sha_to_ids1.setdefault(sha1, set()).add(id1)
+        for id2, sha2 in current_sha.items():
+            sha_to_ids2.setdefault(sha2, set()).add(id2)
 
-        disk_sha = {}
-        with open(path, "r") as f:
-            for line in f:
-                json_line = json.loads(line)
-                disk_sha.update(json_line)
+        ids_to_remove = []
+        ids_to_collect = []
+        ids_to_rename = {}
 
-        for id, sha in current_sha.items():
-            if id not in disk_sha:
-                if not rebase_dataset:
-                    print(f"ID {id} not found in disk sha")
-                return False
-            if disk_sha[id] != sha:
-                if not rebase_dataset:
-                    print(f"Disk data ID {id} sha mismatch: {disk_sha[id]} vs {sha}")
-                return False
+        # Process SHAs to align both datasets
+        all_shas = set(sha_to_ids1.keys()).union(set(sha_to_ids2.keys()))
+        for sha in all_shas:
+            ids1 = sha_to_ids1.get(sha, set())
+            ids2 = sha_to_ids2.get(sha, set())
 
-        return True
+            if len(ids1) > len(ids2):
+                surplus = len(ids1) - len(ids2)
+                ids_to_remove.extend(list(ids1)[:surplus])
+                ids1 = ids1 - set(ids_to_remove)
+
+            if len(ids2) > len(ids1):
+                missing = len(ids2) - len(ids1)
+                ids_to_collect.extend(list(ids2)[:missing])
+                ids2 = ids2 - set(ids_to_collect)
+
+            ids1 = list(ids1)
+            ids2 = list(ids2)
+            for id1, id2 in zip(ids1, ids2):
+                if id1 != id2:
+                    ids_to_rename[id1] = id2
+
+        return ids_to_collect, ids_to_rename, ids_to_remove
 
     def check_teacher_names(path, teacher_names):
         if not os.path.exists(path):
@@ -209,48 +222,47 @@ def collect_or_load(student, teachers, paths, rebase_dataset):
 
         return disk_teacher_names == teacher_names
 
-    def check_paths(paths, teacher_names, current_sha):
-        distr_path = os.path.join(paths, "distributions.hdf5")
-        names_path = os.path.join(paths, "teacher_names.json")
-        sha_path = os.path.join(paths, "sha.jsonl")
+    def get_collection_info(path, teacher_names, current_shas, data_manager: H5DataManager):
+        distr_path = os.path.join(path, "distributions.hdf5")
+        names_path = os.path.join(path, "teacher_names.json")
+        disk_shas = data_manager.get_available_shas()
 
-        if not (os.path.exists(distr_path) and os.path.exists(names_path) and os.path.exists(sha_path)):
-            return True
+        if not (os.path.exists(distr_path)):
+            return list(current_shas.keys()), {}, [disk_shas.keys()]
 
         if not check_teacher_names(names_path, teacher_names):
-            return True
+            return list(current_shas.keys()), {}, [disk_shas.keys()]
 
-        if not check_sha(sha_path, current_sha):
-            return True
-
-        return False
+        return check_shas(disk_shas, current_shas)
 
     teacher_names = [teacher.model_name for teacher in teachers]
-    current_sha = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.dataset}
-    current_sha_val = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.validation_dataset}
+    current_shas = {f"{convo.origin_convo_id}": convo.content_sha for convo in student_dataset}
 
-    collect = check_paths(paths.dataset, teacher_names, current_sha)
-    collect_val = check_paths(paths.dataset_validation, teacher_names, current_sha_val)
+    ids_collect, ids_rename, ids_remove = get_collection_info(metadata_path, teacher_names, current_shas, data_manager)
 
-    return collect, collect_val
+    ids_collect = [int(id) for id in ids_collect]
+    ids_remove = [int(id) for id in ids_remove]
+
+    return ids_collect, ids_rename, ids_remove
 
 
-def save_dataset_metadata(path, teachers: list[TeacherModel], student: StudentModel, validation=False):
-    if os.path.exists(os.path.join(path, "sha.jsonl")):
-        os.remove(os.path.join(path, "sha.jsonl"))
+def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataManager, rebase, student: StudentModel, teachers: list[TeacherModel], paths: Paths):
+    if rebase:
+        return [], []
+    
+    ids_collect, ids_rename, ids_remove = calculate_sync(student.dataset, paths.dataset, teachers, data_manager)
+    ids_collect_val, ids_rename_val, ids_remove_val = calculate_sync(student.validation_dataset, paths.dataset_validation, teachers, validation_data_manager)
 
+    data_manager.sync(ids_remove, ids_rename)
+    validation_data_manager.sync(ids_remove_val, ids_rename_val)
+
+    return ids_collect, ids_collect_val
+
+
+def save_teacher_names(path, teachers: list[TeacherModel]):
     if os.path.exists(os.path.join(path, "teacher_names.json")):
         os.remove(os.path.join(path, "teacher_names.json"))
 
-    with open(os.path.join(path, "sha.jsonl"), "w", encoding="utf-8") as f:
-
-        if validation:
-            for convo in student.validation_dataset:
-                f.write(json.dumps({convo.origin_convo_id: convo.content_sha}, ensure_ascii=False) + "\n")
-        else:
-            for convo in student.dataset:
-                f.write(json.dumps({convo.origin_convo_id: convo.content_sha}, ensure_ascii=False) + "\n")
-            
     with open(os.path.join(path, "teacher_names.json"), "w", encoding="utf-8") as f:
         json.dump([teacher.model_name for teacher in teachers], f, indent=4, ensure_ascii=False)
 
@@ -261,11 +273,11 @@ def main():
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
-    dataset_path = r"C:\Users\PC\Converted_random_samples_4k.jsonl"
+    dataset_path = r"C:\Users\PC\val_completion.jsonl"
     validation_dataset_path = r"C:\Users\PC\val_completion.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
-    student_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+    student_path = r"C:\Users\PC\Downloads\tiny-mistral-200M_safetensors"
 
     ignore_model_type = True # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
     rebase_dataset = False # Only use if you know what you are doing. Will skip the check for conversation and teacher match to use data from disk
@@ -281,7 +293,7 @@ def main():
     device = "cuda:1"
 
     # Collection settings
-    num_inference_workers = 1 # 3 IS ABSOLUTE MAX IT CAN GO
+    num_inference_workers = 2 # 3 IS ABSOLUTE MAX IT CAN GO
     reserve_vram = [4, 0.5] # GB, reserving ordered as [cuda:0, cuda:1, cuda:2, cuda:3, ...]
     encourage_eos = False
 
@@ -302,7 +314,7 @@ def main():
     data_order = "sorted" # "shuffle", "native", "sorted"
     training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     
-    validate_every_n_epochs = 0.1
+    validate_every_n_epochs = 0.5
     save_student_every_n_epochs = 4
 
     num_gpu0_layers = 7 # Used only if device_map is set to "custom"
@@ -339,46 +351,40 @@ def main():
                         validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers)
 
     student.reorder_dataset()
-    
-    loop_ids, full_collect = calculate_loop_ids(student, max_cache_size_gb, enable_topK, save_topK)
-
-    collect, collect_val = collect_or_load(student, teachers, paths, rebase_dataset)
 
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
     time.sleep(2)
     data_manager = H5DataManager(paths.dataset, device)
+    
+    loop_ids, full_collect = calculate_loop_ids(student, max_cache_size_gb, enable_topK, save_topK)
+    
+    ids_collect, ids_collect_val = sync_datasets(validation_data_manager, data_manager, rebase_dataset, student, teachers, paths)
 
-    # Main loop
+    # Main logic
 
-    ## Validation collecting loop
-    if collect_val and not rebase_dataset:
-        print("Collecting validation data...")
+    ## Validation collection
+    if ids_collect_val and not rebase_dataset:
+        print(f"Collecting validation data for {len(ids_collect_val)} samples...")
 
-        validation_data_manager.purge_dataset()
+        save_teacher_names(paths.dataset_validation, teachers)
 
         for teacher in teachers:
-            teacher.process_chunk(reserve_vram, num_inference_workers, data_manager=validation_data_manager, validation=True)
+            teacher.process_chunk(reserve_vram, num_inference_workers, data_manager=validation_data_manager, ids_to_collect=ids_collect_val, validation=True)
 
-        save_dataset_metadata(paths.dataset_validation, teachers, student, validation=True)
 
     else:
         print("Using data on disk for validation...")
     
-        if rebase_dataset:
-            save_dataset_metadata(paths.dataset_validation, teachers, student, validation=True)
-    
     
     ## Training collecting loop
-    if collect and not rebase_dataset:
-        print("Collecting all data..." if full_collect else "Collecting data in chunks...")
-        
-        data_manager.purge_dataset()
+    if ids_collect and not rebase_dataset:
+        print(f"Collecting data for {len(ids_collect)} samples..." if full_collect else "Collecting data in chunks...")
+
+        save_teacher_names(paths.dataset, teachers)
 
         if full_collect:
             for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):
-                teacher.process_chunk(reserve_vram, num_inference_workers, full_collect=True, data_manager=data_manager)
-
-            save_dataset_metadata(paths.dataset, teachers, student)
+                teacher.process_chunk(reserve_vram, num_inference_workers, ids_to_collect=ids_collect, data_manager=data_manager)
 
             student.train_chunk(data_manager, validation_data_manager, full_collect)
 
@@ -395,9 +401,6 @@ def main():
 
     else:
         print("Using data on disk for training...")
-
-        if rebase_dataset:
-            save_dataset_metadata(paths.dataset, teachers, student)
 
         student.train_chunk(data_manager, validation_data_manager, True)
 
