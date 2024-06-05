@@ -228,10 +228,10 @@ def calculate_sync(student_dataset, metadata_path, teachers, data_manager: H5Dat
         disk_shas = data_manager.get_available_shas()
 
         if not (os.path.exists(distr_path)):
-            return list(current_shas.keys()), {}, [disk_shas.keys()]
+            return list(current_shas.keys()), {}, list(disk_shas.keys())
 
         if not check_teacher_names(names_path, teacher_names):
-            return list(current_shas.keys()), {}, [disk_shas.keys()]
+            return list(current_shas.keys()), {}, list(disk_shas.keys())
 
         return check_shas(disk_shas, current_shas)
 
@@ -273,7 +273,7 @@ def main():
 
     # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
     # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
-    dataset_path = r"C:\Users\PC\val_completion.jsonl"
+    dataset_path = r"C:\Users\PC\Converted_random_samples_4k.jsonl"
     validation_dataset_path = r"C:\Users\PC\val_completion.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
@@ -311,8 +311,8 @@ def main():
     
     lr_scheduler = "cosine" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
-    data_order = "sorted" # "shuffle", "native", "sorted"
-    training_precision = "fp16" # "fp32", "fp16", "bf16", "4bit", "8bit"
+    data_order = "shuffle" # "shuffle", "native", "sorted"
+    training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
     
     validate_every_n_epochs = 0.5
     save_student_every_n_epochs = 4
@@ -370,7 +370,7 @@ def main():
 
         for teacher in teachers:
             teacher.process_chunk(reserve_vram, num_inference_workers, data_manager=validation_data_manager, ids_to_collect=ids_collect_val, validation=True)
-
+    
 
     else:
         print("Using data on disk for validation...")

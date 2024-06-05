@@ -34,9 +34,7 @@ class TeacherModel(BaseModel):
         self._sort_datasets_by_len()
 
         dataset_chunk = (self.validation_dataset if validation else self.dataset)
-        print(ids_to_collect)
         dataset_chunk = [convo for convo in dataset_chunk if convo.origin_convo_id in ids_to_collect]
-        print(len(dataset_chunk))
 
         with multiprocessing.Manager() as manager:
             done_chunk = manager.Event()

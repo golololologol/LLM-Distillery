@@ -72,8 +72,8 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
     student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
 
     if indices is not None:
-        rev_sum_topK = (1 - teacher_logits.exp().sum(dim=-1)).clamp(eps)
-        num_pad_logits = student_logits.size(-1) - teacher_logits.size(-1)
+        rev_sum_topK = (1 - teacher_logits[:min_len].exp().sum(dim=-1)).clamp(eps)
+        num_pad_logits = student_logprobs.size(-1) - teacher_logits[:min_len].size(-1)
         pad_logits = (rev_sum_topK / num_pad_logits).log()
 
         teacher_logits_padded = torch.zeros_like(student_logprobs) + pad_logits.unsqueeze(-1)
