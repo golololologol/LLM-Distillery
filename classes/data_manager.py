@@ -335,6 +335,9 @@ class H5DataManager:
         """
         Deletes distributions with the given IDs from the dataset.
         """
+        response = input(f"Are you sure you want to delete {len(ids)} samples from the dataset?")
+        if response.lower() not in ['y', 'yes', 'ye', '1', 'true', 't']:
+            raise ValueError("User cancelled operation.")
         self.queue.put(('clear_ids', ids))
         self.done_everything.wait()
 
