@@ -175,8 +175,8 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.num_gpu0_layers = num_gpu0_layers
 
 
-def collect_or_load(student: StudentModel, teachers: list[TeacherModel], paths: Paths, rebase_dataset: bool) -> tuple[bool, bool]:
-
+def collect_or_load(student, teachers, paths, rebase_dataset):
+    
     def check_sha(path, current_sha):
         if not os.path.exists(path):
             print(f"File not found: {path}")
