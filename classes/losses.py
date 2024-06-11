@@ -31,33 +31,20 @@ class Losses:
             raise ValueError("No losses to add to the loss dictionary.")
 
         self.num_steps_accumulated += 1
-        
+
         for key, value in new_losses.items():
-            if key == "train_loss":
-                continue
-            else:
-                new_losses[key] = value.detach()
+            if key != "train_loss":
+                new_losses[key] = value.clone().detach()
 
         if not self.loss_dict:
             self.loss_dict = new_losses
             return
 
-        try:
-            for key, value in new_losses.items():
-                if key in self.loss_dict:
-                    self.loss_dict[key] += value
-                else:
-                    self.loss_dict[key] = value
-
-        except:
-            self.device = new_losses[new_losses.keys()][0].device
-
-            for key, value in new_losses.items():
-                if key in self.loss_dict:
-                    self.loss_dict[key].to(self.device)
-                    self.loss_dict[key] += value
-                else:
-                    self.loss_dict[key] = value
+        for key, value in new_losses.items():
+            if key in self.loss_dict:
+                self.loss_dict[key] += value
+            else:
+                self.loss_dict[key] = value
 
     def empty(self):
         """
@@ -122,8 +109,6 @@ class Losses:
     def __str__(self):
         loss_str = " Validation Losses:\n" if self.validation else " Training Losses:\n"
         for key, value in self.loss_dict.items():
-            if key == "train_loss":
-                continue
             loss_str += f"{key}: {value.item():.4f}\n"
         return loss_str
     

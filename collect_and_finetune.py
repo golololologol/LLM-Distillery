@@ -175,7 +175,7 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.num_gpu0_layers = num_gpu0_layers
 
 
-def calculate_sync(student_dataset, metadata_path, teachers, data_manager: H5DataManager):
+def calculate_sync(student_dataset, data_manager: H5DataManager, student_vocab_family: str):
     def check_shas(disk_sha: dict[str, str], current_sha: dict[str, str]):
         # Create reverse mappings from SHA to set of IDs
         sha_to_ids1 = {}
@@ -213,32 +213,22 @@ def calculate_sync(student_dataset, metadata_path, teachers, data_manager: H5Dat
 
         return ids_to_collect, ids_to_rename, ids_to_remove
 
-    def check_teacher_names(path, teacher_names):
-        if not os.path.exists(path):
-            return False
-
-        with open(path, "r") as f:
-            disk_teacher_names = json.load(f)
-
-        return disk_teacher_names == teacher_names
-
-    def get_collection_info(path, teacher_names, current_shas, data_manager: H5DataManager):
-        distr_path = os.path.join(path, "distributions.hdf5")
-        names_path = os.path.join(path, "teacher_names.json")
+    def get_collection_info(current_shas, data_manager: H5DataManager, student_vocab_family: str):
         disk_shas = data_manager.get_available_shas()
+        data_manager_vocab_family = data_manager.get_vocab_family()
 
-        if not (os.path.exists(distr_path)):
+        if data_manager_vocab_family is None:
             return list(current_shas.keys()), {}, list(disk_shas.keys())
 
-        if not check_teacher_names(names_path, teacher_names):
+        if not data_manager_vocab_family == student_vocab_family:
+            print("Vocab family mismatch between the current models and the dataset on disk!\nAll data will be recollected using the new vocab family.")
             return list(current_shas.keys()), {}, list(disk_shas.keys())
 
         return check_shas(disk_shas, current_shas)
 
-    teacher_names = [teacher.model_name for teacher in teachers]
     current_shas = {f"{convo.origin_convo_id}": convo.content_sha for convo in student_dataset}
 
-    ids_collect, ids_rename, ids_remove = get_collection_info(metadata_path, teacher_names, current_shas, data_manager)
+    ids_collect, ids_rename, ids_remove = get_collection_info(current_shas, data_manager, student_vocab_family)
 
     ids_collect = [int(id) for id in ids_collect]
     ids_remove = [int(id) for id in ids_remove]
@@ -246,12 +236,18 @@ def calculate_sync(student_dataset, metadata_path, teachers, data_manager: H5Dat
     return ids_collect, ids_rename, ids_remove
 
 
-def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataManager, rebase, student: StudentModel, teachers: list[TeacherModel], paths: Paths):
+def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataManager, rebase, student: StudentModel):
     if rebase:
+        current_shas = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.dataset}
+        current_shas_val = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.validation_dataset}
+        data_manager.update_shas(current_shas)
+        validation_data_manager.update_shas(current_shas_val)
+        data_manager.set_vocab_family(student.vocab_family)
+        validation_data_manager.set_vocab_family(student.vocab_family)
         return [], []
     
-    ids_collect, ids_rename, ids_remove = calculate_sync(student.dataset, paths.dataset, teachers, data_manager)
-    ids_collect_val, ids_rename_val, ids_remove_val = calculate_sync(student.validation_dataset, paths.dataset_validation, teachers, validation_data_manager)
+    ids_collect, ids_rename, ids_remove = calculate_sync(student.dataset, data_manager, student.vocab_family)
+    ids_collect_val, ids_rename_val, ids_remove_val = calculate_sync(student.validation_dataset, validation_data_manager, student.vocab_family)
 
     data_manager.sync(ids_remove, ids_rename)
     validation_data_manager.sync(ids_remove_val, ids_rename_val)
@@ -259,57 +255,47 @@ def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataMa
     return ids_collect, ids_collect_val
 
 
-def save_teacher_names(path, teachers: list[TeacherModel]):
-    if os.path.exists(os.path.join(path, "teacher_names.json")):
-        os.remove(os.path.join(path, "teacher_names.json"))
-
-    with open(os.path.join(path, "teacher_names.json"), "w", encoding="utf-8") as f:
-        json.dump([teacher.model_name for teacher in teachers], f, indent=4, ensure_ascii=False)
-
-
 def main():
     cache_folder = r"C:\Users\PC\Desktop\cache"
     max_cache_size_gb = 320
 
-    # "/root/axo_clone/axolotl/data/random_samples_4k.jsonl"
-    # "/root/axo_clone/Distill_Latest_Clone/train_test_small.jsonl"
-    dataset_path = r"C:\Users\PC\Converted_random_samples_4k.jsonl"
+    dataset_path = r"C:\Users\PC\Downloads\theoremqa.jsonl"
     validation_dataset_path = r"C:\Users\PC\val_completion.jsonl"
 
     teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
-    student_path = r"C:\Users\PC\Downloads\tiny-mistral-200M_safetensors"
+    student_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
 
     ignore_model_type = True # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
-    rebase_dataset = False # Only use if you know what you are doing. Will skip the check for conversation and teacher match to use data from disk
+    rebase_dataset = False # Only use if you know what you are doing. Will skip safety checks to directly use data on disk, also updating metadata used for future safety checks
 
     # General model settings
     context_len = 2*1024
     save_sys_range = True
     save_user_range = True
     save_assistant_range = True
-    crop_distr_to_size = 32000
+    crop_distr_to_size = 32000 # A very rudimentary way to avoid training on tokens that aren't in the student's vocab. Its applied as: distributions[:, :crop_distr_to_size]
     enable_topK = True
     save_topK = 300
     device = "cuda:1"
 
     # Collection settings
-    num_inference_workers = 2 # 3 IS ABSOLUTE MAX IT CAN GO
-    reserve_vram = [4, 0.5] # GB, reserving ordered as [cuda:0, cuda:1, cuda:2, cuda:3, ...]
-    encourage_eos = False
+    num_inference_workers = 1 # 3 IS ABSOLUTE MAX IT CAN GO (for some reason 4 workers will deadlock the script)
+    reserve_vram = [4, 0.5] # GB, reserving ordered as [cuda:0, cuda:1, cuda:2, cuda:3, ...], used during collection
+    encourage_eos = False # If True, during collection each content end position will have eos token as the most probable one. Reasoning: to help the student learn to stop generating at ends of turns
 
     # Training settings
     num_epochs = 1
-    num_warmup_steps = 50
+    num_warmup_steps = 200
 
     batch_size = 4
     grad_accum_batches = 1
     grad_checkpointing = False
     temperature = 1
-    lr = 1e-6
+    lr = 1e-5
     decay_start = 0.9 # wsd only
-    alpha = 2 # weighted losses
+    alpha = 0.5 # weighted losses
     
-    lr_scheduler = "cosine" # "wsd", "cosine", "linear", "constant"
+    lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
     optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
     data_order = "shuffle" # "shuffle", "native", "sorted"
     training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
@@ -353,12 +339,12 @@ def main():
     student.reorder_dataset()
 
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
-    time.sleep(2)
+    time.sleep(2) # 2s sleep to allow the data manager to initialize, else it stalls for some reason
     data_manager = H5DataManager(paths.dataset, device)
     
     loop_ids, full_collect = calculate_loop_ids(student, max_cache_size_gb, enable_topK, save_topK)
     
-    ids_collect, ids_collect_val = sync_datasets(validation_data_manager, data_manager, rebase_dataset, student, teachers, paths)
+    ids_collect, ids_collect_val = sync_datasets(validation_data_manager, data_manager, rebase_dataset, student)
 
     # Main logic
 
@@ -366,29 +352,39 @@ def main():
     if ids_collect_val and not rebase_dataset:
         print(f"Collecting validation data for {len(ids_collect_val)} samples...")
 
-        save_teacher_names(paths.dataset_validation, teachers)
+        validation_data_manager.set_vocab_family(student.vocab_family)
 
         for teacher in teachers:
             teacher.process_chunk(reserve_vram, num_inference_workers, data_manager=validation_data_manager, ids_to_collect=ids_collect_val, validation=True)
     
-
     else:
         print("Using data on disk for validation...")
     
     
     ## Training collecting loop
     if ids_collect and not rebase_dataset:
-        print(f"Collecting data for {len(ids_collect)} samples..." if full_collect else "Collecting data in chunks...")
 
-        save_teacher_names(paths.dataset, teachers)
+        data_manager.set_vocab_family(student.vocab_family)
 
         if full_collect:
+            print(f"Collecting data for {len(ids_collect)} samples...")
             for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):
                 teacher.process_chunk(reserve_vram, num_inference_workers, ids_to_collect=ids_collect, data_manager=data_manager)
 
             student.train_chunk(data_manager, validation_data_manager, full_collect)
 
         else:
+            print(f"WARNING: The calculated size of the h5 dataset is too large for the specified cache size ({max_cache_size_gb}GB).")
+            print("The data will be collected in chunks. This will erase all previous data in the main h5 dataset!")
+
+            response = input("Do you wish to continue? (y/n): ")
+            if response.lower() not in ["y", "yes", "1", "true", "t"]:
+                print("Exiting...")
+                validation_data_manager.close()
+                data_manager.close()
+                student.close()
+                exit(0)
+
             for epoch in tqdm(range(num_epochs), desc="Epochs", smoothing=0.06, position=0):
 
                 for chunk_ids in tqdm(loop_ids, desc="Chunks", smoothing=0.06, position=1, leave=False):
@@ -407,9 +403,9 @@ def main():
     validation_data_manager.close()
     data_manager.close()
 
-    print("\nDone!")
-
     student.close()
+
+    print("Done!")
 
 if __name__ == "__main__":
     main()

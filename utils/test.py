@@ -370,53 +370,74 @@ def truncated_kldiv(student_probs, teacher_probs):
 #print(grouped_dict.items())
 #print(dict1)
 
-model_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+#model_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+#
+#model = LlamaForCausalLM.from_pretrained(
+#    model_path,
+#    device_map="auto",
+#    attn_implementation="flash_attention_2"
+#)
+#
+#layer_names = list(model.hf_device_map.keys())
+#print(model.hf_device_map, "\n")
+#del model
+#
+#torch.cuda.empty_cache()
+#
+#num_layers = len(layer_names)
+#num_gpus = 3
+#num_gpu0_layers = 2
+#
+## Distribute layers across GPUs
+#custom_device_map = {}
+#remaining_layers = num_layers - num_gpu0_layers
+#layers_per_gpu = math.ceil(remaining_layers / (num_gpus - 1))
+#
+## Assign layers to GPU 0
+#layer_index = 0
+#for _ in range(num_gpu0_layers):
+#    custom_device_map[layer_names[layer_index]] = 0
+#    layer_index += 1
+#
+## Assign remaining layers to other GPUs
+#gpu_id = 1
+#while layer_index < num_layers:
+#    for _ in range(layers_per_gpu):
+#        if layer_index >= num_layers:
+#            break
+#        custom_device_map[layer_names[layer_index]] = gpu_id
+#        layer_index += 1
+#    gpu_id += 1
+#
+#print(custom_device_map)
+#
+#input("Press Enter to continue...")
+#
+#model = AutoModelForCausalLM.from_pretrained(
+#    model_path,
+#    device_map=custom_device_map,
+#    attn_implementation="flash_attention_2"
+#)
+#print(model.hf_device_map)
+#input("Press Enter to continue...")
 
-model = LlamaForCausalLM.from_pretrained(
-    model_path,
-    device_map="auto",
-    attn_implementation="flash_attention_2"
-)
 
-layer_names = list(model.hf_device_map.keys())
-print(model.hf_device_map, "\n")
-del model
+letter_list = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']
 
-torch.cuda.empty_cache()
+content_ranges = [[0, 3], [5, 8]]
 
-num_layers = len(layer_names)
-num_gpus = 3
-num_gpu0_layers = 2
+content_indices = []
+for start, end in content_ranges:
+    content_indices.extend(range(start, end))
 
-# Distribute layers across GPUs
-custom_device_map = {}
-remaining_layers = num_layers - num_gpu0_layers
-layers_per_gpu = math.ceil(remaining_layers / (num_gpus - 1))
+content_letters = [letter_list[i] for i in content_indices]
 
-# Assign layers to GPU 0
-layer_index = 0
-for _ in range(num_gpu0_layers):
-    custom_device_map[layer_names[layer_index]] = 0
-    layer_index += 1
+inner_content_indices = []
+start_idx = 0
 
-# Assign remaining layers to other GPUs
-gpu_id = 1
-while layer_index < num_layers:
-    for _ in range(layers_per_gpu):
-        if layer_index >= num_layers:
-            break
-        custom_device_map[layer_names[layer_index]] = gpu_id
-        layer_index += 1
-    gpu_id += 1
+for start, end in content_ranges:
+    end_idx = start_idx + (end - start) - 1
+    inner_content_indices.append([start_idx, end_idx])
+    start_idx = end_idx + 1
 
-print(custom_device_map)
-
-input("Press Enter to continue...")
-
-model = AutoModelForCausalLM.from_pretrained(
-    model_path,
-    device_map=custom_device_map,
-    attn_implementation="flash_attention_2"
-)
-print(model.hf_device_map)
-input("Press Enter to continue...")
+print(inner_content_indices)

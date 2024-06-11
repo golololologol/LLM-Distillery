@@ -50,9 +50,6 @@ class ConvoTokenized:
     def __init__(self, tokenized: ndarray, content_ranges, padding, cropped_end, convo_id):
         self.tokenized: ndarray = tokenized
         self.content_ranges: list[tuple[int, int]] = content_ranges
-        self.CE_token_ranges: list[tuple[int, int]] = [(start+1, end) for start, end in content_ranges]
-        self.CE_distr_ranges: list[tuple[int, int]] = [(start, end-1) for start, end in content_ranges]
-        self.content_tokens: list[int] = [token for start, end in content_ranges for token in tokenized[start:end]]
         self.padding: int = padding
         self.cropped_end: bool = cropped_end
         self.length: int = len(tokenized) - padding

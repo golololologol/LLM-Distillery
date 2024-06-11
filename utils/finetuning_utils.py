@@ -44,7 +44,7 @@ class WarmupStableDecayLR(LRScheduler):
             return [self.final_lr for group in self.optimizer.param_groups]
         
 
-def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_content_tokens: torch.Tensor, alpha: torch.Tensor) -> dict[str, torch.Tensor]:
+def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_CE_tokens: torch.Tensor, alpha: torch.Tensor, avoid_indices: torch.Tensor) -> dict[str, torch.Tensor]:
     def custom_kl_div(student_logprobs: torch.Tensor, teacher_logprobs: torch.Tensor, per_token: bool = False):
         kl_div_raw = F.kl_div(student_logprobs, teacher_logprobs, reduction='none', log_target=True)
 
@@ -56,18 +56,19 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
         return kl_div
         
     def abomination_loss(kl_div_per_token: torch.Tensor, alpha: torch.Tensor, CE_loss: torch.Tensor):
-        corrected_CE_loss = torch.cat((CE_loss, torch.zeros(1, device=CE_loss.device)))
+        if CE_loss.numel() < kl_div_per_token.numel():
+            CE_loss = torch.cat((CE_loss, torch.zeros(1, device=CE_loss.device)))
 
         weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha)
 
-        weights = weights + corrected_CE_loss
+        weights = weights + CE_loss
 
         loss = (kl_div_per_token * weights).mean()
 
         return loss
     
     min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
-    eps = 1e-8
+    eps = 1e-10
 
     student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
 
@@ -84,8 +85,15 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
     else:
         teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
 
-    CE_loss = F.cross_entropy(student_logits[:min_len - 1], convo_content_tokens[1:min_len], reduction='none')
-    teacher_CE_loss = F.cross_entropy(teacher_logprobs[:min_len - 1], convo_content_tokens[1:min_len], reduction='none')
+    convo_CE_tokens = convo_CE_tokens[:min_len]
+
+    CE_loss = F.cross_entropy(student_logprobs[:convo_CE_tokens.numel()], convo_CE_tokens, reduction='none')
+    teacher_CE_loss = F.cross_entropy(teacher_logprobs[:convo_CE_tokens.numel()], convo_CE_tokens, reduction='none')
+
+    if avoid_indices.numel() > 0:
+        CE_loss.scatter_(0, avoid_indices, 0)
+        teacher_CE_loss.scatter_(0, avoid_indices, 0)
+
     CE_diff = CE_loss - teacher_CE_loss
     corrected_CE_diff = torch.where(CE_diff < 0, torch.zeros_like(CE_diff), CE_diff)
 

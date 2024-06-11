@@ -89,6 +89,31 @@ class StudentModel(BaseModel):
         for start, end in content_ranges:
             content_indices.append(np.arange(start, end))
         return torch.as_tensor(np.concatenate(content_indices), dtype=torch.long).to(device, non_blocking=True)
+    
+    def _get_CE_indices_tensor(self, content_ranges, device, convo_len) -> tuple[torch.Tensor, torch.Tensor]:
+        CE_indices = []
+        avoid_CE_indices = []
+        num_ranges = len(content_ranges)
+        start_idx = 0
+        for start, end in content_ranges:
+            if (start + 1) > self.context_len:
+                continue
+            CE_indices.append(np.arange(start+1, end+1))
+            end_idx = start_idx + (end - start) - 1
+
+            if num_ranges > 1:
+                avoid_CE_indices.append(end_idx)
+                
+            start_idx = end_idx + 1
+
+        CE_indices = np.concatenate(CE_indices)
+
+        if CE_indices[-1] >= convo_len:
+            CE_indices = CE_indices[:-1]
+            if avoid_CE_indices:
+                avoid_CE_indices.pop(-1)
+
+        return torch.as_tensor(CE_indices, dtype=torch.long).to(device, non_blocking=True), torch.as_tensor(np.array(avoid_CE_indices), dtype=torch.long).to(device, non_blocking=True)
 
     def _load_model(self, model_path: str = None, load_empty: bool = False):
         self._set_postfix("Loading model...")
@@ -190,7 +215,7 @@ class StudentModel(BaseModel):
         self.optimizer = set_optimizer(
             self.model.parameters(),
             lr=self.lr,
-            betas=(0.9, 0.999),
+            betas=(0.9, 0.99),
             optimizer_name=self.optimizer_name,
             weight_decay=2e-8
         )
@@ -205,6 +230,9 @@ class StudentModel(BaseModel):
         self.validation_dataset_sorted = True
     
     def reorder_dataset(self):
+        """
+        Reorders the main dataset according to the data_order attribute.
+        """
         if self.dataset_sorted:
             return
         if self.data_order == "shuffle":
@@ -357,11 +385,11 @@ class StudentModel(BaseModel):
         for batch_convos in batched_chunk_convos:
             updated_grads = False
             batch_steps = len(batch_convos)
-            logits_device = self.distr_device if self.distr_device else self.device
+            distr_device = self.distr_device if self.distr_device else self.device
 
             sdh_mem_name, batch_shape, batch_dtype, batch_indices, batch_padding = data_manager.read_next_batch()
             shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
-            teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(logits_device, non_blocking=True)
+            teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(distr_device, non_blocking=True)
 
             max_non_padded_len = max(convo.length for convo in batch_convos)
             batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
@@ -371,32 +399,36 @@ class StudentModel(BaseModel):
             
             if not self.distr_device:
                 self.distr_device = batch_logits.device
-                logits_device = self.distr_device
-                teacher_batch_raw = teacher_batch_raw.to(logits_device, non_blocking=True)
+                distr_device = self.distr_device
+                teacher_batch_raw = teacher_batch_raw.to(distr_device, non_blocking=True)
             
             for i, convo in enumerate(batch_convos):
-                indices = torch.from_numpy(batch_indices[i]).to(logits_device, non_blocking=True)
-                content_indices = self._get_content_indices_tensor(convo.content_ranges, logits_device)
+                indices = torch.from_numpy(batch_indices[i]).to(distr_device, non_blocking=True)
+                content_indices = self._get_content_indices_tensor(convo.content_ranges, distr_device)
+                CE_indices, avoid_CE_indices = self._get_CE_indices_tensor(convo.content_ranges, distr_device, convo.length)
                 
                 convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
                 convo_teacher_logits = teacher_batch_raw[i]
-                convo_content_tokens = torch.index_select(batch_tokenized_tensor[i], 0, content_indices)
+                
+                CE_tokens = torch.index_select(batch_tokenized_tensor[i], 0, CE_indices)
 
-                loss_dict = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, convo_content_tokens, self.alpha)
+                loss_dict = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, CE_tokens, self.alpha, avoid_CE_indices)
 
                 self.losses.add_losses(loss_dict)
 
                 del loss_dict
                 del convo_content_logits
                 del convo_teacher_logits
-                del convo_content_tokens
+                del CE_tokens
+                del CE_indices
+                del avoid_CE_indices
                 del indices
                 del content_indices
 
             del batch_logits
             del teacher_batch_raw
 
-            self.losses.backward(divisor=self.eff_batch_size)
+            self.losses.backward(divisor=self.grad_accum)
             
             self.progress_bar.update(batch_steps)
 
@@ -434,11 +466,11 @@ class StudentModel(BaseModel):
 
         with torch.no_grad():
             for val_convo_batch in self.validation_dataset_batched:
-                logits_device = self.distr_device if self.distr_device else self.device
+                distr_device = self.distr_device if self.distr_device else self.device
 
                 sdh_mem_name, batch_shape, batch_dtype, val_batch_indices, batch_padding = validation_data_manager.read_next_batch()
                 shd_mem = shared_memory.SharedMemory(name=sdh_mem_name)
-                teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(logits_device, non_blocking=True)
+                teacher_batch_raw = torch.from_numpy(np.ndarray(batch_shape, dtype=batch_dtype, buffer=shd_mem.buf)).to(distr_device, non_blocking=True)
 
                 val_max_non_padded_len = max(convo.length for convo in val_convo_batch)
                 val_batch_tokenized = np.array([convo.tokenized[:val_max_non_padded_len] for convo in val_convo_batch])
@@ -448,24 +480,28 @@ class StudentModel(BaseModel):
                 
                 if not self.distr_device:
                     self.distr_device = val_batch_logits.device
-                    logits_device = self.distr_device
-                    teacher_batch_raw = teacher_batch_raw.to(logits_device, non_blocking=True)
+                    distr_device = self.distr_device
+                    teacher_batch_raw = teacher_batch_raw.to(distr_device, non_blocking=True)
 
                 for i, val_convo in enumerate(val_convo_batch):
-                    val_indices = torch.from_numpy(val_batch_indices[i]).to(logits_device, non_blocking=True)
-                    val_content_indices = self._get_content_indices_tensor(val_convo.content_ranges, logits_device)
-
+                    val_indices = torch.from_numpy(val_batch_indices[i]).to(distr_device, non_blocking=True)
+                    val_content_indices = self._get_content_indices_tensor(val_convo.content_ranges, distr_device)
+                    val_CE_indices, val_avoid_CE_indices = self._get_CE_indices_tensor(val_convo.content_ranges, distr_device, val_convo.length)
+                    
                     val_convo_content_logits = torch.index_select(val_batch_logits[i], 0, val_content_indices) / self.temperature
                     val_convo_teacher_logits = teacher_batch_raw[i][:batch_padding[i]]
-                    val_convo_content_tokens = torch.index_select(val_batch_tokenized_tensor[i], 0, val_content_indices)
+                    val_convo_CE_tokens = torch.index_select(val_batch_tokenized_tensor[i], 0, val_CE_indices)
                     
-                    loss_dict = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, val_indices, val_convo_content_tokens, self.alpha)
+                    loss_dict = calculate_divergence(val_convo_content_logits, val_convo_teacher_logits, val_indices, val_convo_CE_tokens, self.alpha, val_avoid_CE_indices)
                     
                     losses.add_losses(loss_dict)
+
                     del loss_dict
                     del val_convo_content_logits
                     del val_convo_teacher_logits
-                    del val_convo_content_tokens
+                    del val_convo_CE_tokens
+                    del val_CE_indices
+                    del val_avoid_CE_indices
                     del val_indices
                     del val_content_indices
 
@@ -483,6 +519,7 @@ class StudentModel(BaseModel):
         pbar.close()
         self.model.train()
         self.next_val_step += self.validation_every_steps
+        torch.cuda.empty_cache()
 
 
 

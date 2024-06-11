@@ -3,6 +3,7 @@ from multiprocessing import shared_memory
 from multiprocessing import get_context
 import multiprocessing
 import numpy as np
+import signal
 import torch
 import time
 import h5py
@@ -13,10 +14,12 @@ class H5DataManager:
     """
     DataManager class for handling the distribution data in a HDF5 file.\n
     This class is designed to be used with the `Distribution` class from `classes/data_classes.py`.\n
-    The data is stored in a HDF5 file with the following format:\n
-    - Each distribution is stored in a dataset with the name `convo_{convo_id}`.\n
-    - The TopK indices are stored in a dataset with the name `indices_{convo_id}`.\n
-    - The distributions are stored as log probabilities to minimize the effect of floating point precision errors.
+    The class is asynchronous and uses multiprocessing to handle the data loading and saving.\n
+    General information:
+    - Distributions are stored as log probabilities to minimize the effect of floating point precision errors.
+    - The class uses shared memory to pass the data between processes.
+    - Each conversation ID has a corresponding group in the HDF5 file, containing the distribution data and optional TopK indices.
+    - Everything is tied to `origin_convo_id`, they correspond to the position of each conversation in the text dataset.
     """
     def __init__(self, dataset_path, device, max_queue_size=5):
         self.file_path = os.path.join(dataset_path, "distributions.hdf5")
@@ -32,69 +35,81 @@ class H5DataManager:
         self.distr_key = "distributions"
         self.indices_key = "indices"
 
+        signal.signal(signal.SIGTERM, self._handle_exit)
+        signal.signal(signal.SIGINT, self._handle_exit)
+
         self.loading_process.start()
+
+    def _handle_exit(self, signum, frame):
+        self.closing.set()
+        self.loading_process.join()
 
     def _process_thread(self):
         with h5py.File(self.file_path, 'a') as hdf_file:
             while True:
+                if self.closing.is_set():
+                    break
+
                 if self.queue.empty():
                     continue
 
                 self.done_everything.clear()
 
-                while not self.queue.empty():
-                    task, data = self.queue.get()
+                task, data = self.queue.get()
 
-                    if self.closing.is_set():
-                        self.done_everything.set()
-                        break
-
-                    match task:
-                        case 'get_batch':
-                            self.result_queue.put(self._make_outgoing_batch(hdf_file, data))
-                        case 'get_batches':
+                match task:
+                    case 'get_batch':
+                        self.result_queue.put(self._make_outgoing_batch(hdf_file, data))
+                    case 'get_batches':
+                        for batch_ids in data:
+                            self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
+                    case 'read_only_mode':
+                        while not self.closing.is_set():
                             for batch_ids in data:
+                                while self.result_queue.full() and not self.closing.is_set():
+                                    time.sleep(0.1)
+
+                                if self.closing.is_set():
+                                    break
+
                                 self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
-                        case 'read_only_mode':
-                            while self.queue.empty():
-                                for batch_ids in data:
-                                    while self.result_queue.full():
-                                        if self.closing.is_set():
-                                            break
-                                        time.sleep(0.1)
-
-                                    if self.closing.is_set():
-                                        break
-
-                                    self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
                                     
-                        case 'put_batch':
-                            self._process_distributions(hdf_file, data)
-                        case 'update_batch':
-                            self._update_data(hdf_file, data)
-                        case 'get_available_ids':
-                            self.result_queue.put([int(group.split('_')[1]) for group in hdf_file])
-                        case 'clear_dataset':
-                            ids_to_clear = [int(group.split('_')[1]) for group in hdf_file]
-                            self._clear_dataset(hdf_file, ids_to_clear)
-                        case 'clear_ids':
-                            self._clear_dataset(hdf_file, data)
-                        case 'rename_ids':
-                            self._rename_ids(hdf_file, data)
-                        case 'get_available_shas':
-                            self.result_queue.put(self._get_shas(hdf_file))
-
-                    if self.closing.is_set():
-                        break
-                
+                    case 'put_batch':
+                        self._process_distributions(hdf_file, data)
+                    case 'update_batch':
+                        self._update_data(hdf_file, data)
+                    case 'update_shas':
+                        self._update_shas(hdf_file, data)
+                    case 'get_available_ids':
+                        self.result_queue.put([int(group.split('_')[1]) for group in hdf_file])
+                    case 'clear_dataset':
+                        ids_to_clear = [int(group.split('_')[1]) for group in hdf_file]
+                        self._clear_dataset(hdf_file, ids_to_clear)
+                    case 'clear_ids':
+                        self._clear_dataset(hdf_file, data)
+                    case 'rename_ids':
+                        self._rename_ids(hdf_file, data)
+                    case 'get_available_shas':
+                        self.result_queue.put(self._get_shas(hdf_file))
+                    case 'get_vocab_family':
+                        self.result_queue.put(self._get_vocab_family(hdf_file))
+                    case 'set_vocab_family':
+                        self._set_vocab_family(hdf_file, data)
+   
                 if self.queue.empty():
                     self.done_everything.set()
+            
+        self.shared_batches = []
 
-                if self.closing.is_set():
-                    for shared_batch in self.shared_batches:
-                        shared_batch.close()
-                        shared_batch.unlink()
-                    break
+        while not self.queue.empty():
+            self.queue.get()
+
+        while not self.result_queue.empty():
+            self.result_queue.get()
+
+        self.done_everything.set()
+        self.queue.close()
+        self.result_queue.close()
                 
     def _process_distributions(self, hdf_file, batch: list[Distribution]):
         for distribution in batch:
@@ -110,6 +125,12 @@ class H5DataManager:
 
             shd_mem.close()
             shd_mem.unlink()
+
+    def _update_shas(self, hdf_file, shas: dict[int, str]):
+        for id, sha in shas.items():
+            group_key = f'convo_{id}'
+            if group_key in hdf_file:
+                hdf_file[group_key].attrs['content_sha'] = sha
 
     def _merge_data(self, hdf_file, new_distribution: Distribution, id):
 
@@ -266,6 +287,12 @@ class H5DataManager:
 
         self.shared_batches = []
 
+    def _get_vocab_family(self, hdf_file: h5py.File) -> str:
+        return hdf_file.attrs['vocab_family'] if 'vocab_family' in hdf_file.attrs else None
+    
+    def _set_vocab_family(self, hdf_file: h5py.File, vocab_family: str):
+        hdf_file.attrs['vocab_family'] = vocab_family
+
     def _rename_ids(self, hdf_file: h5py.File, ids_to_rename: dict[int, int]):
         for old_id, new_id in ids_to_rename.items():
             hdf_file.move(f'convo_{old_id}', f'convo_{new_id}_moved')
@@ -303,6 +330,10 @@ class H5DataManager:
         self.queue.put(('put_batch', batch))
 
     def update_batch(self, batch: list[Distribution]):
+        """
+        Rewrites a batch of distributions in the dataset.\n
+        Does not merge the data, but replaces it.
+        """
         self.queue.put(('update_batch', batch))
 
     def get_dataset_ids(self) -> list[int]:
@@ -318,27 +349,66 @@ class H5DataManager:
         """
         true_replies = ['y', 'yes', 'ye', '1', 'true', 't']
 
-        reply = input("Are you sure you want to delete all distributions from the dataset? (y/n): ")
-
+        reply = input("The script is going to delete all distributions from the h5 dataset.\nAre you sure you want to proceed? (y/n):")
         if reply.lower() not in true_replies:
-            return
+            raise ValueError("User cancelled operation.")
         
         reply = input("Are you REALLY sure you want to delete all distributions from the dataset? (y/n): ")
-
         if reply.lower() not in true_replies:
-            return
+            raise ValueError("User cancelled operation.")
         
         self.queue.put(('clear_dataset', None))
+        self.done_everything.wait()
+
+    def update_shas(self, shas: dict[int, str]):
+        """
+        Updates the content SHA hashes of the given conversation IDs in the dataset.
+        """
+        self.queue.put(('update_shas', shas))
         self.done_everything.wait()
     
     def delete_ids(self, ids: list[int]):
         """
         Deletes distributions with the given IDs from the dataset.
         """
-        response = input(f"Are you sure you want to delete {len(ids)} samples from the dataset?")
+        if not ids:
+            return
+        
+        response = input(f"The script called for deletion of {len(ids)} samples from the h5 dataset.\nAre you sure you want to proceed? (y/n):")
         if response.lower() not in ['y', 'yes', 'ye', '1', 'true', 't']:
             raise ValueError("User cancelled operation.")
+        
         self.queue.put(('clear_ids', ids))
+        self.done_everything.wait()
+
+    def rename_ids(self, ids_to_rename: dict[int, int]):
+        """
+        Renames the given IDs in the dataset.
+        """
+        if not ids_to_rename:
+            return
+        
+        response = input(f"The script called for renaming of {len(ids_to_rename)} samples in the h5 dataset.\nThis means that the dataset's samples will be moved to new IDs.\nAre you sure you want to proceed? (y/n):")
+        if response.lower() not in ['y', 'yes', 'ye', '1', 'true', 't']:
+            raise ValueError("User cancelled operation.")
+        
+        self.queue.put(('rename_ids', ids_to_rename))
+        self.done_everything.wait()
+
+    def get_vocab_family(self) -> str:
+        """
+        Returns the vocabulary family of the dataset.
+        """
+        self.done_everything.wait()
+        self.queue.put(('get_vocab_family', None))
+        return self.result_queue.get()
+    
+    def set_vocab_family(self, vocab_family: str):
+        """
+        Sets the vocabulary family of the dataset.
+        """
+        self.done_everything.wait()
+        self.queue.put(('set_vocab_family', vocab_family))
         self.done_everything.wait()
 
     def sync(self, ids_to_delete, ids_to_rename):
@@ -348,7 +418,7 @@ class H5DataManager:
         This function is synchronous and will block until the operation is complete.
         """
         self.done_everything.wait()
-        self.queue.put(('clear_ids', ids_to_delete))
+        self.delete_ids(ids_to_delete)
 
         self.done_everything.wait()
         self.queue.put(('rename_ids', ids_to_rename))
@@ -364,5 +434,8 @@ class H5DataManager:
         return self.result_queue.get()
 
     def close(self):
+        """
+        Closes the HDF5 file and stops the loading process.
+        """
         self.closing.set()
-        self.queue.put(('close', None))
+        self.loading_process.join()
