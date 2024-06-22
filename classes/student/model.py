@@ -377,11 +377,11 @@ class StudentModel(BaseModel):
 
     def close(self):
         if self.logger is not None:
-            time.sleep(2)
             self.logger.finish()
 
     # main training loop
     def _run_distillation_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager) -> bool:
+        updated_grads = False
         for batch_convos in batched_chunk_convos:
             updated_grads = False
             batch_steps = len(batch_convos)
@@ -395,7 +395,7 @@ class StudentModel(BaseModel):
             batch_tokenized = np.array([convo.tokenized[:max_non_padded_len] for convo in batch_convos])
             batch_tokenized_tensor = torch.from_numpy(batch_tokenized).to(self.input_device, non_blocking=True)
 
-            batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float()
+            batch_logits = self.model(batch_tokenized_tensor).logits[:, :, :self.crop_to_size].float() / self.temperature
             
             if not self.distr_device:
                 self.distr_device = batch_logits.device
@@ -407,12 +407,12 @@ class StudentModel(BaseModel):
                 content_indices = self._get_content_indices_tensor(convo.content_ranges, distr_device)
                 CE_indices, avoid_CE_indices = self._get_CE_indices_tensor(convo.content_ranges, distr_device, convo.length)
                 
-                convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices) / self.temperature
-                convo_teacher_logits = teacher_batch_raw[i]
+                convo_content_logits = torch.index_select(batch_logits[i], 0, content_indices)
+                convo_teacher_logits = (teacher_batch_raw[i]/self.temperature)[:batch_padding[i]]
                 
                 CE_tokens = torch.index_select(batch_tokenized_tensor[i], 0, CE_indices)
 
-                loss_dict = calculate_divergence(convo_content_logits, convo_teacher_logits[:batch_padding[i]], indices, CE_tokens, self.alpha, avoid_CE_indices)
+                loss_dict = calculate_divergence(convo_content_logits, convo_teacher_logits, indices, CE_tokens, self.alpha, avoid_CE_indices)
 
                 self.losses.add_losses(loss_dict)
 

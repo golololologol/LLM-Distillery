@@ -6,6 +6,7 @@ from classes.paths import Paths
 from tqdm import tqdm
 import multiprocessing
 import nvidia_smi
+import argparse
 import math
 import time
 import json
@@ -255,72 +256,144 @@ def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataMa
     return ids_collect, ids_collect_val
 
 
-def main():
-    cache_folder = r"C:\Users\PC\Desktop\cache"
-    max_cache_size_gb = 320
+def load_config(config_path):
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at {config_path}!\nPlease make sure the file exists, and has all the necessary parameters.")
+    with open(config_path, 'r') as f:
+        return json.load(f)
 
-    dataset_path = r"C:\Users\PC\Downloads\theoremqa.jsonl"
-    validation_dataset_path = r"C:\Users\PC\val_completion.jsonl"
 
-    teacher_models_folder = r"C:\Users\PC\Desktop\teachers"
-    student_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
-
-    ignore_model_type = True # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
-    rebase_dataset = False # Only use if you know what you are doing. Will skip safety checks to directly use data on disk, also updating metadata used for future safety checks
+def get_params():
+    parser = argparse.ArgumentParser(description="Set parameters for the script.")
+    
+    # Paths
+    parser.add_argument('--cache_folder', '-c', type=str)
+    parser.add_argument('--dataset_path', '-d', type=str)
+    parser.add_argument('--validation_dataset_path', '-vd', type=str)
+    parser.add_argument('--teacher_models_folder', '-tm', type=str)
+    parser.add_argument('--student_path', '-s', type=str)
+    
+    # Cache settings
+    parser.add_argument('--max_cache_size_gb', '-maxgb', type=int)
+    
+    # Pipeline settings
+    parser.add_argument('--ignore_model_type', type=bool)
+    parser.add_argument('--rebase_dataset', type=bool)
 
     # General model settings
-    context_len = 2*1024
-    save_sys_range = True
-    save_user_range = True
-    save_assistant_range = True
-    crop_distr_to_size = 32000 # A very rudimentary way to avoid training on tokens that aren't in the student's vocab. Its applied as: distributions[:, :crop_distr_to_size]
-    enable_topK = True
-    save_topK = 300
-    device = "cuda:1"
+    parser.add_argument('--context_len', '-ctx', type=int)
+    parser.add_argument('--save_sys_range', type=bool)
+    parser.add_argument('--save_user_range', type=bool)
+    parser.add_argument('--save_assistant_range', type=bool)
+    parser.add_argument('--crop_distr_to_size', type=int)
+    parser.add_argument('--enable_topK', type=bool)
+    parser.add_argument('--save_topK', '-topk', type=int)
+    parser.add_argument('--device', type=str)
+    
+    # Collection settings
+    parser.add_argument('--num_inference_workers', '-niw', type=int)
+    parser.add_argument('--reserve_vram', type=float, nargs='+')
+    parser.add_argument('--encourage_eos', type=bool)
+    
+    # Training settings
+    parser.add_argument('--num_epochs', '-ne', type=int)
+    parser.add_argument('--num_warmup_steps', '-nws', type=int)
+    parser.add_argument('--batch_size', '-bs', type=int)
+    parser.add_argument('--grad_accum_batches', '-g', type=int)
+    parser.add_argument('--grad_checkpointing', type=bool)
+    parser.add_argument('--temperature', '-t', type=float)
+    parser.add_argument('--lr', '-lr', type=float)
+    parser.add_argument('--decay_start', type=float)
+    parser.add_argument('--alpha', type=float)
+    parser.add_argument('--lr_scheduler', type=str)
+    parser.add_argument('--optimizer', type=str)
+    parser.add_argument('--data_order', type=str)
+    parser.add_argument('--training_precision', type=str)
+    parser.add_argument('--validate_every_n_epochs', type=float)
+    parser.add_argument('--save_student_every_n_epochs', type=float)
+    parser.add_argument('--num_gpu0_layers', type=int)
+    parser.add_argument('--device_map', type=str)
+    parser.add_argument('--max_memory', type=str)
+    parser.add_argument('--multi_gpu', type=bool)
+    parser.add_argument('--save_final_state', type=bool)
+    parser.add_argument('--wandb_comment', '-wdb', type=str)
+    
+    # Student settings
+    parser.add_argument('--freeze_layers', '-fl', type=str, nargs='+')
+    parser.add_argument('--add_bos', type=bool)
+    parser.add_argument('--prompt_format', type=json.loads)
+    
+    args = parser.parse_args()
+
+    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+    config = load_config(config_path)
+
+    params = {key: getattr(args, key) if getattr(args, key) is not None else config[key] for key in config.keys()}
+
+    params['max_memory'] = {int(key): value for key, value in params['max_memory'].items() if key.lower() != 'cpu'}
+
+    return params
+
+
+def main():
+    params = get_params()
+
+    # Paths
+    cache_folder = params['cache_folder']
+    dataset_path = params['dataset_path']
+    validation_dataset_path = params['validation_dataset_path']
+    teacher_models_folder = params['teacher_models_folder']
+    student_path = params['student_path']
+
+    # Cache settings
+    max_cache_size_gb = params['max_cache_size_gb']
+
+    # Pipeline settings
+    ignore_model_type = params['ignore_model_type'] # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
+    rebase_dataset = params['rebase_dataset'] # Only use if you know what you are doing. Will skip safety checks to directly use data on disk, also updating metadata used for future safety checks
+
+    # General model settings
+    context_len = params['context_len']
+    save_sys_range = params['save_sys_range']
+    save_user_range = params['save_user_range']
+    save_assistant_range = params['save_assistant_range']
+    crop_distr_to_size = params['crop_distr_to_size'] # A very rudimentary way to avoid training on tokens that aren't in the student's vocab. Its applied as: distributions[:, :crop_distr_to_size] 
+    enable_topK = params['enable_topK']
+    save_topK = params['save_topK']
+    device = params['device']
 
     # Collection settings
-    num_inference_workers = 1 # 3 IS ABSOLUTE MAX IT CAN GO (for some reason 4 workers will deadlock the script)
-    reserve_vram = [4, 0.5] # GB, reserving ordered as [cuda:0, cuda:1, cuda:2, cuda:3, ...], used during collection
-    encourage_eos = False # If True, during collection each content end position will have eos token as the most probable one. Reasoning: to help the student learn to stop generating at ends of turns
+    num_inference_workers = params['num_inference_workers']
+    reserve_vram = params['reserve_vram']
+    encourage_eos = params['encourage_eos']
 
     # Training settings
-    num_epochs = 1
-    num_warmup_steps = 200
-
-    batch_size = 4
-    grad_accum_batches = 1
-    grad_checkpointing = False
-    temperature = 1
-    lr = 1e-5
-    decay_start = 0.9 # wsd only
-    alpha = 0.5 # weighted losses
-    
-    lr_scheduler = "wsd" # "wsd", "cosine", "linear", "constant"
-    optimizer = "adamw" # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
-    data_order = "shuffle" # "shuffle", "native", "sorted"
-    training_precision = "bf16" # "fp32", "fp16", "bf16", "4bit", "8bit"
-    
-    validate_every_n_epochs = 0.5
-    save_student_every_n_epochs = 4
-
-    num_gpu0_layers = 7 # Used only if device_map is set to "custom"
-    device_map = "custom" # "balanced", "balanced_low_0", "custom"
-    max_memory = {0: '20GB', 1: '20GB', 'cpu': '200GB'} # {0: '20GB', 1: '60GB', 2: '60GB', 3: '60GB', 'cpu': '200GB'}
-    multi_gpu = True
-    save_final_state = False
-    wandb_comment = f"FFT" # Comment for wandb: {comment} ModelName lr(lr) (Date/Time)
+    num_epochs = params['num_epochs']
+    num_warmup_steps = params['num_warmup_steps']
+    batch_size = params['batch_size']
+    grad_accum_batches = params['grad_accum_batches']
+    grad_checkpointing = params['grad_checkpointing']
+    temperature = params['temperature']
+    lr = params['lr']
+    decay_start = params['decay_start'] # Start decay at this % of total steps trained
+    alpha = params['alpha'] # weighted losses
+    lr_scheduler = params['lr_scheduler'] # "wsd", "cosine", "linear", "constant"
+    optimizer = params['optimizer'] # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
+    data_order = params['data_order'] # "shuffle", "native", "sorted"
+    training_precision = params['training_precision'] # "fp32", "fp16", "bf16", "4bit", "8bit"
+    validate_every_n_epochs = params['validate_every_n_epochs']
+    save_student_every_n_epochs = params['save_student_every_n_epochs']
+    num_gpu0_layers = params['num_gpu0_layers'] # Used only if `device_map` is set to "custom"
+    device_map = params['device_map'] # "balanced", "balanced_low_0", "custom"
+    max_memory = params['max_memory'] # {0: '20GB', 1: '60GB', 2: '60GB', 3: '60GB', 'cpu': '200GB'}
+    multi_gpu = params['multi_gpu']
+    save_final_state = params['save_final_state'] # Save the final state of the model after training
+    wandb_comment = params['wandb_comment'] # Comment for wandb: {comment} ModelName lr(lr) (Date/Time)
 
     # Student settings
-    freeze_layers = []
-    add_bos = True
-    prompt_format = {
-        "SYS_START": "#System:\n",
-        "USER_START": "#User:\n",
-        "ASSISTANT_START": "#AI:\n",
-        "SYS_END": "\n\n",
-        "USER_END": "\n\n",
-        "ASSISTANT_END": "\n\n",
-    }
+    freeze_layers = params['freeze_layers']
+    add_bos = params['add_bos']
+    prompt_format = params['prompt_format']
 
 
     # Initialization
@@ -378,7 +451,7 @@ def main():
             print("The data will be collected in chunks. This will erase all previous data in the main h5 dataset!")
 
             response = input("Do you wish to continue? (y/n): ")
-            if response.lower() not in ["y", "yes", "1", "true", "t"]:
+            if response.lower() not in ["y", "ye", "yes", "1", "true", "t"]:
                 print("Exiting...")
                 validation_data_manager.close()
                 data_manager.close()
@@ -402,7 +475,6 @@ def main():
 
     validation_data_manager.close()
     data_manager.close()
-
     student.close()
 
     print("Done!")

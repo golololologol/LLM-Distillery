@@ -55,13 +55,13 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
 
         return kl_div
         
-    def abomination_loss(kl_div_per_token: torch.Tensor, alpha: torch.Tensor, CE_loss: torch.Tensor):
-        if CE_loss.numel() < kl_div_per_token.numel():
-            CE_loss = torch.cat((CE_loss, torch.zeros(1, device=CE_loss.device)))
+    def abomination_loss(kl_div_per_token: torch.Tensor, alpha: torch.Tensor, CE_loss_per_token: torch.Tensor):
+        if CE_loss_per_token.numel() < kl_div_per_token.numel():
+            CE_loss_per_token = torch.cat((CE_loss_per_token, torch.zeros(1, device=CE_loss_per_token.device)))
 
         weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha)
 
-        weights = weights + CE_loss
+        weights = weights + CE_loss_per_token
 
         loss = (kl_div_per_token * weights).mean()
 
@@ -99,14 +99,14 @@ def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Ten
 
     kl_div = custom_kl_div(student_logprobs, teacher_logprobs, per_token=True)
     reverse_kl_div = custom_kl_div(teacher_logprobs, student_logprobs, per_token=True)
-
+    
     weighted_kl_div = abomination_loss(kl_div, alpha, corrected_CE_diff)
     weighted_r_kl_div = abomination_loss(reverse_kl_div, alpha, corrected_CE_diff)
 
     custom_loss = (weighted_kl_div + weighted_r_kl_div)/2
 
     loss_dict = {
-        "train_loss": custom_loss, # DO NOT REMOVE  The loss under "train_loss" key is used for backprop every batch at Losses.backward()
+        "train_loss": custom_loss, # DO NOT REMOVE   The loss under "train_loss" key is used for backprop every batch at classes/Losses.py/backward()
         "custom loss": custom_loss,
         "CE loss": CE_loss.mean(),
         "kl_div": kl_div.mean(),

@@ -7,7 +7,7 @@ import torch
 
 
 def _inference_worker(inference_queue, result_queue, made_distributions, model_loaded, start_inference, done_chunk, model_path, model_name, reserve_vram_gb,
-                        gpus_mem_used, temperature, crop_to_size, pbar_queue, context_len, batch_size, max_queue_size, seq_chunk_len, enable_topK, topK):
+                        gpus_mem_used, crop_to_size, pbar_queue, context_len, batch_size, max_queue_size, seq_chunk_len, enable_topK, topK):
         
     def _load_model(model_loaded) -> tuple[ExLlamaV2, ExLlamaV2Cache]:
         pbar_queue.put(("str", f"Loading {model_name}..."))
@@ -61,7 +61,7 @@ def _inference_worker(inference_queue, result_queue, made_distributions, model_l
         if batch_tokenized is None:
             print(f"{model_name}: Batch is empty.")
 
-        batch_logp: torch.Tensor = F.log_softmax(model.forward(batch_tokenized, cache=cache).contiguous()[:, :, :crop_to_size].float()/temperature, dim=-1)
+        batch_logp: torch.Tensor = F.log_softmax(model.forward(batch_tokenized, cache=cache).contiguous()[:, :, :crop_to_size].float(), dim=-1)
         indices = None
 
         if enable_topK:

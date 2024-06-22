@@ -179,12 +179,50 @@ def rewrite_sharegpt(input_path, output_path, dataset_name, sort):
         write_records(samples, outfile, sort)
 
 
-input_file_path = r"C:\Users\PC\Downloads\opus-writing-prompts-2-sharegpt.jsonl"
+def rewrite_custom(input_path, output_path, dataset_name, sort):
+    with open(input_path, 'r', encoding='utf-8') as infile, open(output_path, 'w', encoding='utf-8') as outfile:
+        samples = []
+        for line in infile:
+            sample = json.loads(line.strip())
+            
+            sys = sample.get('init', "")
+            source = sample.get('source', "")
+            tags = sample.get('tags', [])
+            reversed = "reversed" in tags or sample.get('reversed', False)
+            turns = []
+
+            for i, turn_text in enumerate(sample['conversations']):
+
+                if reversed:
+                    assistant = (i + 1) % 2
+                else:
+                    assistant = i % 2
+
+                new_turn = {
+                    "from": "gpt" if assistant else "human",
+                    "value": turn_text
+                }
+
+                turns.append(new_turn)
+
+
+            new_sample = {
+                "init": sys,
+                "conversations": turns,
+                "source": source,
+                "tags": tags
+            }
+
+            samples.append(new_sample)
+
+        write_records(samples, outfile, sort)
+
+input_file_path = r"C:\Users\PC\Downloads\theoremqa.jsonl"
 path = os.path.dirname(input_file_path)
 name = os.path.basename(input_file_path).split('.')[0]
 output_file_path = os.path.join(path, f"Converted_{name}.jsonl")
 dataset_name = name
 sort = True
 
-rewrite_sharegpt(input_file_path, output_file_path, dataset_name, sort)
+rewrite_custom(input_file_path, output_file_path, dataset_name, sort)
 print(f"Converted {input_file_path} to {output_file_path} with dataset name {dataset_name}")

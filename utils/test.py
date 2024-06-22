@@ -422,22 +422,38 @@ def truncated_kldiv(student_probs, teacher_probs):
 #input("Press Enter to continue...")
 
 
-letter_list = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']
+#letter_list = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']
+#
+#content_ranges = [[0, 3], [5, 8]]
+#
+#content_indices = []
+#for start, end in content_ranges:
+#    content_indices.extend(range(start, end))
+#
+#content_letters = [letter_list[i] for i in content_indices]
+#
+#inner_content_indices = []
+#start_idx = 0
+#
+#for start, end in content_ranges:
+#    end_idx = start_idx + (end - start) - 1
+#    inner_content_indices.append([start_idx, end_idx])
+#    start_idx = end_idx + 1
+#
+#print(inner_content_indices)
 
-content_ranges = [[0, 3], [5, 8]]
 
-content_indices = []
-for start, end in content_ranges:
-    content_indices.extend(range(start, end))
+logits = torch.tensor(([0.00004, 10.1, 1.2], [1.5, 2.3, 3.4]))
 
-content_letters = [letter_list[i] for i in content_indices]
+logprobs = F.log_softmax(logits, dim=-1)
 
-inner_content_indices = []
-start_idx = 0
+print(logprobs.exp())
 
-for start, end in content_ranges:
-    end_idx = start_idx + (end - start) - 1
-    inner_content_indices.append([start_idx, end_idx])
-    start_idx = end_idx + 1
+temp = 2
 
-print(inner_content_indices)
+logprobs_temp = F.log_softmax(logprobs / temp, dim=-1)
+logits_temp = F.log_softmax(logits / temp, dim=-1)
+
+print(logprobs_temp.exp())
+print(logits_temp.exp())
+

@@ -61,6 +61,7 @@ def encode_prompt_format(prompt_format: dict, sp_toks: dict, tokenizer) -> dict[
         prompt_format[key] = good_encode(value, sp_toks, tokenizer)
     return prompt_format
 
+
 def tokenize_sample(args):
     convo_id, json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, model, ignore_model_type = args
 
@@ -82,8 +83,8 @@ def tokenize_sample(args):
 
     if completion:
         if model.completion or student:
-            text = json_item.get("conversations", [""])[0]
-
+            turn = json_item.get("conversations", [""])[0]
+            text = turn.get("value", "")
             if text:
                 text_tokenized = good_encode(text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)[:context_len - num_toks]
                 conversation_tokenized[num_toks:num_toks + len(text_tokenized)] = text_tokenized
@@ -107,8 +108,6 @@ def tokenize_sample(args):
     if empty:
         return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
     
-    
-    reversed = ("reversed" in tags) or json_item.get("reversed", False)
 
     sys_content = json_item.get("init", "")
     if sys_content:
@@ -124,20 +123,20 @@ def tokenize_sample(args):
             conversation_content_ranges.append((len(pf['SYS_START']) + start_idx, num_toks - len(pf['SYS_END'])))
         start_idx = num_toks - 1
 
-    for i, turn in enumerate(json_item["conversations"]):
+    for turn in json_item["conversations"]:
 
-        if turn == "":
+        turn_speaker = turn.get("from", "")
+        turn_text = turn.get("value", "")
+
+        if not turn_speaker or not turn_text:
             empty = True
             return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
 
-        if reversed:
-            assistant = (i + 1) % 2
-        else:
-            assistant = i % 2
+        assistant = turn_speaker == "gpt"
 
         turn_start_tokenized = pf['ASSISTANT_START'] if assistant else pf['USER_START']
         turn_end_tokenized = pf['ASSISTANT_END'] if assistant else pf['USER_END']
-        turn_tokenized = good_encode(turn.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
+        turn_tokenized = good_encode(turn_text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
         turn_len = len(turn_tokenized)
 
         full_turn_tokenized = np.zeros(len(turn_start_tokenized) + turn_len + len(turn_end_tokenized), dtype=np.int64)

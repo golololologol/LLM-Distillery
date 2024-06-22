@@ -46,9 +46,7 @@ class H5DataManager:
 
     def _process_thread(self):
         with h5py.File(self.file_path, 'a') as hdf_file:
-            while True:
-                if self.closing.is_set():
-                    break
+            while not self.closing.is_set():
 
                 if self.queue.empty():
                     continue
@@ -80,8 +78,7 @@ class H5DataManager:
                         self._update_data(hdf_file, data)
                     case 'update_shas':
                         self._update_shas(hdf_file, data)
-                    case 'get_available_ids':
-                        self.result_queue.put([int(group.split('_')[1]) for group in hdf_file])
+
                     case 'clear_dataset':
                         ids_to_clear = [int(group.split('_')[1]) for group in hdf_file]
                         self._clear_dataset(hdf_file, ids_to_clear)
@@ -89,12 +86,20 @@ class H5DataManager:
                         self._clear_dataset(hdf_file, data)
                     case 'rename_ids':
                         self._rename_ids(hdf_file, data)
+
+                    case 'get_available_ids':
+                        self.result_queue.put([int(group.split('_')[1]) for group in hdf_file])
                     case 'get_available_shas':
                         self.result_queue.put(self._get_shas(hdf_file))
+
                     case 'get_vocab_family':
                         self.result_queue.put(self._get_vocab_family(hdf_file))
                     case 'set_vocab_family':
                         self._set_vocab_family(hdf_file, data)
+                    case 'get_dataset_attr':
+                        self.result_queue.put(self._get_attr(hdf_file, data))
+                    case 'set_dataset_attr':
+                        self._set_attr(hdf_file, data[0], data[1])
    
                 if self.queue.empty():
                     self.done_everything.set()
@@ -110,6 +115,12 @@ class H5DataManager:
         self.done_everything.set()
         self.queue.close()
         self.result_queue.close()
+
+    def _get_attr(self, hdf_file, arg):
+        return hdf_file.attrs[arg] if arg in hdf_file.attrs else None
+    
+    def _set_attr(self, hdf_file, arg, value):
+        hdf_file.attrs[arg] = value
                 
     def _process_distributions(self, hdf_file, batch: list[Distribution]):
         for distribution in batch:
@@ -439,3 +450,19 @@ class H5DataManager:
         """
         self.closing.set()
         self.loading_process.join()
+
+    def set_dataset_attr(self, attr: str, value):
+        """
+        Sets an attribute for the dataset.
+        """
+        self.queue.put(('set_dataset_attr', (attr, value)))
+
+    def get_dataset_attr(self, attr: str):
+        """
+        Gets an attribute from the dataset.
+        """
+        self.queue.put(('get_dataset_attr', attr))
+        return self.result_queue.get()
+
+    def __del__(self):
+        self.close()
