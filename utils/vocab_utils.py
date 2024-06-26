@@ -11,43 +11,6 @@ def try_load_tokenizer(model_path: str) -> AutoTokenizer:
     return tokenizer
 
 
-def get_special_tokens(tokenizer=None, model_path="") -> dict[str, str|int]:
-    tokenizer = try_load_tokenizer(model_path) if tokenizer == None else tokenizer
-    vocab_family = get_vocab_family(tokenizer)
-
-    def safe_get(attr, default):
-        return getattr(tokenizer, attr) or default
-
-    if vocab_family == "llama_1|2" or vocab_family == "mistral":
-        # existing implementation
-        sp_toks = {
-            "bos": safe_get('bos_token', '<s>'),
-            "bos_id": safe_get('bos_token_id', 1),
-            "eos": safe_get('eos_token', '</s>'),
-            "eos_id": safe_get('eos_token_id', 2),
-            "pad": safe_get('pad_token', '</s>'),
-            "pad_id": safe_get('pad_token_id', 2),
-            "unk": safe_get('unk_token', '<unk>'),
-            "unk_id": safe_get('unk_token_id', 0)
-        }
-    elif vocab_family == "llama_3":
-        # new implementation for LLaMA-3
-        sp_toks = {
-            "bos": safe_get('bos_token', '<|begin_of_text|>'),
-            "bos_id": safe_get('bos_token_id', 128000),
-            "eos": safe_get('eos_token', '<|end_of_text|>'),
-            "eos_id": safe_get('eos_token_id', 128001),
-            "pad": safe_get('pad_token', '<|end_of_text|>'),
-            "pad_id": safe_get('pad_token_id', 128001),
-            "unk": safe_get('unk_token', '<|end_of_text|>'),
-            "unk_id": safe_get('unk_token_id', 128001)
-        }
-    else:
-        raise NotImplementedError(f"Special tokens for {vocab_family} have not been added yet!")
-    
-    return sp_toks
-
-
 def get_tokenizer_sha(tokenizer = None, model_path="") -> str:
     tokenizer = try_load_tokenizer(model_path) if tokenizer == None else tokenizer
 
@@ -56,6 +19,35 @@ def get_tokenizer_sha(tokenizer = None, model_path="") -> str:
     base_tokens = sorted(set(all_tokens) - set(added_tokens))
     tokenizer_sha = hashlib.sha256("".join(base_tokens).encode()).hexdigest()
     return tokenizer_sha
+
+
+def get_family_bos_id(vocab_family: str, tokenizer=None, model_path="") -> int|None:
+    family_to_bos_id = {
+        "mistral": 1,
+        "llama_1|2": 1,
+        "llama_3": 128000,
+        "command-r": 5,
+        "dbrx": None,
+        "gpt2": 50256,
+        "codeqwen": 1,
+        "qwen_1.5": None,
+        "gptneox": 50256,
+        "gemma": 2,
+        "yi": 1,
+        "deepseek": None,
+        "deepseek_1.5": 100000,
+        "T5": None,
+        "codellama": 1,
+        "jamba": 1
+    }
+
+    bos_id = family_to_bos_id.get(vocab_family, None)
+
+    if bos_id is None:
+        tokenizer = try_load_tokenizer(model_path) if tokenizer == None else tokenizer
+        bos_id = tokenizer.bos_token_id
+        
+    return bos_id
 
 
 def get_vocab_family(tokenizer=None, model_path="") -> str:

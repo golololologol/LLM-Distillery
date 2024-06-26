@@ -7,6 +7,7 @@ from tqdm import tqdm
 import multiprocessing
 import nvidia_smi
 import argparse
+import signal
 import math
 import time
 import json
@@ -129,16 +130,14 @@ def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[Teach
         teacher.validation_dataset_len = len(teacher.validation_dataset)
     
 
-def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str, save_topK: int, enable_topK: bool, encourage_eos: bool):
+def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str, save_topK: int, enable_topK: bool):
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
         teacher.temperature = temperature
-        teacher.student_eos_id = student.special_tokens["eos_id"]
         teacher.device = device
         teacher.topK = save_topK
         teacher.enable_topK = enable_topK
-        teacher.encourage_eos = encourage_eos
 
     student.crop_to_size = crop_to_size
     student.context_len = context_len
@@ -146,8 +145,8 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
     student.device = device
 
 
-def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
-                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers):
+def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs, 
+                        save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers, use_flash_attn_2):
     
     student.num_epochs = num_epochs
     student.eff_batch_size = grad_accum_batches * student.batch_size
@@ -169,6 +168,7 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.save_final_state = save_final_state
     student.grad_checkpointing = grad_checkpointing
     student.freeze_layers = freeze_layers
+    student.use_fa2 = use_flash_attn_2
     student.wandb_comment = wandb_comment
     student.alpha = alpha
     student.device_map_name = device_map
@@ -209,7 +209,7 @@ def calculate_sync(student_dataset, data_manager: H5DataManager, student_vocab_f
             ids1 = list(ids1)
             ids2 = list(ids2)
             for id1, id2 in zip(ids1, ids2):
-                if id1 != id2:
+                if id1 != int(id2):
                     ids_to_rename[id1] = id2
 
         return ids_to_collect, ids_to_rename, ids_to_remove
@@ -293,7 +293,6 @@ def get_params():
     # Collection settings
     parser.add_argument('--num_inference_workers', '-niw', type=int)
     parser.add_argument('--reserve_vram', type=float, nargs='+')
-    parser.add_argument('--encourage_eos', type=bool)
     
     # Training settings
     parser.add_argument('--num_epochs', '-ne', type=int)
@@ -317,6 +316,7 @@ def get_params():
     parser.add_argument('--multi_gpu', type=bool)
     parser.add_argument('--save_final_state', type=bool)
     parser.add_argument('--wandb_comment', '-wdb', type=str)
+    parser.add_argument('--use_flash_attn_2', '-fa2', type=bool)
     
     # Student settings
     parser.add_argument('--freeze_layers', '-fl', type=str, nargs='+')
@@ -330,9 +330,21 @@ def get_params():
 
     params = {key: getattr(args, key) if getattr(args, key) is not None else config[key] for key in config.keys()}
 
+    if getattr(args, "save_topK") is not None:
+        params["enable_topK"] = True
+
     params['max_memory'] = {int(key): value for key, value in params['max_memory'].items() if key.lower() != 'cpu'}
 
     return params
+
+
+def handle_termination(signum, frame):
+    print("\nShutting down...")
+    if data_manager:
+        data_manager.close()
+    if validation_data_manager:
+        validation_data_manager.close()
+    exit(0)
 
 
 def main():
@@ -365,7 +377,6 @@ def main():
     # Collection settings
     num_inference_workers = params['num_inference_workers']
     reserve_vram = params['reserve_vram']
-    encourage_eos = params['encourage_eos']
 
     # Training settings
     num_epochs = params['num_epochs']
@@ -388,6 +399,7 @@ def main():
     max_memory = params['max_memory'] # {0: '20GB', 1: '60GB', 2: '60GB', 3: '60GB', 'cpu': '200GB'}
     multi_gpu = params['multi_gpu']
     save_final_state = params['save_final_state'] # Save the final state of the model after training
+    use_flash_attn_2 = params['use_flash_attn_2']
     wandb_comment = params['wandb_comment'] # Comment for wandb: {comment} ModelName lr(lr) (Date/Time)
 
     # Student settings
@@ -397,6 +409,8 @@ def main():
 
 
     # Initialization
+    global data_manager, validation_data_manager
+
     multiprocessing.set_start_method('spawn', force=True)
     paths = Paths(cache_folder)
     teachers = get_teachers(teacher_models_folder)
@@ -405,15 +419,18 @@ def main():
     ensure_compatibility(teachers, student)
     prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type)
 
-    set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK, encourage_eos)
-    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order,
-                        validate_every_n_epochs, save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers)
+    set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK)
+    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs, 
+                        save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers, use_flash_attn_2)
 
     student.reorder_dataset()
-
+    
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
     time.sleep(2) # 2s sleep to allow the data manager to initialize, else it stalls for some reason
     data_manager = H5DataManager(paths.dataset, device)
+
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGINT, handle_termination)
     
     loop_ids, full_collect = calculate_loop_ids(student, max_cache_size_gb, enable_topK, save_topK)
     
@@ -434,7 +451,7 @@ def main():
         print("Using data on disk for validation...")
     
     
-    ## Training collecting loop
+    ## Training collection and finetuning
     if ids_collect and not rebase_dataset:
 
         data_manager.set_vocab_family(student.vocab_family)
@@ -451,12 +468,9 @@ def main():
             print("The data will be collected in chunks. This will erase all previous data in the main h5 dataset!")
 
             response = input("Do you wish to continue? (y/n): ")
+
             if response.lower() not in ["y", "ye", "yes", "1", "true", "t"]:
-                print("Exiting...")
-                validation_data_manager.close()
-                data_manager.close()
-                student.close()
-                exit(0)
+                handle_termination(None, None)
 
             for epoch in tqdm(range(num_epochs), desc="Epochs", smoothing=0.06, position=0):
 
@@ -473,11 +487,9 @@ def main():
 
         student.train_chunk(data_manager, validation_data_manager, True)
 
-    validation_data_manager.close()
-    data_manager.close()
-    student.close()
-
     print("Done!")
+
+    handle_termination(None, None)
 
 if __name__ == "__main__":
     main()

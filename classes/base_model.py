@@ -1,4 +1,4 @@
-from utils.vocab_utils import get_vocab_family, get_special_tokens
+from utils.vocab_utils import get_vocab_family
 from utils.convert_to_safetensor import convert_model
 from classes.data_classes import ConvoTokenized
 from transformers import AutoTokenizer
@@ -182,7 +182,6 @@ class BaseModel:
         
         self.seq_chunk_len = config.get('seq_chunk_len', 256)
         self.vocab_family = get_vocab_family(model_path=self.model_path)
-        self.special_tokens = get_special_tokens(model_path=self.model_path)
     
     def write_dataset_to_file(self, folder: str):
         tokenizer = AutoTokenizer.from_pretrained(self.model_path)

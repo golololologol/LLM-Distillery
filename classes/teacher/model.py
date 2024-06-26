@@ -24,9 +24,7 @@ class TeacherModel(BaseModel):
     def __init__(self, model_path: str, max_queue_size=3):
         super().__init__(model_path)
         self.distr_device: str = ""
-        self.encourage_eos: bool = False
         self.stop_id: int = 0
-        self.student_eos_id: int = 0
         self.reserve_vram = []
         self.max_queue_size = max_queue_size
 
@@ -101,7 +99,7 @@ class TeacherModel(BaseModel):
         self.progress_bar.set_postfix_str(f"Starting workers for {self.model_name[:20]}...")
 
         batch_creator = multiprocessing.Process(target=_batch_creator_worker, args=(inference_queue, self.batch_size, dataset_chunk, num_inference_workers))
-        result_processor = multiprocessing.Process(target=_result_processor_worker, args=(result_queue, made_distributions, done_chunk, disk_queue, self.encourage_eos, self.student_eos_id, pbar_queue, self.max_queue_size, self.batch_size, num_inference_workers))
+        result_processor = multiprocessing.Process(target=_result_processor_worker, args=(result_queue, made_distributions, done_chunk, disk_queue, pbar_queue, self.max_queue_size, num_inference_workers))
 
         batch_creator.start()
         

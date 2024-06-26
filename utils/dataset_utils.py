@@ -1,10 +1,10 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
-from utils.vocab_utils import get_special_tokens
 from classes.data_classes import ConvoTokenized
-from multiprocessing import cpu_count
+from utils.vocab_utils import get_family_bos_id
 from classes.base_model import BaseModel
 from transformers import AutoTokenizer
+from multiprocessing import cpu_count
 from tqdm import tqdm
 import numpy as np
 import logging
@@ -40,10 +40,7 @@ def read_jsonl(file_path):
     return data_list
 
 
-def good_encode(text: str, sp_toks: dict, tokenizer, encode_special=True, replace_tokens=True):
-    if replace_tokens:
-        text = text.replace('<bos>', sp_toks["bos"]).replace('<eos>', sp_toks["eos"])
-
+def good_encode(text: str, tokenizer, encode_special=False):
     if tokenizer.__class__.__name__ != "ExLlamaV2Tokenizer":
         encoded_ids = tokenizer.encode("\n" + text, add_special_tokens=False)[2:]
     else:
@@ -54,21 +51,21 @@ def good_encode(text: str, sp_toks: dict, tokenizer, encode_special=True, replac
     return encoded_text
 
 
-def encode_prompt_format(prompt_format: dict, sp_toks: dict, tokenizer) -> dict[str, list[int]]:
+def encode_prompt_format(prompt_format: dict, tokenizer) -> dict[str, list[int]]:
     prompt_format = prompt_format.copy()
 
     for key, value in prompt_format.items():
-        prompt_format[key] = good_encode(value, sp_toks, tokenizer)
+        prompt_format[key] = good_encode(value, tokenizer, encode_special=True)
     return prompt_format
 
 
 def tokenize_sample(args):
-    convo_id, json_item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, model, ignore_model_type = args
+    convo_id, json_item, tokenizer, pf, bos_token_id, save_sys_range, save_user_range, save_assistant_range, context_len, model_completion, model_student, model_add_bos, ignore_model_type = args
 
     conversation_tokenized = np.zeros(context_len, dtype=np.int64)
 
-    if model.add_bos:
-        conversation_tokenized[0] = sp_toks["bos_id"]
+    if model_add_bos and not bos_token_id is None:
+        conversation_tokenized[0] = bos_token_id
         num_toks = 1
         start_idx = 0
     else:
@@ -79,14 +76,14 @@ def tokenize_sample(args):
     tags = json_item.get("tags", [])
     empty = False
     completion = "completion" in tags
-    student = model.student or ignore_model_type
+    student = model_student or ignore_model_type
 
     if completion:
-        if model.completion or student:
+        if model_completion or student:
             turn = json_item.get("conversations", [""])[0]
             text = turn.get("value", "")
             if text:
-                text_tokenized = good_encode(text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)[:context_len - num_toks]
+                text_tokenized = good_encode(text.strip(), tokenizer)[:context_len - num_toks]
                 conversation_tokenized[num_toks:num_toks + len(text_tokenized)] = text_tokenized
                 num_toks += len(text_tokenized)
                 conversation_content_ranges.append((0, num_toks))
@@ -97,7 +94,7 @@ def tokenize_sample(args):
         else:
             empty = True
     
-    elif model.completion and not student:
+    elif model_completion and not student:
         empty = True
 
     num_turns = len(json_item["conversations"])
@@ -111,7 +108,7 @@ def tokenize_sample(args):
 
     sys_content = json_item.get("init", "")
     if sys_content:
-        sys_content_tokenized = good_encode(sys_content.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
+        sys_content_tokenized = good_encode(sys_content.strip(), tokenizer)
         sys_tokenized = np.zeros(len(pf['SYS_START']) + len(sys_content_tokenized) + len(pf['SYS_END']), dtype=np.int64)
         sys_tokenized[:len(pf['SYS_START'])] = pf['SYS_START']
         sys_tokenized[len(pf['SYS_START']):len(pf['SYS_START']) + len(sys_content_tokenized)] = sys_content_tokenized
@@ -136,7 +133,7 @@ def tokenize_sample(args):
 
         turn_start_tokenized = pf['ASSISTANT_START'] if assistant else pf['USER_START']
         turn_end_tokenized = pf['ASSISTANT_END'] if assistant else pf['USER_END']
-        turn_tokenized = good_encode(turn_text.strip(), sp_toks, tokenizer, replace_tokens=False, encode_special=False)
+        turn_tokenized = good_encode(turn_text.strip(), tokenizer)
         turn_len = len(turn_tokenized)
 
         full_turn_tokenized = np.zeros(len(turn_start_tokenized) + turn_len + len(turn_end_tokenized), dtype=np.int64)
@@ -182,15 +179,18 @@ def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range,
     except:
         tokenizer = AutoTokenizer.from_pretrained(model.model_path, legacy=False)
 
-    sp_toks = get_special_tokens(model_path=model.model_path)
-    pf = encode_prompt_format(model.prompt_format, sp_toks, tokenizer)
+    pf = encode_prompt_format(model.prompt_format, tokenizer)
     
     dataset = []
     ids = set()
+    bos_token_id = get_family_bos_id(model.vocab_family)
+    model_completion = model.completion
+    model_student = model.student
+    model_add_bos = model.add_bos
 
     def generate_tasks():
         for convo_id, item in enumerate(read_jsonl(dataset_path)):
-            yield (convo_id, item, sp_toks, tokenizer, pf, save_sys_range, save_user_range, save_assistant_range, context_len, model, ignore_model_type)
+            yield (convo_id, item, tokenizer, pf, bos_token_id, save_sys_range, save_user_range, save_assistant_range, context_len, model_completion, model_student, model_add_bos, ignore_model_type)
 
     with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
         futures = {executor.submit(tokenize_sample, task): task for task in generate_tasks()}

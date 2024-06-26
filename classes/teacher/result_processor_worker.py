@@ -5,7 +5,7 @@ from tqdm import tqdm
 import numpy as np
 
 
-def _result_processor_worker(result_queue, made_distributions, done_chunk_writes, disk_queue, encourage_eos, student_eos_id, pbar_queue: tqdm, max_queue_size: int, batch_size: int, num_inference_workers: int):
+def _result_processor_worker(result_queue, made_distributions, done_chunk_writes, disk_queue, pbar_queue: tqdm, max_queue_size: int, num_inference_workers: int):
     def _get_content_indices_np(content_ranges) -> ndarray:
         content_indices = []
         for start, end in content_ranges:
@@ -37,27 +37,6 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
             convo_logprobs = batch_logprobs_np[i]
             if batch_indices_np is not None:
                 convo_indices = batch_indices_np[i]
-            
-            if encourage_eos:
-                content_end_ids = [end-1 for start, end in distribution.content_ranges]
-
-                if distribution.cropped_end:
-                    content_end_ids = content_end_ids[:-1]
-
-                for end in content_end_ids:
-                    eos_pos_logprob = np.log((np.max(np.exp(convo_logprobs[end])) * 1.1))
-                    if batch_indices_np is not None:
-
-                        if student_eos_id not in convo_indices[end]:
-                            convo_logprobs[end, -1:] = eos_pos_logprob
-                            convo_indices[end][-1] = student_eos_id
-                        else:
-                            position = np.where(convo_indices[end] == student_eos_id)[0][0]
-                            convo_logprobs[end, position] = eos_pos_logprob
-
-                    else:
-                        convo_logprobs[end, student_eos_id] = eos_pos_logprob
-                        convo_logprobs[end] = np.log((np.exp(convo_logprobs[end]) / np.sum(np.exp(convo_logprobs[end]))))
 
             distribution.distribution = convo_logprobs[:distribution.length]
             distribution.indices = convo_indices

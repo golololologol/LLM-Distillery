@@ -69,6 +69,7 @@ class StudentModel(BaseModel):
         self.save_final_state = False
         self.grad_checkpointing = False
         self.multi_gpu = False
+        self.use_fa2 = False
         self.wandb_comment = ""
         self.device_map_name = ""
         self.device_map = {}
@@ -135,11 +136,13 @@ class StudentModel(BaseModel):
         else:
             device_map = self.device_map_name if self.multi_gpu else self.device
 
+        use_bnb_quant = self.training_precision_name == "4bit" or self.training_precision_name == "8bit"
+
         if not self.device_map and self.device_map_name == "custom":
             model = AutoModelForCausalLM.from_pretrained(
                 path,
                 device_map="auto",
-                torch_dtype=train_precision,
+                torch_dtype=train_precision if not use_bnb_quant else None,
                 load_in_4bit=self.training_precision_name == "4bit",
                 load_in_8bit = self.training_precision_name == "8bit",
                 max_memory = self.max_memory
@@ -153,7 +156,7 @@ class StudentModel(BaseModel):
             num_layers = len(layer_names)
             num_gpus = torch.cuda.device_count()
 
-            # Distribute layers across GPUs
+            # Calculate the layer distribution
             custom_device_map = {}
             remaining_layers = num_layers - self.num_gpu0_layers
             layers_per_gpu = math.ceil(remaining_layers / (num_gpus - 1))
@@ -180,10 +183,10 @@ class StudentModel(BaseModel):
         self.model = AutoModelForCausalLM.from_pretrained(
             path,
             device_map=device_map,
-            torch_dtype=train_precision,
+            torch_dtype=train_precision if not use_bnb_quant else None,
             load_in_4bit=self.training_precision_name == "4bit",
             load_in_8bit = self.training_precision_name == "8bit",
-            attn_implementation="flash_attention_2",
+            attn_implementation="flash_attention_2" if self.use_fa2 else "sdpa",
             max_memory = self.max_memory
         )
 

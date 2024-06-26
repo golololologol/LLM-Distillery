@@ -1,6 +1,5 @@
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import get_scheduler
-from fairscale.optim.oss import OSS
 import torch.nn.functional as F
 import numpy as np
 import torch

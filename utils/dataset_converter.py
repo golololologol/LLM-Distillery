@@ -4,7 +4,7 @@ import os
 
 def write_records(samples, outfile, sort):
     if sort:
-        samples.sort(key=lambda x: sum([len(turn) for turn in x['conversations']]))
+        samples.sort(key=lambda x: sum([len(turn["value"]) for turn in x['conversations']]))
 
     for sample in samples:
         outfile.write(json.dumps(sample, ensure_ascii=False) + '\n')
@@ -24,7 +24,7 @@ def rewrite_alpaca_gpt4(input_path, output_path, dataset_name, sort):
 
             new_sample = {
                 "init": "",
-                "conversations": [combined_instruction, output_text],
+                "conversations": [{"from": "human", "value": combined_instruction}, {"from": "gpt", "value": output_text}],
                 "source": dataset_name,
                 "tags": []
             }
@@ -44,7 +44,7 @@ def rewrite_codefeedback(input_path, output_path, dataset_name, sort):
 
             new_sample = {
                 "init": "",
-                "conversations": [instruction, response],
+                "conversations": [{"from": "human", "value": instruction}, {"from": "gpt", "value": response}],
                 "source": dataset_name,
                 "tags": []
             }
@@ -65,7 +65,7 @@ def rewrite_multitask(input_path, output_path, dataset_name, sort):
 
             new_sample = {
                 "init": init,
-                "conversations": [instruction,output_text],
+                "conversations": [{"from": "human", "value": instruction}, {"from": "gpt", "value": output_text}],
                 "source": dataset_name,
                 "tags": []
             }
@@ -74,7 +74,7 @@ def rewrite_multitask(input_path, output_path, dataset_name, sort):
 
         write_records(samples, outfile, sort)
 
-def convert_dolly(input_path, output_path, dataset_name, sort):
+def rewrite_dolly(input_path, output_path, dataset_name, sort):
     with open(input_path, 'r', encoding='utf-8') as infile, open(output_path, 'w', encoding='utf-8') as outfile:
         samples = []
         for line in infile:
@@ -89,7 +89,7 @@ def convert_dolly(input_path, output_path, dataset_name, sort):
 
             new_sample = {
                 "init": "",
-                "conversations": [combined_instruction, output_text],
+                "conversations": [{"from": "human", "value": combined_instruction}, {"from": "gpt", "value": output_text}],
                 "source": dataset_name,
                 "tags": []
             }
@@ -99,7 +99,7 @@ def convert_dolly(input_path, output_path, dataset_name, sort):
         write_records(samples, outfile, sort)
 
 
-def convert_gpt_roleplay(input_path, output_path, dataset_name, sort):
+def rewrite_gpt_roleplay(input_path, output_path, dataset_name, sort):
     with open(input_path, 'r', encoding='utf-8') as infile, open(output_path, 'w', encoding='utf-8') as outfile:
         samples = []
         for line in infile:
@@ -115,23 +115,24 @@ def convert_gpt_roleplay(input_path, output_path, dataset_name, sort):
                 converted_chat = []
 
                 if greeting:
-                    converted_chat.append(greeting)
+                    converted_chat.append({"from": "gpt", "value": greeting})
 
                 for turn in chat['chat']:
-                    converted_chat.append(turn["content"])
+                    speaker = "gpt" if turn['role'] == 'char' else "human"
+                    converted_chat.append({"from": speaker, "value": turn['content']})
 
                 new_sample = {
                     "init": sys if sys else "",
                     "conversations": converted_chat,
                     "source": dataset_name,
-                    "tags": ["reversed"] if greeting else []
+                    "tags": []
                 }
 
                 samples.append(new_sample)
 
         write_records(samples, outfile, sort)
 
-def rewrite_random_smaples(input_path, output_path, dataset_name, sort):
+def rewrite_random_samples(input_path, output_path, dataset_name, sort):
     with open(input_path, 'r', encoding='utf-8') as infile, open(output_path, 'w', encoding='utf-8') as outfile:
         samples = []
         for line in infile:
@@ -141,7 +142,7 @@ def rewrite_random_smaples(input_path, output_path, dataset_name, sort):
 
             new_sample = {
                 "init": "",
-                "conversations": [text] if text else [""],
+                "conversations": [{"from": "human", "value": text}],
                 "source": dataset_name,
                 "tags": ["completion"]
             }
@@ -161,7 +162,7 @@ def rewrite_sharegpt(input_path, output_path, dataset_name, sort):
                 if turn["from"] == "system":
                     sys = turn["value"]
                 else:
-                    turns.append(turn["value"])
+                    turns.append({"from": turn["from"], "value": turn["value"]})
 
             # drop the system message with 75% chance
             if random.random() < 0.75:
@@ -179,7 +180,7 @@ def rewrite_sharegpt(input_path, output_path, dataset_name, sort):
         write_records(samples, outfile, sort)
 
 
-def rewrite_custom(input_path, output_path, dataset_name, sort):
+def rewrite_custom(input_path, output_path, dataset_name, sort): # used to update from an older format pipeline used
     with open(input_path, 'r', encoding='utf-8') as infile, open(output_path, 'w', encoding='utf-8') as outfile:
         samples = []
         for line in infile:
@@ -217,12 +218,12 @@ def rewrite_custom(input_path, output_path, dataset_name, sort):
 
         write_records(samples, outfile, sort)
 
-input_file_path = r"C:\Users\PC\Downloads\theoremqa.jsonl"
+input_file_path = r"C:\Users\PC\Downloads\converted_native_8k_EDU.jsonl"
 path = os.path.dirname(input_file_path)
 name = os.path.basename(input_file_path).split('.')[0]
 output_file_path = os.path.join(path, f"Converted_{name}.jsonl")
 dataset_name = name
 sort = True
 
-rewrite_custom(input_file_path, output_file_path, dataset_name, sort)
+rewrite_custom(input_file_path, output_file_path, dataset_name, sort) # change this line to the appropriate function
 print(f"Converted {input_file_path} to {output_file_path} with dataset name {dataset_name}")

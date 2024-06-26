@@ -13,8 +13,8 @@ import os
 class H5DataManager:
     """
     DataManager class for handling the distribution data in a HDF5 file.\n
+    It is asynchronous and uses multiprocessing to handle the data loading and saving.\n
     This class is designed to be used with the `Distribution` class from `classes/data_classes.py`.\n
-    The class is asynchronous and uses multiprocessing to handle the data loading and saving.\n
     General information:
     - Distributions are stored as log probabilities to minimize the effect of floating point precision errors.
     - The class uses shared memory to pass the data between processes.
@@ -29,24 +29,35 @@ class H5DataManager:
         self.max_queue_size = max_queue_size
         self.done_everything = multiprocessing.Event()
         self.done_everything.set()
-        self.closing = multiprocessing.Event()
-        self.loading_process = get_context("spawn").Process(target=self._process_thread)
+        self.loading_process = get_context("spawn").Process(target=self._loading_process)
         self.shared_batches = []
         self.distr_key = "distributions"
         self.indices_key = "indices"
 
-        signal.signal(signal.SIGTERM, self._handle_exit)
-        signal.signal(signal.SIGINT, self._handle_exit)
-
         self.loading_process.start()
 
-    def _handle_exit(self, signum, frame):
-        self.closing.set()
-        self.loading_process.join()
 
-    def _process_thread(self):
+    def _loading_process(self):
+
+        def _handle_exit(signum, frame):
+            self.shared_batches = []
+
+            while not self.queue.empty():
+                self.queue.get()
+
+            while not self.result_queue.empty():
+                self.result_queue.get()
+
+            self.done_everything.set()
+            self.queue.close()
+            self.result_queue.close()
+            exit(0)
+
+        signal.signal(signal.SIGINT, _handle_exit)
+        signal.signal(signal.SIGTERM, _handle_exit)
+
         with h5py.File(self.file_path, 'a') as hdf_file:
-            while not self.closing.is_set():
+            while True:
 
                 if self.queue.empty():
                     continue
@@ -60,15 +71,15 @@ class H5DataManager:
                         self.result_queue.put(self._make_outgoing_batch(hdf_file, data))
                     case 'get_batches':
                         for batch_ids in data:
+                            while self.result_queue.full():
+                                time.sleep(0.1)
+
                             self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
                     case 'read_only_mode':
-                        while not self.closing.is_set():
+                        while True:
                             for batch_ids in data:
-                                while self.result_queue.full() and not self.closing.is_set():
+                                while self.result_queue.full():
                                     time.sleep(0.1)
-
-                                if self.closing.is_set():
-                                    break
 
                                 self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
                                     
@@ -76,8 +87,6 @@ class H5DataManager:
                         self._process_distributions(hdf_file, data)
                     case 'update_batch':
                         self._update_data(hdf_file, data)
-                    case 'update_shas':
-                        self._update_shas(hdf_file, data)
 
                     case 'clear_dataset':
                         ids_to_clear = [int(group.split('_')[1]) for group in hdf_file]
@@ -91,11 +100,14 @@ class H5DataManager:
                         self.result_queue.put([int(group.split('_')[1]) for group in hdf_file])
                     case 'get_available_shas':
                         self.result_queue.put(self._get_shas(hdf_file))
+                    case 'update_shas':
+                        self._update_shas(hdf_file, data)
 
                     case 'get_vocab_family':
                         self.result_queue.put(self._get_vocab_family(hdf_file))
                     case 'set_vocab_family':
                         self._set_vocab_family(hdf_file, data)
+
                     case 'get_dataset_attr':
                         self.result_queue.put(self._get_attr(hdf_file, data))
                     case 'set_dataset_attr':
@@ -103,18 +115,7 @@ class H5DataManager:
    
                 if self.queue.empty():
                     self.done_everything.set()
-            
-        self.shared_batches = []
 
-        while not self.queue.empty():
-            self.queue.get()
-
-        while not self.result_queue.empty():
-            self.result_queue.get()
-
-        self.done_everything.set()
-        self.queue.close()
-        self.result_queue.close()
 
     def _get_attr(self, hdf_file, arg):
         return hdf_file.attrs[arg] if arg in hdf_file.attrs else None
@@ -310,7 +311,7 @@ class H5DataManager:
 
         for old_id, new_id in ids_to_rename.items():
             hdf_file.move(f'convo_{new_id}_moved', f'convo_{new_id}')
-
+            
     
     def enqueue_get_batches(self, batches: list[list[int]]):
         """
@@ -399,7 +400,7 @@ class H5DataManager:
         if not ids_to_rename:
             return
         
-        response = input(f"The script called for renaming of {len(ids_to_rename)} samples in the h5 dataset.\nThis means that the dataset's samples will be moved to new IDs.\nAre you sure you want to proceed? (y/n):")
+        response = input(f"The script called for renaming of {len(ids_to_rename)} samples in the h5 dataset.\nThis means that the dataset's samples will be moved to new IDs to be in sync with your current text dataset.\nAre you sure you want to proceed? (y/n):")
         if response.lower() not in ['y', 'yes', 'ye', '1', 'true', 't']:
             raise ValueError("User cancelled operation.")
         
@@ -432,7 +433,7 @@ class H5DataManager:
         self.delete_ids(ids_to_delete)
 
         self.done_everything.wait()
-        self.queue.put(('rename_ids', ids_to_rename))
+        self.rename_ids(ids_to_rename)
         
         self.done_everything.wait()
 
@@ -448,8 +449,10 @@ class H5DataManager:
         """
         Closes the HDF5 file and stops the loading process.
         """
-        self.closing.set()
-        self.loading_process.join()
+        
+        if self.loading_process.is_alive():
+            self.loading_process.terminate()
+            self.loading_process.join()
 
     def set_dataset_attr(self, attr: str, value):
         """

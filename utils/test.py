@@ -3,7 +3,6 @@ import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM, LlamaTokenizer, AutoConfig
 import math
 import torch.nn.functional as F
-from peft import get_peft_config, get_peft_model, LoraConfig, TaskType
 import json
 import nvidia_smi
 import codecs
@@ -457,3 +456,4 @@ logits_temp = F.log_softmax(logits / temp, dim=-1)
 print(logprobs_temp.exp())
 print(logits_temp.exp())
 
+tokenizer = AutoTokenizer.from_pretrained("alpindale/gemma-7b", use_fast=False)
