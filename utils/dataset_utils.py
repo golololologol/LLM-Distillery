@@ -183,7 +183,7 @@ def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range,
     
     dataset = []
     ids = set()
-    bos_token_id = get_family_bos_id(model.vocab_family)
+    bos_token_id = get_family_bos_id(model.vocab_family, tokenizer)
     model_completion = model.completion
     model_student = model.student
     model_add_bos = model.add_bos
