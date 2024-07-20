@@ -7,7 +7,6 @@ import json
 import nvidia_smi
 import codecs
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config, ExLlamaV2Cache, ExLlamaV2
-from utils.dataset_utils import read_jsonl_lazy
 from tqdm import tqdm
 from collections import defaultdict
 import multiprocessing as mp
@@ -295,7 +294,7 @@ def input_prompt_format():
     #print(gpu["memory_total"])
     #print(gpu["memory_used"])
     #print(gpu["memory_free"])
-
+#
 #tokenizer = AutoTokenizer.from_pretrained("alpindale/gemma-7b", use_fast=False)
 #
 #all_tokens = tokenizer.get_vocab()
@@ -309,9 +308,9 @@ def input_prompt_format():
 #all_tokens = tokenizer.get_vocab().keys()
 #added_tokens = tokenizer.all_special_tokens
 #base_tokens2 = set(all_tokens) - set(added_tokens)
-
+#
 #print(base_tokens1 - base_tokens2)
-
+#
 #a = torch.tensor(([[1.5, 1], [2.3, 3.4]], [[1.5, 1], [2.3, 3.4]]))
 #b = torch.tensor(([0.04, 10.1, 1.2], [1.5, 2.3, 3.4]))
 # see how many elements are in the second dimension
@@ -335,15 +334,15 @@ def truncated_kldiv(student_probs, teacher_probs):
     return div
 
 #tensor1 = torch.tensor(([0.01, 0.99], [0.99, 0.01]), dtype=torch.float32).log()
-
+#
 #log_soft_1 = F.log_softmax(tensor1, dim=-1)
-
+#
 #indices = torch.tensor(([1, 0]))
-
+#
 #list = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 #print(list[1:-1])
 #print(F.cross_entropy(log_soft_1, indices, reduction='none'))
-
+#
 #losses = torch.tensor(([0.01, 0.3]), dtype=torch.float32)
 #power = 0.2
 #add = 1
@@ -359,16 +358,16 @@ def truncated_kldiv(student_probs, teacher_probs):
 #print(f"Losses * Transformed weights: {weighted_losses_transformed}")
 #print(f"Mean of both: {mean_losses}")
 #print(f"Total mean: {mean_losses.mean()}")
-
+#
 #dict1 = {1: 1, 'b': 2, 'c': 4, 'd': 5, 'a': 5}
-
+#
 #grouped_dict = defaultdict(list)
 #for key, value in dict1.items():
 #    grouped_dict[value].append(key)
-
+#
 #print(grouped_dict.items())
 #print(dict1)
-
+#
 #model_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
 #
 #model = LlamaForCausalLM.from_pretrained(
@@ -419,8 +418,8 @@ def truncated_kldiv(student_probs, teacher_probs):
 #)
 #print(model.hf_device_map)
 #input("Press Enter to continue...")
-
-
+#
+#
 #letter_list = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j']
 #
 #content_ranges = [[0, 3], [5, 8]]
@@ -440,20 +439,122 @@ def truncated_kldiv(student_probs, teacher_probs):
 #    start_idx = end_idx + 1
 #
 #print(inner_content_indices)
+#
+#
+#logits = torch.tensor(([0.00004, 10.1, 1.2], [1.5, 2.3, 3.4]))
+#
+#logprobs = F.log_softmax(logits, dim=-1)
+#
+#print(logprobs.exp())
+#
+#temp = 2
+#
+#logprobs_temp = F.log_softmax(logprobs / temp, dim=-1)
+#logits_temp = F.log_softmax(logits / temp, dim=-1)
+#
+#print(logprobs_temp.exp())
+#print(logits_temp.exp())
+#
+#tokenizer = AutoTokenizer.from_pretrained("alpindale/gemma-7b", use_fast=False)
+#
+#
+# prep and load an exllama model
+#
+#model_path = r"C:\Users\PC\Desktop\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T"
+#
+#context_len = 2048
+#batch_size = 1
+#seq_chunk_len = 256
+#
+#config = ExLlamaV2Config()
+#config.model_dir = model_path
+#config.prepare()
+#config.max_seq_len = context_len
+#config.max_batch_size = batch_size
+#config.max_input_len = seq_chunk_len
+#config.max_attention_size = context_len ** 2 
+#
+#model = ExLlamaV2(config)
+#tokenizer = ExLlamaV2Tokenizer(config)
+#cache = ExLlamaV2Cache(model, batch_size, context_len, lazy=True)
+#
+#model.load_autosplit(cache, reserve_vram=[256 * 1536**2]*2)
+#
+#text = "Hello, how are you"
+#
+#tokenized = tokenizer.encode(text)
+#
+#forward_pass = model.forward(tokenized, cache=cache, last_id_only=True)
+#
+#sum = forward_pass.exp().sum()
+#prob_sum = F.softmax(forward_pass, dim=-1).sum()
+#print(sum)
+#print(prob_sum)
+#
+## save the forward pass to a file
+#with open("forward_pass.json", "w") as f:
+#    json.dump(forward_pass.tolist(), f)
+#
+# open the forward pass files and make the variables for two of them
+#
+#with open("forward_pass1.json", "r") as f:
+#    forward_pass1 = torch.tensor(json.load(f)).squeeze()
+#
+#with open("forward_pass2.json", "r") as f:
+#    forward_pass2 = torch.tensor(json.load(f)).squeeze()
+#
+#eps = torch.tensor(1e-10)
+#
+#student_logprobs = F.log_softmax(forward_pass1, dim=-1)
+#teacher_logits = F.log_softmax(forward_pass2, dim=-1)
+#
+#print(F.kl_div(student_logprobs, teacher_logits, reduction='batchmean', log_target=True))
+#
+#K = 200
+#topK, indices = torch.topk(teacher_logits, K, dim=-1)
+#
+#rev_sum_topK = (1 - teacher_logits.exp().sum(dim=-1)).clamp(eps)
+#num_pad_logits = student_logprobs.size(-1) - topK.size(-1)
+#print(num_pad_logits)
+#pad_logits = (rev_sum_topK / num_pad_logits).log()
+#print(pad_logits)
+#
+#teacher_logits_padded = torch.zeros_like(student_logprobs) + pad_logits.unsqueeze(-1)
+#
+#teacher_logits_padded.scatter_(-1, indices, topK)
+#
+#teacher_logprobs = teacher_logits_padded
+#print(teacher_logprobs)
+#print(student_logprobs)
+#KL_div = F.kl_div(student_logprobs, teacher_logprobs, reduction='batchmean', log_target=True)
+#
+#print(KL_div)
 
 
-logits = torch.tensor(([0.00004, 10.1, 1.2], [1.5, 2.3, 3.4]))
+# Given data and indices tensors
+data = torch.tensor([[0.123, 24.3, 9.4], [0.62, 0.121, 53.23]])
+indices = torch.tensor([[6, 95, 2124], [934, 953, 11]])
 
-logprobs = F.log_softmax(logits, dim=-1)
+# Sequence of IDs you want to retrieve
+sequence = torch.tensor([411, 11])
 
-print(logprobs.exp())
+# Flatten the data and indices tensors
+flat_data = data.flatten()
+flat_indices = indices.flatten()
 
-temp = 2
+# Create a sparse tensor
+sparse_indices = flat_indices.unsqueeze(0)
+sparse_data = flat_data
+sparse_tensor = torch.sparse_coo_tensor(sparse_indices, sparse_data)
 
-logprobs_temp = F.log_softmax(logprobs / temp, dim=-1)
-logits_temp = F.log_softmax(logits / temp, dim=-1)
+# Function to retrieve values from the sequence
+def retrieve_values(sequence, sparse_tensor):
+    dense_lookup = sparse_tensor.to_dense()
+    result = torch.zeros(sequence.size(), dtype=dense_lookup.dtype)
+    valid_indices = sequence < dense_lookup.size(0)
+    result[valid_indices] = dense_lookup[sequence[valid_indices]]
+    return result
 
-print(logprobs_temp.exp())
-print(logits_temp.exp())
-
-tokenizer = AutoTokenizer.from_pretrained("alpindale/gemma-7b", use_fast=False)
+# Retrieve the correct values
+retrieved_values = retrieve_values(sequence, sparse_tensor)
+print(retrieved_values)

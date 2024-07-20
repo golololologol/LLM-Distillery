@@ -137,6 +137,8 @@ class StudentModel(BaseModel):
             device_map = self.device_map_name if self.multi_gpu else self.device
 
         use_bnb_quant = self.training_precision_name == "4bit" or self.training_precision_name == "8bit"
+        num_gpus = torch.cuda.device_count()
+        max_memory = self.max_memory if len(self.max_memory) == num_gpus else None
 
         if not self.device_map and self.device_map_name == "custom":
             model = AutoModelForCausalLM.from_pretrained(
@@ -145,7 +147,7 @@ class StudentModel(BaseModel):
                 torch_dtype=train_precision if not use_bnb_quant else None,
                 load_in_4bit=self.training_precision_name == "4bit",
                 load_in_8bit = self.training_precision_name == "8bit",
-                max_memory = self.max_memory
+                max_memory = max_memory
                 )
 
             layer_names = list(model.hf_device_map.keys())
@@ -154,7 +156,6 @@ class StudentModel(BaseModel):
             torch.cuda.empty_cache()
 
             num_layers = len(layer_names)
-            num_gpus = torch.cuda.device_count()
 
             # Calculate the layer distribution
             custom_device_map = {}
@@ -187,7 +188,7 @@ class StudentModel(BaseModel):
             load_in_4bit=self.training_precision_name == "4bit",
             load_in_8bit = self.training_precision_name == "8bit",
             attn_implementation="flash_attention_2" if self.use_fa2 else "sdpa",
-            max_memory = self.max_memory
+            max_memory = max_memory
         )
 
         if not self.device_map:

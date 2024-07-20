@@ -16,7 +16,7 @@ def _inference_worker(inference_queue, result_queue, made_distributions, model_l
         if num_gpus == 0:
             raise Exception("No CUDA-capable GPUs found.")
 
-        reserve_vram_bytes = [int(128 * 1024**2)]*num_gpus # default 128MB/GPU
+        reserve_vram_bytes = [int(256 * 1024**2)]*num_gpus # default 256MB/GPU
 
         for i, reserve_gb in enumerate(reserve_vram_gb):
             if reserve_gb > 0 and i < num_gpus:
@@ -43,7 +43,7 @@ def _inference_worker(inference_queue, result_queue, made_distributions, model_l
 
         return model, cache
 
-    def _unload_model(model: ExLlamaV2, cache: ExLlamaV2Cache):
+    def _unload_model(model: ExLlamaV2|None, cache: ExLlamaV2Cache):
         if model is None:
             print(f"{model_name} is already unloaded, genius.")
             return

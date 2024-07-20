@@ -1,7 +1,7 @@
 from torch.optim.lr_scheduler import LRScheduler
 from transformers import get_scheduler
+from torch import Tensor
 import torch.nn.functional as F
-import numpy as np
 import torch
 import math
 import sys
@@ -43,69 +43,74 @@ class WarmupStableDecayLR(LRScheduler):
             return [self.final_lr for group in self.optimizer.param_groups]
         
 
-def calculate_divergence(student_logits: torch.Tensor, teacher_logits: torch.Tensor, indices: np.ndarray, convo_CE_tokens: torch.Tensor, alpha: torch.Tensor, avoid_indices: torch.Tensor) -> dict[str, torch.Tensor]:
-    def custom_kl_div(student_logprobs: torch.Tensor, teacher_logprobs: torch.Tensor, per_token: bool = False):
+
+def calculate_divergence(student_logits: Tensor, teacher_logits: Tensor, indices: Tensor|None, convo_CE_tokens: Tensor, alpha: Tensor, avoid_indices: Tensor) -> dict[str, Tensor]:
+
+    def custom_kl_div(student_logprobs: Tensor, teacher_logprobs: Tensor, per_token: bool = False):
         kl_div_raw = F.kl_div(student_logprobs, teacher_logprobs, reduction='none', log_target=True)
 
         if per_token:
             kl_div = kl_div_raw.sum(dim=-1)
         else:
             kl_div = kl_div_raw.sum(dim=-1).mean()
-
         return kl_div
-        
-    def abomination_loss(kl_div_per_token: torch.Tensor, alpha: torch.Tensor, CE_loss_per_token: torch.Tensor):
+
+    def abomination_loss(kl_div_per_token: Tensor, alpha: Tensor, CE_loss_per_token: Tensor):
         if CE_loss_per_token.numel() < kl_div_per_token.numel():
             CE_loss_per_token = torch.cat((CE_loss_per_token, torch.zeros(1, device=CE_loss_per_token.device)))
 
         weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha)
-
         weights = weights + CE_loss_per_token
 
         loss = (kl_div_per_token * weights).mean()
-
         return loss
     
-    min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
-    eps = 1e-10
+    def custom_ce_loss(logprobs: Tensor, convo_CE_tokens: Tensor, indices: Tensor, ignore_indexes: Tensor) -> Tensor:
+        crop = 0
+        if convo_CE_tokens.size(-1) < logprobs.size(0):
+            crop = -1
 
+        topk_mask = convo_CE_tokens.unsqueeze(-1) == indices[:crop]
+        topk_mask[ignore_indexes] = False
+        valid_mask = topk_mask.any(dim=-1)
+        
+        valid_logprobs = torch.zeros_like(valid_mask, dtype=torch.float32)
+        valid_logprobs[valid_mask] = logprobs[:crop][topk_mask].squeeze(-1)
+
+        # compute the average of only valid tokens
+        CE_valid_mean = valid_logprobs[valid_mask].mean()
+
+        valid_logprobs[~valid_mask] = CE_valid_mean
+        return -valid_logprobs, valid_mask
+
+
+    min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
     student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
 
     if indices is not None:
-        rev_sum_topK = (1 - teacher_logits[:min_len].exp().sum(dim=-1)).clamp(eps)
-        num_pad_logits = student_logprobs.size(-1) - teacher_logits[:min_len].size(-1)
-        pad_logits = (rev_sum_topK / num_pad_logits).log()
-
-        teacher_logits_padded = torch.zeros_like(student_logprobs) + pad_logits.unsqueeze(-1)
-
-        teacher_logits_padded.scatter_(1, indices[:min_len], teacher_logits[:min_len])
-
-        teacher_logprobs = F.log_softmax(teacher_logits_padded, dim=-1)
+        teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
+        student_logprobs = torch.gather(student_logprobs, 1, indices[:min_len])
     else:
         teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
 
     convo_CE_tokens = convo_CE_tokens[:min_len]
-
-    CE_loss = F.cross_entropy(student_logprobs[:convo_CE_tokens.numel()], convo_CE_tokens, reduction='none')
-    teacher_CE_loss = F.cross_entropy(teacher_logprobs[:convo_CE_tokens.numel()], convo_CE_tokens, reduction='none')
-
-    if avoid_indices.numel() > 0:
-        CE_loss.scatter_(0, avoid_indices, 0)
-        teacher_CE_loss.scatter_(0, avoid_indices, 0)
-
+    CE_loss, CE_valid_mask = custom_ce_loss(student_logprobs, convo_CE_tokens, indices, avoid_indices)
+    teacher_CE_loss, teacher_CE_valid_mask = custom_ce_loss(teacher_logprobs, convo_CE_tokens, indices, avoid_indices)
+        
     CE_diff = CE_loss - teacher_CE_loss
+
     corrected_CE_diff = torch.where(CE_diff < 0, torch.zeros_like(CE_diff), CE_diff)
 
     kl_div = custom_kl_div(student_logprobs, teacher_logprobs, per_token=True)
-    reverse_kl_div = custom_kl_div(teacher_logprobs, student_logprobs, per_token=True)
-    
+    reverse_kl_div = custom_kl_div(teacher_logprobs, F.log_softmax(student_logprobs, dim=-1), per_token=True)
+
     weighted_kl_div = abomination_loss(kl_div, alpha, corrected_CE_diff)
     weighted_r_kl_div = abomination_loss(reverse_kl_div, alpha, corrected_CE_diff)
 
-    custom_loss = (weighted_kl_div + weighted_r_kl_div)/2
+    custom_loss = (weighted_kl_div + weighted_r_kl_div) / 2
 
     loss_dict = {
-        "train_loss": custom_loss, # DO NOT REMOVE   The loss under "train_loss" key is used for backprop every batch at classes/Losses.py/backward()
+        "train_loss": custom_loss,
         "custom loss": custom_loss,
         "CE loss": CE_loss.mean(),
         "kl_div": kl_div.mean(),

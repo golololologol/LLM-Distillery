@@ -49,8 +49,11 @@ def calculate_loop_ids(student: StudentModel, max_cache_size_gb, enable_topK, sa
     return loop_ids, full_collect
 
 
-def get_teachers(models_folder) -> list[TeacherModel]:
+def get_teachers(models_folder, use_teachers: bool) -> list[TeacherModel]:
     teachers = []
+
+    if not use_teachers:
+        return teachers
 
     # check if the path is to one model folder or a folder with multiple models
     for file in os.listdir(models_folder):
@@ -71,7 +74,10 @@ def get_teachers(models_folder) -> list[TeacherModel]:
     return teachers
             
 
-def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel):
+def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel, use_teachers: bool):
+    if not use_teachers:
+        return
+    
     checklist = {
         'vocab_family': teachers[0].vocab_family,
     }
@@ -86,7 +92,7 @@ def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel):
             raise ValueError(f"Student has {key} = {getattr(student, key)} while the teachers have {key} = {value}")
         
 
-def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[TeacherModel], student: StudentModel, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type):
+def prepare_datasets(dataset_path, data_manager: H5DataManager, validation_dataset_path, validation_data_manager: H5DataManager, teachers: list[TeacherModel], student: StudentModel, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type, use_teachers):
     print("Preparing datasets for the student...")
     student.dataset, relevant_ids = tokenize_dataset(
         dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type)
@@ -108,8 +114,12 @@ def prepare_datasets(dataset_path, validation_dataset_path, teachers: list[Teach
         teachers_ids.update(teacher_ids)
         teachers_ids_val.update(teacher_ids_val)
 
-    common_ids = relevant_ids.intersection(teachers_ids)
-    common_ids_val = relevant_ids_val.intersection(teachers_ids_val)
+    if use_teachers:
+        common_ids = relevant_ids.intersection(teachers_ids)
+        common_ids_val = relevant_ids_val.intersection(teachers_ids_val)
+    else:
+        common_ids = data_manager.get_dataset_ids()
+        common_ids_val = validation_data_manager.get_dataset_ids()
 
     student.dataset = [convo for convo in student.dataset if convo.origin_convo_id in common_ids]
     total_tokens = sum([convo.length for convo in student.dataset])
@@ -237,14 +247,19 @@ def calculate_sync(student_dataset, data_manager: H5DataManager, student_vocab_f
     return ids_collect, ids_rename, ids_remove
 
 
-def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataManager, rebase, student: StudentModel):
+def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataManager, rebase, student: StudentModel, use_teachers: bool):
     if rebase:
         current_shas = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.dataset}
         current_shas_val = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.validation_dataset}
+
         data_manager.update_shas(current_shas)
         validation_data_manager.update_shas(current_shas_val)
+
         data_manager.set_vocab_family(student.vocab_family)
         validation_data_manager.set_vocab_family(student.vocab_family)
+        return [], []
+    
+    if not use_teachers:
         return [], []
     
     ids_collect, ids_rename, ids_remove = calculate_sync(student.dataset, data_manager, student.vocab_family)
@@ -256,6 +271,30 @@ def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataMa
     return ids_collect, ids_collect_val
 
 
+def check_topk(data_manager: H5DataManager, enable_topk, save_topk: int, validation=False):
+    if not enable_topk:
+        return save_topk
+    
+    dataset_topk = data_manager.get_topk()
+
+    if dataset_topk is None:
+        data_manager.set_topk(save_topk)
+        return save_topk
+    
+    text_insert = "validation" if validation else "main"
+
+    if dataset_topk != save_topk:
+        print(f"\nTopK mismatch between the {text_insert} h5 dataset, and your config!\n{text_insert.upper()} dataset has TopK={dataset_topk}, while you set TopK={save_topk}.")
+        response = input("Do you wish to continue with the dataset's TopK?\nIf not, the program will exit to allow you to change the config. (y/n): ")
+
+        if response.lower() not in ["y", "ye", "yes", "1", "true", "t"]:
+            handle_termination(None, None)
+        
+        return dataset_topk
+
+    return save_topk
+        
+
 def load_config(config_path):
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found at {config_path}!\nPlease make sure the file exists, and has all the necessary parameters.")
@@ -263,66 +302,78 @@ def load_config(config_path):
         return json.load(f)
 
 
+
 def get_params():
     parser = argparse.ArgumentParser(description="Set parameters for the script.")
     
+    # Groups
+    path_group = parser.add_argument_group('Path args')
+    cache_group = parser.add_argument_group('Cache args')
+    pipeline_group = parser.add_argument_group('Pipeline args')
+    general_model_group = parser.add_argument_group('General model args')
+    collection_group = parser.add_argument_group('Data collection args')
+    training_group = parser.add_argument_group('Training args')
+    student_group = parser.add_argument_group('Student args')
+
     # Paths
-    parser.add_argument('--cache_folder', '-c', type=str)
-    parser.add_argument('--dataset_path', '-d', type=str)
-    parser.add_argument('--validation_dataset_path', '-vd', type=str)
-    parser.add_argument('--teacher_models_folder', '-tm', type=str)
-    parser.add_argument('--student_path', '-s', type=str)
-    
+    path_group.add_argument('--cache_folder', '-c', type=str, help='Directory for cache storage. Ideally should be an empty folder. {string}')
+    path_group.add_argument('--dataset_path', '-d', type=str, help='Path to the training dataset. {string}')
+    path_group.add_argument('--validation_dataset_path', '-vd', type=str, help='Path to the validation dataset. {string}')
+    path_group.add_argument('--teacher_models_folder', '-tm', type=str, help='Directory containing teacher models, or a path to just one teacher directly. {string}')
+    path_group.add_argument('--student_path', '-s', type=str, help='Path to the student model. {string}')
+
     # Cache settings
-    parser.add_argument('--max_cache_size_gb', '-maxgb', type=int)
-    
+    cache_group.add_argument('--max_cache_size_gb', '-maxgb', type=float, help='Maximum cache size in GB. Used to keep the main h5 dataset under this limit, and use chunked collection+training when the calculated size of the collected h5 dataset is over this limit. Only tracks the main h5 dataset\'s size, any misc. files/states are not counted. {float}')
+
     # Pipeline settings
-    parser.add_argument('--ignore_model_type', type=bool)
-    parser.add_argument('--rebase_dataset', type=bool)
+    pipeline_group.add_argument('--ignore_model_type', type=bool, help='If True, will let completion teachers collect instruct data, and instruct teachers completion data. Use at your own discretion. {bool}')
+    pipeline_group.add_argument('--rebase_dataset', type=bool, help='Rebase the dataset without safety checks. Overwrites all metadata in the h5 dataset, so be very careful to use the exact same text dataset as the one used for its collection. Intended to update the dataset to a newer version of the pipeline after breaking changes. {bool}')
+    pipeline_group.add_argument('--use_teachers', type=bool, help='Whether to use teachers for distillation. Useful when you downloaded the dataset from the internet and want to distill using it, but don\'t have the teachers it was collected with on disk. {bool}')
 
     # General model settings
-    parser.add_argument('--context_len', '-ctx', type=int)
-    parser.add_argument('--save_sys_range', type=bool)
-    parser.add_argument('--save_user_range', type=bool)
-    parser.add_argument('--save_assistant_range', type=bool)
-    parser.add_argument('--crop_distr_to_size', type=int)
-    parser.add_argument('--enable_topK', type=bool)
-    parser.add_argument('--save_topK', '-topk', type=int)
-    parser.add_argument('--device', type=str)
-    
+    general_model_group.add_argument('--context_len', '-ctx', type=int, help='Context length to collect and train on. {int}')
+    general_model_group.add_argument('--save_sys_range', type=bool, help='Boolean flag to save specific token ranges within conversations. Used only with instruct data to collect and train only on the content of the conversation, avoiding the prompt formatting tokens. {bool}')
+    general_model_group.add_argument('--save_user_range', type=bool, help='Boolean flag to save specific token ranges within conversations. Used only with instruct data to collect and train only on the content of the conversation, avoiding the prompt formatting tokens. {bool}')
+    general_model_group.add_argument('--save_assistant_range', type=bool, help='Boolean flag to save specific token ranges within conversations. Used only with instruct data to collect and train only on the content of the conversation, avoiding the prompt formatting tokens. {bool}')
+    general_model_group.add_argument('--crop_distr_to_size', type=int, help='Crop distribution size for token filtering. A rudimentary way to avoid training on tokens that aren\'t in the student\'s vocab. Applied as: distributions[:, :crop_distr_to_size], where the first dimension is for tokens, and the second for logits. Must be set to the base-model\'s vocabulary size. {int}')
+    general_model_group.add_argument('--enable_topK', type=bool, help='Enable top-K sampling for collecting and training. {bool}')
+    general_model_group.add_argument('--save_topK', '-topk', type=int, help='Configure top-K sampling for collecting and training. Slashes storage requirements enormously, without it, 1000 2048-token long samples take up ~100gb of storage at vocabulary size of 32000, but with top-K at 200, this goes down to only ~1.4gb. {int}')
+    general_model_group.add_argument('--device', type=str, help='Main device for any single-device tensor operations (e.g., cuda:0). {string}')
+
     # Collection settings
-    parser.add_argument('--num_inference_workers', '-niw', type=int)
-    parser.add_argument('--reserve_vram', type=float, nargs='+')
-    
+    collection_group.add_argument('--num_inference_workers', '-niw', type=int, help='Number of inference workers for parallel collection. Use if you have enough VRAM. Note: it can\'t handle more than 3 inference workers due to multiprocessing issues, else it just hangs indefinitely. {int}')
+    collection_group.add_argument('--reserve_vram', type=list, nargs='+', help='Amount of VRAM to reserve per GPU during collection, will try to keep that much memory in GB free for each GPU. Example: [4, 0.5] for 4GB reserved on the first GPU, and 0.5GB on the second. {float list}')
+
     # Training settings
-    parser.add_argument('--num_epochs', '-ne', type=int)
-    parser.add_argument('--num_warmup_steps', '-nws', type=int)
-    parser.add_argument('--batch_size', '-bs', type=int)
-    parser.add_argument('--grad_accum_batches', '-g', type=int)
-    parser.add_argument('--grad_checkpointing', type=bool)
-    parser.add_argument('--temperature', '-t', type=float)
-    parser.add_argument('--lr', '-lr', type=float)
-    parser.add_argument('--decay_start', type=float)
-    parser.add_argument('--alpha', type=float)
-    parser.add_argument('--lr_scheduler', type=str)
-    parser.add_argument('--optimizer', type=str)
-    parser.add_argument('--data_order', type=str)
-    parser.add_argument('--training_precision', type=str)
-    parser.add_argument('--validate_every_n_epochs', type=float)
-    parser.add_argument('--save_student_every_n_epochs', type=float)
-    parser.add_argument('--num_gpu0_layers', type=int)
-    parser.add_argument('--device_map', type=str)
-    parser.add_argument('--max_memory', type=str)
-    parser.add_argument('--multi_gpu', type=bool)
-    parser.add_argument('--save_final_state', type=bool)
-    parser.add_argument('--wandb_comment', '-wdb', type=str)
-    parser.add_argument('--use_flash_attn_2', '-fa2', type=bool)
-    
+    training_group.add_argument('--num_epochs', '-ne', type=int, help='Number of training epochs. {int}')
+    training_group.add_argument('--num_warmup_steps', '-nws', type=int, help='Number of warmup steps for learning rate. {int}')
+    training_group.add_argument('--batch_size', '-bs', type=int, help='Training batch size. {int}')
+    training_group.add_argument('--grad_accum_batches', '-g', type=int, help='Number of gradient accumulations done before calling optimizer.step(). {int}')
+    training_group.add_argument('--grad_checkpointing', type=bool, help='Enable gradient checkpointing for memory savings, but slower training. {bool}')
+    training_group.add_argument('--temperature', '-t', type=float, help='Temperature for distillation. {float}')
+    training_group.add_argument('--lr', '-lr', type=float, help='Learning rate. {float}')
+    training_group.add_argument('--decay_start', type=float, help='Start decaying learning rate to 0 at this percentage of total training steps, only used by the wsd learning rate scheduler. {float}')
+    training_group.add_argument('--alpha', type=float, help='Weighting factor for weighted losses. Currently used as: weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha). {float}')
+    training_group.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler name. Options include a custom implementation of Warmup Stable Decay learning rate scheduler from MiniCPM, and any other learning rate scheduler from Transformer\'s get_scheduler() function (e.g., cosine, linear, constant). {string}')
+    training_group.add_argument('--optimizer', type=str, help='Optimizer name. Currently available options include: adam, adamw, adamw8bit, adamw32bit, paged_adamw, paged_adamw8bit, paged_adamw32bit, sgd, rmsprop, rmsprop8bit, rmsprop32bit, adagrad. {string}')
+    training_group.add_argument('--data_order', type=str, help='Order of samples during training. Options are: shuffle - randomizes order of samples every epoch, sorted - sort the data by length of samples, native - same order of samples as in the text dataset. {string}')
+    training_group.add_argument('--training_precision', type=str, help='Training precision. Options include: fp32, fp16, bf16 (also supports bnb\'s 4bit and 8bit, but they are very buggy at the moment, use at your own discretion). {string}')
+    training_group.add_argument('--validate_every_n_epochs', type=float, help='Validation frequency measured in epochs to scale with your dataset. Accepts floating point numbers like 0.1, this will do 10 validation steps every epoch, etc. {float}')
+    training_group.add_argument('--save_student_every_n_epochs', type=float, help='Frequency of saving student model in epochs. Same as above. {float}')
+    training_group.add_argument('--num_gpu0_layers', type=int, help='Number of layers for GPU 0. Used only with device_map = "custom". {int}')
+    training_group.add_argument('--device_map', type=str, help='Device mapping strategy. Currently supports any device map provided by HF accelerate: balanced, balanced_low_0, and custom for our custom splitting strategy, also allowing you to set how many layers you want on the first GPU with num_gpu0_layers. {string}')
+    training_group.add_argument('--max_memory', type=dict, help='Maximum memory allocation for each device. Must be formatted as a Dict, an example is provided within the config.json in the repo. Ensure it is edited according to the number of GPUs you have. {dict[str, int]}')
+    training_group.add_argument('--multi_gpu', type=bool, help='Wether to do multi-GPU training. {bool}')
+    training_group.add_argument('--save_final_state', type=bool, help='Save the final model state after training. Can consume enormous amounts of storage and RAM. {bool}')
+    training_group.add_argument('--wandb_comment', '-wdb', type=str, help='A comment for Weights and Biases logging. Example: {comment} ModelName lr(lr) (Date/Time). {string}')
+    training_group.add_argument('--use_flash_attn_2', '-fa2', type=bool, help='Whether to use Flash Attention 2, or default to sdpa. {bool}')
+
     # Student settings
-    parser.add_argument('--freeze_layers', '-fl', type=str, nargs='+')
-    parser.add_argument('--add_bos', type=bool)
-    parser.add_argument('--prompt_format', type=json.loads)
-    
+    student_group.add_argument('--freeze_layers', '-fl', type=str, nargs='+', help='Layers to freeze during training. Uses a list of strings for layer names to freeze. Example: [".block_sparse_moe.gate", ...] {string list}')
+    student_group.add_argument('--add_bos', type=bool, help='Add beginning-of-sequence token to every sample. {bool}')
+    student_group.add_argument('--prompt_format', type=json.loads, help='Prompt format to use for instruct samples. {JSON}')
+
+
     args = parser.parse_args()
 
     config_path = os.path.join(os.path.dirname(__file__), 'config.json')
@@ -347,6 +398,11 @@ def handle_termination(signum, frame):
     exit(0)
 
 
+def update_teachers_param(teachers, param, value):
+    for teacher in teachers:
+        setattr(teacher, param, value)
+
+
 def main():
     params = get_params()
 
@@ -363,6 +419,7 @@ def main():
     # Pipeline settings
     ignore_model_type = params['ignore_model_type'] # If True, will collect all data from teachers regardless if both, conversation and teacher are matching in being completion/instruct
     rebase_dataset = params['rebase_dataset'] # Only use if you know what you are doing. Will skip safety checks to directly use data on disk, also updating metadata used for future safety checks
+    use_teachers = params['use_teachers'] # If True, will use the teacher models to collect data for the student if its needed, and will run safety checks for them
 
     # General model settings
     context_len = params['context_len']
@@ -411,13 +468,22 @@ def main():
     # Initialization
     global data_manager, validation_data_manager
 
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGINT, handle_termination)
+
     multiprocessing.set_start_method('spawn', force=True)
     paths = Paths(cache_folder)
-    teachers = get_teachers(teacher_models_folder)
+    teachers = get_teachers(teacher_models_folder, use_teachers)
     student = StudentModel(student_path, paths, add_bos, prompt_format, batch_size)
 
-    ensure_compatibility(teachers, student)
-    prepare_datasets(dataset_path, validation_dataset_path, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type)
+    print("Launching data managers...")
+    data_manager = H5DataManager(paths.dataset, device)
+    time.sleep(2) # 2s sleep to allow the data manager to initialize, else it stalls for some reason
+    validation_data_manager = H5DataManager(paths.dataset_validation, device)
+    
+    ensure_compatibility(teachers, student, use_teachers)
+    prepare_datasets(dataset_path, data_manager, validation_dataset_path, validation_data_manager, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range,
+                     ignore_model_type, use_teachers)
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK)
     set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs, 
@@ -425,22 +491,18 @@ def main():
 
     student.reorder_dataset()
     
-    validation_data_manager = H5DataManager(paths.dataset_validation, device)
-    time.sleep(2) # 2s sleep to allow the data manager to initialize, else it stalls for some reason
-    data_manager = H5DataManager(paths.dataset, device)
-
-    signal.signal(signal.SIGTERM, handle_termination)
-    signal.signal(signal.SIGINT, handle_termination)
-    
     loop_ids, full_collect = calculate_loop_ids(student, max_cache_size_gb, enable_topK, save_topK)
     
-    ids_collect, ids_collect_val = sync_datasets(validation_data_manager, data_manager, rebase_dataset, student)
+    ids_collect, ids_collect_val = sync_datasets(validation_data_manager, data_manager, rebase_dataset, student, use_teachers)
 
     # Main logic
 
     ## Validation collection
     if ids_collect_val and not rebase_dataset:
         print(f"Collecting validation data for {len(ids_collect_val)} samples...")
+
+        #topk_to_use = check_topk(validation_data_manager, enable_topK, save_topK, validation=True)
+        #update_teachers_param(teachers, "topK", topk_to_use)
 
         validation_data_manager.set_vocab_family(student.vocab_family)
 
@@ -458,6 +520,10 @@ def main():
 
         if full_collect:
             print(f"Collecting data for {len(ids_collect)} samples...")
+
+            #topk_to_use = check_topk(data_manager, enable_topK, save_topK)
+            #update_teachers_param(teachers, "topK", topk_to_use)
+
             for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):
                 teacher.process_chunk(reserve_vram, num_inference_workers, ids_to_collect=ids_collect, data_manager=data_manager)
 
@@ -465,17 +531,21 @@ def main():
 
         else:
             print(f"WARNING: The calculated size of the h5 dataset is too large for the specified cache size ({max_cache_size_gb}GB).")
-            print("The data will be collected in chunks. This will erase all previous data in the main h5 dataset!")
+            print("The data will be collected and trained on in chunks.")
 
-            response = input("Do you wish to continue? (y/n): ")
+            if data_manager.has_data():
+                print("This will erase all previous data in the main h5 dataset!")
+                response = input("Do you wish to continue? (y/n): ")
 
-            if response.lower() not in ["y", "ye", "yes", "1", "true", "t"]:
-                handle_termination(None, None)
+                if response.lower() not in ["y", "ye", "yes", "1", "true", "t"]:
+                    handle_termination(None, None)
+
+            data_manager.set_topk(save_topK)
 
             for epoch in tqdm(range(num_epochs), desc="Epochs", smoothing=0.06, position=0):
 
                 for chunk_ids in tqdm(loop_ids, desc="Chunks", smoothing=0.06, position=1, leave=False):
-                    data_manager.purge_dataset()
+                    data_manager.purge_dataset(ask_confirmation=False)
 
                     for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=2, leave=False):
                         teacher.process_chunk(reserve_vram, num_inference_workers, ids_to_collect=chunk_ids, data_manager=data_manager)
