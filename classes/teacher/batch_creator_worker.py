@@ -1,10 +1,19 @@
 from classes.data_classes import Distribution, ConvoTokenized
 from numpy import ndarray
 import numpy as np
+import signal
 import math
 
 
 def _batch_creator_worker(inference_queue, batch_size, dataset_chunk: list[ConvoTokenized], num_inference_workers):
+    def _signal_handler(signum, frame):
+        exit(0)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGABRT, _signal_handler)
+
+
     def _prepare_batch_for_inference(convo_id, batch_size, dataset_chunk: list[ConvoTokenized]) -> tuple[ndarray, list[Distribution], int]:
         batch_tokenized: list[ndarray] = []
         batch_distributions: list[Distribution] = []
@@ -28,7 +37,7 @@ def _batch_creator_worker(inference_queue, batch_size, dataset_chunk: list[Convo
     num_batches = math.ceil(len(dataset_chunk) / batch_size)
 
     for i in range(num_batches):
-        batch_tokenized, batch_distributions, batch_size = _prepare_batch_for_inference(convo_id, batch_size, dataset_chunk)
+        batch_tokenized, batch_distributions, batch_size = _prepare_batch_for_inference(convo_id, batch_size, dataset_chunk)            
         inference_queue.put((batch_tokenized, batch_distributions))
         convo_id += batch_size
 

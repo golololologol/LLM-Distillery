@@ -81,7 +81,7 @@ def calculate_divergence(student_logits: Tensor, teacher_logits: Tensor, indices
         CE_valid_mean = valid_logprobs[valid_mask].mean()
 
         valid_logprobs[~valid_mask] = CE_valid_mean
-        return -valid_logprobs, valid_mask
+        return -valid_logprobs
 
 
     min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
@@ -94,8 +94,8 @@ def calculate_divergence(student_logits: Tensor, teacher_logits: Tensor, indices
         teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
 
     convo_CE_tokens = convo_CE_tokens[:min_len]
-    CE_loss, CE_valid_mask = custom_ce_loss(student_logprobs, convo_CE_tokens, indices, avoid_indices)
-    teacher_CE_loss, teacher_CE_valid_mask = custom_ce_loss(teacher_logprobs, convo_CE_tokens, indices, avoid_indices)
+    CE_loss = custom_ce_loss(student_logprobs, convo_CE_tokens, indices, avoid_indices)
+    teacher_CE_loss = custom_ce_loss(teacher_logprobs, convo_CE_tokens, indices, avoid_indices)
         
     CE_diff = CE_loss - teacher_CE_loss
 

@@ -3,11 +3,20 @@ from multiprocessing import shared_memory
 from numpy import ndarray
 import torch.nn.functional as F
 import numpy as np
+import signal
 import torch
 
 
 def _inference_worker(inference_queue, result_queue, made_distributions, model_loaded, start_inference, done_chunk, model_path, model_name, reserve_vram_gb,
                         gpus_mem_used, crop_to_size, pbar_queue, context_len, batch_size, max_queue_size, seq_chunk_len, enable_topK, topK):
+    def _signal_handler(signum, frame):
+        while not inference_queue.empty():
+            inference_queue.get()
+        exit(0)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGABRT, _signal_handler)
         
     def _load_model(model_loaded) -> tuple[ExLlamaV2, ExLlamaV2Cache]:
         pbar_queue.put(("str", f"Loading {model_name}..."))
@@ -103,7 +112,7 @@ def _inference_worker(inference_queue, result_queue, made_distributions, model_l
         shared_list.append(shd_mem)
         if len(shared_list) > max_queue_size + 20:
             shared_list.pop(0)
-            
+        
         result_queue.put((shd_mem_name, batch_logp_shape, batch_logp_dtype, batch_distributions, indices_np))
         made_distributions.set()
         start_inference.wait()

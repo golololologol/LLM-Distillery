@@ -3,9 +3,22 @@ from multiprocessing import shared_memory
 from numpy import ndarray
 from tqdm import tqdm
 import numpy as np
+import signal
 
 
 def _result_processor_worker(result_queue, made_distributions, done_chunk_writes, disk_queue, pbar_queue: tqdm, max_queue_size: int, num_inference_workers: int):
+    def _signal_handler(signum, frame):
+        while not result_queue.empty():
+            result_queue.get()
+        while not pbar_queue.empty():
+            pbar_queue.get()
+        exit(0)
+
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGABRT, _signal_handler)
+
+
     def _get_content_indices_np(content_ranges) -> ndarray:
         content_indices = []
         for start, end in content_ranges:
@@ -41,7 +54,7 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
             distribution.distribution = convo_logprobs[:distribution.length]
             distribution.indices = convo_indices
         batch_content_distributions, batch_distributions_len = _get_batch_content_logprobs(batch_distributions)
-        disk_queue.put(batch_content_distributions)
+        disk_queue.put(('put_batch', batch_content_distributions))
 
         return batch_distributions_len
     

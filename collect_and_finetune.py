@@ -16,7 +16,6 @@ import os
 nvidia_smi.nvmlInit()
     
 def calculate_loop_ids(student: StudentModel, max_cache_size_gb, enable_topK, save_topK):
-    
     if enable_topK:
         kb_per_distr_val = (0.001953125 * 3) / 1.7 # storage of one FP16 value * 3 (for int32 index) / 1.7 (avg compression ratio)
         distr_size_kb = kb_per_distr_val * save_topK
@@ -304,7 +303,7 @@ def load_config(config_path):
 
 
 def get_params():
-    parser = argparse.ArgumentParser(description="Set parameters for the script.")
+    parser = argparse.ArgumentParser(description="Set parameters for the script.", formatter_class=argparse.RawTextHelpFormatter)
     
     # Groups
     path_group = parser.add_argument_group('Path args')
@@ -316,60 +315,60 @@ def get_params():
     student_group = parser.add_argument_group('Student args')
 
     # Paths
-    path_group.add_argument('--cache_folder', '-c', type=str, help='Directory for cache storage. Ideally should be an empty folder. {string}')
+    path_group.add_argument('--cache_folder', '-c', type=str, help='Directory for cache storage.\nIdeally should be an empty folder. {string}')
     path_group.add_argument('--dataset_path', '-d', type=str, help='Path to the training dataset. {string}')
     path_group.add_argument('--validation_dataset_path', '-vd', type=str, help='Path to the validation dataset. {string}')
-    path_group.add_argument('--teacher_models_folder', '-tm', type=str, help='Directory containing teacher models, or a path to just one teacher directly. {string}')
+    path_group.add_argument('--teacher_models_folder', '-tm', type=str, help='Directory containing teacher models,\nor a path to just one teacher directly. {string}')
     path_group.add_argument('--student_path', '-s', type=str, help='Path to the student model. {string}')
 
     # Cache settings
-    cache_group.add_argument('--max_cache_size_gb', '-maxgb', type=float, help='Maximum cache size in GB. Used to keep the main h5 dataset under this limit, and use chunked collection+training when the calculated size of the collected h5 dataset is over this limit. Only tracks the main h5 dataset\'s size, any misc. files/states are not counted. {float}')
+    cache_group.add_argument('--max_cache_size_gb', '-maxgb', type=float, help='Maximum cache size in GB.\nUsed to keep the main h5 dataset under this limit,\nand use chunked collection+training when the calculated size of the collected h5 dataset is over this limit.\nOnly tracks the main h5 dataset\'s size, any misc. files/states are not counted. {float}')
 
     # Pipeline settings
-    pipeline_group.add_argument('--ignore_model_type', type=bool, help='If True, will let completion teachers collect instruct data, and instruct teachers completion data. Use at your own discretion. {bool}')
-    pipeline_group.add_argument('--rebase_dataset', type=bool, help='Rebase the dataset without safety checks. Overwrites all metadata in the h5 dataset, so be very careful to use the exact same text dataset as the one used for its collection. Intended to update the dataset to a newer version of the pipeline after breaking changes. {bool}')
-    pipeline_group.add_argument('--use_teachers', type=bool, help='Whether to use teachers for distillation. Useful when you downloaded the dataset from the internet and want to distill using it, but don\'t have the teachers it was collected with on disk. {bool}')
-
+    pipeline_group.add_argument('--ignore_model_type', type=bool, help='If True, will let completion teachers collect instruct data,\nand instruct teachers completion data.\nUse at your own discretion. {bool}')
+    pipeline_group.add_argument('--rebase_dataset', type=bool, help='Rebase the dataset without safety checks.\nOverwrites all metadata in the h5 dataset,\nso be very careful to use the exact same text dataset as the one used for its collection.\nIntended to update the dataset to a newer version of the pipeline after breaking changes. {bool}')
+    pipeline_group.add_argument('--use_teachers', type=bool, help='Whether to use teachers for distillation.\nUseful when you downloaded the dataset from the internet and want to distill using it,\nbut don\'t have the teachers it was collected with on disk. {bool}')
+    
     # General model settings
     general_model_group.add_argument('--context_len', '-ctx', type=int, help='Context length to collect and train on. {int}')
-    general_model_group.add_argument('--save_sys_range', type=bool, help='Boolean flag to save specific token ranges within conversations. Used only with instruct data to collect and train only on the content of the conversation, avoiding the prompt formatting tokens. {bool}')
-    general_model_group.add_argument('--save_user_range', type=bool, help='Boolean flag to save specific token ranges within conversations. Used only with instruct data to collect and train only on the content of the conversation, avoiding the prompt formatting tokens. {bool}')
-    general_model_group.add_argument('--save_assistant_range', type=bool, help='Boolean flag to save specific token ranges within conversations. Used only with instruct data to collect and train only on the content of the conversation, avoiding the prompt formatting tokens. {bool}')
-    general_model_group.add_argument('--crop_distr_to_size', type=int, help='Crop distribution size for token filtering. A rudimentary way to avoid training on tokens that aren\'t in the student\'s vocab. Applied as: distributions[:, :crop_distr_to_size], where the first dimension is for tokens, and the second for logits. Must be set to the base-model\'s vocabulary size. {int}')
+    general_model_group.add_argument('--save_sys_range', type=bool, help='Boolean flag to save specific token ranges within conversations.\nUsed only with instruct data to collect and train only on the content of the conversation,\navoiding the prompt formatting tokens. {bool}')
+    general_model_group.add_argument('--save_user_range', type=bool, help='Boolean flag to save specific token ranges within conversations.\nUsed only with instruct data to collect and train only on the content of the conversation,\navoiding the prompt formatting tokens. {bool}')
+    general_model_group.add_argument('--save_assistant_range', type=bool, help='Boolean flag to save specific token ranges within conversations.\nUsed only with instruct data to collect and train only on the content of the conversation,\navoiding the prompt formatting tokens. {bool}')
+    general_model_group.add_argument('--crop_distr_to_size', type=int, help='Crop distribution size for token filtering.\nA rudimentary way to avoid training on tokens that aren\'t in the student\'s vocab.\nApplied as: distributions[:, :crop_distr_to_size],\nwhere the first dimension is for tokens, and the second for logits.\nMust be set to the base-model\'s vocabulary size. {int}')
     general_model_group.add_argument('--enable_topK', type=bool, help='Enable top-K sampling for collecting and training. {bool}')
-    general_model_group.add_argument('--save_topK', '-topk', type=int, help='Configure top-K sampling for collecting and training. Slashes storage requirements enormously, without it, 1000 2048-token long samples take up ~100gb of storage at vocabulary size of 32000, but with top-K at 200, this goes down to only ~1.4gb. {int}')
+    general_model_group.add_argument('--save_topK', '-topk', type=int, help='Configure top-K sampling for collecting and training.\nSlashes storage requirements enormously,\nwithout it, 1000 2048-token long samples take up ~100gb of storage at vocabulary size of 32000,\nbut with top-K at 200, this goes down to only ~1.4gb. {int}')
     general_model_group.add_argument('--device', type=str, help='Main device for any single-device tensor operations (e.g., cuda:0). {string}')
 
     # Collection settings
-    collection_group.add_argument('--num_inference_workers', '-niw', type=int, help='Number of inference workers for parallel collection. Use if you have enough VRAM. Note: it can\'t handle more than 3 inference workers due to multiprocessing issues, else it just hangs indefinitely. {int}')
-    collection_group.add_argument('--reserve_vram', type=list, nargs='+', help='Amount of VRAM to reserve per GPU during collection, will try to keep that much memory in GB free for each GPU. Example: [4, 0.5] for 4GB reserved on the first GPU, and 0.5GB on the second. {float list}')
+    collection_group.add_argument('--num_inference_workers', '-niw', type=int, help='Number of inference workers for parallel collection.\nUse if you have enough VRAM.\nNote: it can\'t handle more than 3 inference workers due to multiprocessing issues,\nelse it just hangs indefinitely. {int}')
+    collection_group.add_argument('--reserve_vram', type=list, nargs='+', help='Amount of VRAM to reserve per GPU during collection,\nwill try to keep that much memory in GB free for each GPU.\nExample: [4, 0.5] for 4GB reserved on the first GPU, and 0.5GB on the second. {float list}')
 
     # Training settings
     training_group.add_argument('--num_epochs', '-ne', type=int, help='Number of training epochs. {int}')
     training_group.add_argument('--num_warmup_steps', '-nws', type=int, help='Number of warmup steps for learning rate. {int}')
     training_group.add_argument('--batch_size', '-bs', type=int, help='Training batch size. {int}')
     training_group.add_argument('--grad_accum_batches', '-g', type=int, help='Number of gradient accumulations done before calling optimizer.step(). {int}')
-    training_group.add_argument('--grad_checkpointing', type=bool, help='Enable gradient checkpointing for memory savings, but slower training. {bool}')
+    training_group.add_argument('--grad_checkpointing', type=bool, help='Enable gradient checkpointing for memory savings,\nbut slower training. {bool}')
     training_group.add_argument('--temperature', '-t', type=float, help='Temperature for distillation. {float}')
     training_group.add_argument('--lr', '-lr', type=float, help='Learning rate. {float}')
-    training_group.add_argument('--decay_start', type=float, help='Start decaying learning rate to 0 at this percentage of total training steps, only used by the wsd learning rate scheduler. {float}')
-    training_group.add_argument('--alpha', type=float, help='Weighting factor for weighted losses. Currently used as: weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha). {float}')
-    training_group.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler name. Options include a custom implementation of Warmup Stable Decay learning rate scheduler from MiniCPM, and any other learning rate scheduler from Transformer\'s get_scheduler() function (e.g., cosine, linear, constant). {string}')
-    training_group.add_argument('--optimizer', type=str, help='Optimizer name. Currently available options include: adam, adamw, adamw8bit, adamw32bit, paged_adamw, paged_adamw8bit, paged_adamw32bit, sgd, rmsprop, rmsprop8bit, rmsprop32bit, adagrad. {string}')
-    training_group.add_argument('--data_order', type=str, help='Order of samples during training. Options are: shuffle - randomizes order of samples every epoch, sorted - sort the data by length of samples, native - same order of samples as in the text dataset. {string}')
-    training_group.add_argument('--training_precision', type=str, help='Training precision. Options include: fp32, fp16, bf16 (also supports bnb\'s 4bit and 8bit, but they are very buggy at the moment, use at your own discretion). {string}')
-    training_group.add_argument('--validate_every_n_epochs', type=float, help='Validation frequency measured in epochs to scale with your dataset. Accepts floating point numbers like 0.1, this will do 10 validation steps every epoch, etc. {float}')
-    training_group.add_argument('--save_student_every_n_epochs', type=float, help='Frequency of saving student model in epochs. Same as above. {float}')
-    training_group.add_argument('--num_gpu0_layers', type=int, help='Number of layers for GPU 0. Used only with device_map = "custom". {int}')
-    training_group.add_argument('--device_map', type=str, help='Device mapping strategy. Currently supports any device map provided by HF accelerate: balanced, balanced_low_0, and custom for our custom splitting strategy, also allowing you to set how many layers you want on the first GPU with num_gpu0_layers. {string}')
-    training_group.add_argument('--max_memory', type=dict, help='Maximum memory allocation for each device. Must be formatted as a Dict, an example is provided within the config.json in the repo. Ensure it is edited according to the number of GPUs you have. {dict[str, int]}')
-    training_group.add_argument('--multi_gpu', type=bool, help='Wether to do multi-GPU training. {bool}')
-    training_group.add_argument('--save_final_state', type=bool, help='Save the final model state after training. Can consume enormous amounts of storage and RAM. {bool}')
-    training_group.add_argument('--wandb_comment', '-wdb', type=str, help='A comment for Weights and Biases logging. Example: {comment} ModelName lr(lr) (Date/Time). {string}')
-    training_group.add_argument('--use_flash_attn_2', '-fa2', type=bool, help='Whether to use Flash Attention 2, or default to sdpa. {bool}')
+    training_group.add_argument('--decay_start', type=float, help='Start decaying learning rate to 0 at this percentage of total training steps,\nonly used by the wsd learning rate scheduler. {float}')
+    training_group.add_argument('--alpha', type=float, help='Weighting factor for weighted losses.\nCurrently used as: weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha). {float}')
+    training_group.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler name.\nOptions include a custom implementation of Warmup Stable Decay learning rate scheduler from MiniCPM,\nand any other learning rate scheduler from Transformer\'s get_scheduler() function (e.g., cosine, linear, constant). {string}')
+    training_group.add_argument('--optimizer', type=str, help='Optimizer name.\nCurrently available options include: adam, adamw, adamw8bit, adamw32bit,\npaged_adamw, paged_adamw8bit, paged_adamw32bit, sgd, rmsprop, rmsprop8bit, rmsprop32bit, adagrad. {string}')
+    training_group.add_argument('--data_order', type=str, help='Order of samples during training.\nOptions are: shuffle - randomizes order of samples every epoch,\nsorted - sort the data by length of samples,\nnative - same order of samples as in the text dataset. {string}')
+    training_group.add_argument('--training_precision', type=str, help='Training precision.\nOptions include: fp32, fp16, bf16 (also supports bnb\'s 4bit and 8bit,\nbut they are very buggy at the moment, use at your own discretion). {string}')
+    training_group.add_argument('--validate_every_n_epochs', type=float, help='Validation frequency measured in epochs to scale with your dataset.\nAccepts floating point numbers like 0.1,\nthis will do 10 validation steps every epoch, etc. {float}')
+    training_group.add_argument('--save_student_every_n_epochs', type=float, help='Frequency of saving student model in epochs.\nSame as above. {float}')
+    training_group.add_argument('--num_gpu0_layers', type=int, help='Number of layers for GPU 0.\nUsed only with device_map = "custom". {int}')
+    training_group.add_argument('--device_map', type=str, help='Device mapping strategy.\nCurrently supports any device map provided by HF accelerate: balanced, balanced_low_0,\nand custom for our custom splitting strategy,\nalso allowing you to set how many layers you want on the first GPU with num_gpu0_layers. {string}')
+    training_group.add_argument('--max_memory', type=dict, help='Maximum memory allocation for each device.\nMust be formatted as a Dict, an example is provided within the config.json in the repo.\nEnsure it is edited according to the number of GPUs you have. {dict[str, str]}')
+    training_group.add_argument('--multi_gpu', type=bool, help='Whether to do multi-GPU training. {bool}')
+    training_group.add_argument('--save_final_state', type=bool, help='Save the final model state after training.\nCan consume enormous amounts of storage and RAM. {bool}')
+    training_group.add_argument('--wandb_comment', '-wdb', type=str, help='A comment for Weights and Biases logging.\nExample: {comment} ModelName lr(lr) (Date/Time). {string}')
+    training_group.add_argument('--use_flash_attn_2', '-fa2', type=bool, help='Whether to use Flash Attention 2,\nor default to sdpa. {bool}')
 
     # Student settings
-    student_group.add_argument('--freeze_layers', '-fl', type=str, nargs='+', help='Layers to freeze during training. Uses a list of strings for layer names to freeze. Example: [".block_sparse_moe.gate", ...] {string list}')
+    student_group.add_argument('--freeze_layers', '-fl', type=str, nargs='+', help='Layers to freeze during training.\nUses a list of strings for layer names to freeze.\nExample: [".block_sparse_moe.gate", ...] {string list}')
     student_group.add_argument('--add_bos', type=bool, help='Add beginning-of-sequence token to every sample. {bool}')
     student_group.add_argument('--prompt_format', type=json.loads, help='Prompt format to use for instruct samples. {JSON}')
 
@@ -391,10 +390,13 @@ def get_params():
 
 def handle_termination(signum, frame):
     print("\nShutting down...")
-    if data_manager:
+    if data_manager is not None:
         data_manager.close()
-    if validation_data_manager:
+    if validation_data_manager is not None:
         validation_data_manager.close()
+    if teachers is not None:
+        for teacher in teachers:
+            teacher.close()
     exit(0)
 
 
@@ -466,7 +468,7 @@ def main():
 
 
     # Initialization
-    global data_manager, validation_data_manager
+    global data_manager, validation_data_manager, teachers, student
 
     signal.signal(signal.SIGTERM, handle_termination)
     signal.signal(signal.SIGINT, handle_termination)
@@ -478,7 +480,6 @@ def main():
 
     print("Launching data managers...")
     data_manager = H5DataManager(paths.dataset, device)
-    time.sleep(2) # 2s sleep to allow the data manager to initialize, else it stalls for some reason
     validation_data_manager = H5DataManager(paths.dataset_validation, device)
     
     ensure_compatibility(teachers, student, use_teachers)
@@ -501,8 +502,8 @@ def main():
     if ids_collect_val and not rebase_dataset:
         print(f"Collecting validation data for {len(ids_collect_val)} samples...")
 
-        #topk_to_use = check_topk(validation_data_manager, enable_topK, save_topK, validation=True)
-        #update_teachers_param(teachers, "topK", topk_to_use)
+        topk_to_use = check_topk(validation_data_manager, enable_topK, save_topK, validation=True)
+        update_teachers_param(teachers, "topK", topk_to_use)
 
         validation_data_manager.set_vocab_family(student.vocab_family)
 
@@ -521,8 +522,8 @@ def main():
         if full_collect:
             print(f"Collecting data for {len(ids_collect)} samples...")
 
-            #topk_to_use = check_topk(data_manager, enable_topK, save_topK)
-            #update_teachers_param(teachers, "topK", topk_to_use)
+            topk_to_use = check_topk(data_manager, enable_topK, save_topK)
+            update_teachers_param(teachers, "topK", topk_to_use)
 
             for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):
                 teacher.process_chunk(reserve_vram, num_inference_workers, ids_to_collect=ids_collect, data_manager=data_manager)
