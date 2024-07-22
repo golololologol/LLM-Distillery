@@ -389,15 +389,18 @@ def get_params():
 
 
 def handle_termination(signum, frame):
-    print("\nShutting down...")
+    print("\nTerminating the script...")
     if data_manager is not None:
         data_manager.close()
+
     if validation_data_manager is not None:
         validation_data_manager.close()
+
     if teachers is not None:
         for teacher in teachers:
             teacher.close()
-    exit(0)
+
+    os._exit(0)
 
 
 def update_teachers_param(teachers, param, value):

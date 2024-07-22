@@ -9,6 +9,7 @@ from tqdm import tqdm
 import numpy as np
 import logging
 import json
+import gc
 
 logging.getLogger("transformers").setLevel(logging.ERROR)  # Shut up transformers
 logging.getLogger("torch").setLevel(logging.ERROR) # And pytorch for good measure
@@ -26,7 +27,7 @@ def read_jsonl_lazy(file_path):
                 print(f"Fuck up on line {line_number}: {e.msg}. Line content: {line.strip()}")
 
 
-def read_jsonl(file_path):
+def read_jsonl(file_path) -> list[dict]:
     data_list = []
     with open(file_path, 'r', encoding='utf-8') as f:
         line_number = 0
@@ -142,12 +143,8 @@ def tokenize_sample(args):
         full_turn_tokenized[len(turn_start_tokenized) + turn_len:] = turn_end_tokenized
         end_idx = start_idx + len(full_turn_tokenized)
 
-        if save_assistant_range and assistant:
-            content_start_index = start_idx + len(pf['ASSISTANT_START'])
-            content_end_index = content_start_index + turn_len + 1
-            conversation_content_ranges.append((content_start_index, content_end_index))
-        if save_user_range and not assistant:
-            content_start_index = start_idx + len(pf['USER_START'])
+        if (save_assistant_range and assistant) or (save_user_range and not assistant):
+            content_start_index = start_idx + len(turn_start_tokenized)
             content_end_index = content_start_index + turn_len + 1
             conversation_content_ranges.append((content_start_index, content_end_index))
 
@@ -187,9 +184,11 @@ def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range,
     model_completion = model.completion
     model_student = model.student
     model_add_bos = model.add_bos
+    id_to_sample = {}
 
     def generate_tasks():
         for convo_id, item in enumerate(read_jsonl(dataset_path)):
+            id_to_sample[convo_id] = str(item)
             yield (convo_id, item, tokenizer, pf, bos_token_id, save_sys_range, save_user_range, save_assistant_range, context_len, model_completion, model_student, model_add_bos, ignore_model_type)
 
     with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
@@ -212,7 +211,7 @@ def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range,
                     cropped_end = True
                 corrected_content_ranges.append((start, end))
 
-            conversation = ConvoTokenized(conversation_tokenized, corrected_content_ranges, num_pad_tokens, cropped_end, convo_id)
+            conversation = ConvoTokenized(conversation_tokenized, corrected_content_ranges, num_pad_tokens, cropped_end, convo_id, id_to_sample[convo_id])
             ids.add(convo_id)
             dataset.append(conversation)
 

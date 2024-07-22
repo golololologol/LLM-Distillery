@@ -8,7 +8,7 @@ class Distribution:
     """
     Class for probability distribution data.
     """
-    def __init__(self, origin_convo_id: int, length: int = 0, cropped_end: bool = False, content_ranges: list[tuple[int, int]] = [], tokenized: ndarray = None, content_sha: str = ""):
+    def __init__(self, origin_convo_id: int, length: int = 0, cropped_end: bool = False, content_ranges: list[tuple[int, int]] = [], tokenized: ndarray = None, content_sha: str = "", sample: str = ""):
         self.distribution: ndarray|torch.Tensor = None
         self.length: int = length
         self.tokenized: ndarray = tokenized
@@ -21,6 +21,7 @@ class Distribution:
         self.distr_dtype = None
         self.indices = None
         self.content_sha: str = content_sha
+        self.sample: str = sample
 
     def to_shd_mem(self) -> shared_memory.SharedMemory:
         """
@@ -47,7 +48,7 @@ class ConvoTokenized:
     """
     Class for tokenized conversation data.
     """
-    def __init__(self, tokenized: ndarray, content_ranges, padding, cropped_end, convo_id):
+    def __init__(self, tokenized: ndarray, content_ranges, padding, cropped_end, convo_id, sample: str = ""):
         self.tokenized: ndarray = tokenized
         self.content_ranges: list[tuple[int, int]] = content_ranges
         self.padding: int = padding
@@ -59,3 +60,4 @@ class ConvoTokenized:
             sha_content_tokens += "".join(map(str, tokenized[start+1:end]))
         self.content_sha: str = hashlib.sha256(sha_content_tokens.encode()).hexdigest()
         self.origin_convo_id: int = convo_id
+        self.sample: str = sample

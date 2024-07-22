@@ -4,9 +4,11 @@ from multiprocessing import get_context
 import multiprocessing
 import numpy as np
 import signal
+import tables
 import torch
 import time
 import h5py
+import gc
 import os
 
 class H5DataManager:
@@ -20,6 +22,7 @@ class H5DataManager:
         self.device = device
         self.queue = multiprocessing.Queue(max_queue_size)
         self.result_queue = multiprocessing.Queue(max_queue_size)
+        self.closing = multiprocessing.Event()
         self.done_everything = multiprocessing.Event()
         self.done_everything.set()
         self.max_queue_size = max_queue_size
@@ -32,86 +35,127 @@ class H5DataManager:
 
     def _loading_process(self):
         def _handle_exit(signum, frame):
-            self.hdf_file.close()
-            self.shared_batches = []
 
-            while not self.queue.empty():
-                self.queue.get()
+            if self.queue is not None:
+                while not self.queue.empty():
+                    self.queue.get()
+                self.queue.close()
+                self.queue.join_thread()
 
-            while not self.result_queue.empty():
-                self.result_queue.get()
+            if self.result_queue is not None:
+                while not self.result_queue.empty():
+                    self.result_queue.get()
+                self.result_queue.close()
+                self.result_queue.join_thread()
 
-            self.queue.close()
-            self.result_queue.close()
+            del self.shared_batches
+            gc.collect()
+
             self.done_everything.set()
-            exit(0)
-
-        signal.signal(signal.SIGINT, _handle_exit)
-        signal.signal(signal.SIGTERM, _handle_exit)
-        signal.signal(signal.SIGABRT, _handle_exit)
-        signal.signal(signal.SIGBREAK, _handle_exit)
-        signal.signal(signal.SIGSEGV, _handle_exit)
+            return
         
-        hdf_file = h5py.File(self.file_path, 'a')
-        self.hdf_file = hdf_file
+        def _main_loop():
+            with h5py.File(self.file_path, 'a') as hdf_file:
+                while True:
+                    if self.closing.is_set():
 
-        while True:
-            if self.queue.empty():
-                time.sleep(0.01)
-                continue
+                        break
+                    
+                    if self.queue.empty():
+                        time.sleep(0.005)
 
-            self.done_everything.clear()
+                        continue
 
-            task, data = self.queue.get()
+                    self.done_everything.clear()
+                    task, data = self.queue.get()
 
-            match task:
-                case 'get_batch':
-                    self.result_queue.put(self._make_outgoing_batch(hdf_file, data))
-                case 'get_batches':
-                    for batch_ids in data:
-                        while self.result_queue.full():
-                            time.sleep(0.1)
-                        self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
-                case 'read_only_mode':
-                    while True:
-                        for batch_ids in data:
-                            while self.result_queue.full():
-                                time.sleep(0.1)
-                            self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
-                case 'put_batch':
-                    self._process_distributions(hdf_file, data)
-                case 'update_batch':
-                    self._update_data(hdf_file, data)
-                case 'clear_dataset':
-                    ids_to_clear = [int(group.split('_')[1]) for group in hdf_file]
-                    self._clear_dataset(hdf_file, ids_to_clear)
-                case 'clear_ids':
-                    self._clear_dataset(hdf_file, data)
-                case 'rename_ids':
-                    self._rename_ids(hdf_file, data)
-                case 'get_available_ids':
-                    self.result_queue.put([int(group.split('_')[1]) for group in hdf_file])
-                case 'get_available_shas':
-                    self.result_queue.put(self._get_shas(hdf_file))
-                case 'update_shas':
-                    self._update_shas(hdf_file, data)
-                case 'get_vocab_family':
-                    self.result_queue.put(self._get_vocab_family(hdf_file))
-                case 'set_vocab_family':
-                    self._set_vocab_family(hdf_file, data)
-                case 'get_topk':
-                    self.result_queue.put(self._get_topk(hdf_file))
-                case 'set_topk':
-                    self._set_topk(hdf_file, data)
-                case 'get_dataset_attr':
-                    self.result_queue.put(self._get_attr(hdf_file, data))
-                case 'set_dataset_attr':
-                    self._set_attr(hdf_file, data[0], data[1])
-                case 'has_data':
-                    self.result_queue.put(self._has_data(hdf_file))
+                    match task:
+                        case 'get_batch':
+                            self.result_queue.put(self._make_outgoing_batch(hdf_file, data))
+                        case 'get_batches':
+                            for batch_ids in data:
+                                if self.closing.is_set():
+                                    break
 
-            if self.queue.empty():
-                self.done_everything.set()
+                                while self.result_queue.full():
+                                    if self.closing.is_set():
+                                        break
+                                    time.sleep(0.05)
+
+                                if self.closing.is_set():
+                                    break
+                                self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
+
+                        case 'read_only_mode':
+                            while True:
+                                if self.closing.is_set():
+                                    break
+
+                                for batch_ids in data:
+                                    if self.closing.is_set():
+                                        break
+                                    
+                                    while self.result_queue.full():
+                                        if self.closing.is_set():
+                                            break
+                                        time.sleep(0.05)
+
+                                    if self.closing.is_set():
+                                        break
+
+                                    self.result_queue.put(self._make_outgoing_batch(hdf_file, batch_ids))
+
+                        case 'put_batch':
+                            self._process_distributions(hdf_file, data)
+                        case 'update_batch':
+                            self._update_data(hdf_file, data)
+
+                        case 'clear_dataset':
+                            ids_to_clear = [int(group.split('_')[1]) for group in hdf_file]
+                            self._clear_dataset(hdf_file, ids_to_clear)
+
+                        case 'clear_ids':
+                            self._clear_dataset(hdf_file, data)
+                        case 'rename_ids':
+                            self._rename_ids(hdf_file, data)
+
+                        case 'get_available_ids':
+                            self.result_queue.put([int(group.split('_')[1]) for group in hdf_file])
+
+                        case 'get_available_shas':
+                            self.result_queue.put(self._get_shas(hdf_file))
+                        case 'update_shas':
+                            self._update_shas(hdf_file, data)
+
+                        case 'get_vocab_family':
+                            self.result_queue.put(self._get_vocab_family(hdf_file))
+                        case 'set_vocab_family':
+                            self._set_vocab_family(hdf_file, data)
+
+                        case 'get_topk':
+                            self.result_queue.put(self._get_topk(hdf_file))
+                        case 'set_topk':
+                            self._set_topk(hdf_file, data)
+
+                        case 'get_dataset_attr':
+                            self.result_queue.put(self._get_attr(hdf_file, data))
+                        case 'set_dataset_attr':
+                            self._set_attr(hdf_file, data[0], data[1])
+
+                        case 'has_data':
+                            self.result_queue.put(self._has_data(hdf_file))
+
+                    if self.queue.empty():
+                        self.done_everything.set()
+                        
+
+        try:
+            _main_loop()
+        except Exception as e:
+            pass
+        finally:
+            _handle_exit(None, None)
+
 
 
     def _get_attr(self, hdf_file: h5py.File, arg):
@@ -145,8 +189,7 @@ class H5DataManager:
             if name in hdf_file:
                 merged_data, merged_indices = self._merge_data(hdf_file, distribution, id)
                 self._save_data(hdf_file, merged_data, id, merged_indices)
-            else:
-                self._save_data(hdf_file, distribution.distribution, id, distribution.indices, distribution.content_sha)
+            else:                self._save_data(hdf_file, distribution.distribution, id, distribution.indices, distribution.content_sha, distribution.sample)
 
             shd_mem.close()
             shd_mem.unlink()
@@ -222,7 +265,7 @@ class H5DataManager:
         for distribution in batch:
             shd_mem = distribution.from_shd_mem()
 
-            self._save_data(hdf_file, distribution.distribution, distribution.origin_convo_id, distribution.indices, distribution.content_sha)
+            self._save_data(hdf_file, distribution.distribution, distribution.origin_convo_id, distribution.indices, distribution.content_sha, distribution.sample)
 
             shd_mem.close()
             shd_mem.unlink()
@@ -241,7 +284,7 @@ class H5DataManager:
                 hdf_file[group_key].attrs['content_sha'] = sha
 
 
-    def _save_data(self, hdf_file: h5py.File, data: np.ndarray, convo_id: int, indices: np.ndarray, content_sha: str):
+    def _save_data(self, hdf_file: h5py.File, data: np.ndarray, convo_id: int, indices: np.ndarray, content_sha: str, sample: dict = {}):
         group_key = f'convo_{convo_id}'
         compression_opts = 6
 
@@ -253,6 +296,9 @@ class H5DataManager:
 
         if content_sha is not None:
             group.attrs['content_sha'] = content_sha
+
+        if sample is not None:
+            group.attrs['sample'] = sample
 
         # Create or replace the dataset for data
         if self.distr_key in group:
@@ -504,8 +550,11 @@ class H5DataManager:
         """
         Safely closes the HDF5 file and stops the loading process.
         """
-        if self.loading_process.is_alive():
-            self.loading_process.terminate()
+        if self.loading_process.is_alive() and not self.closing.is_set():
+            self.closing.set()
+            self.done_everything.wait()
+            self.loading_process.kill()
+            self.loading_process.join()
         
 
     def __del__(self):

@@ -96,5 +96,9 @@ def convert_model(pytorch_folder):
     else:
         convert_files(pytorch_folder, safetensors_folder)
 
-    shutil.rmtree(pytorch_folder)  # Remove the directory and its contents
+    try:
+        shutil.rmtree(pytorch_folder)  # Remove the directory and its contents
+    except:
+        print(f"Failed to remove {pytorch_folder} after conversion to safetensors format. Please remove it manually.")
+
     return safetensors_folder

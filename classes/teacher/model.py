@@ -30,6 +30,7 @@ class TeacherModel(BaseModel):
         self.batch_creator: multiprocessing.Process = None
         self.result_processor: multiprocessing.Process = None
         self.inference_workers: list[multiprocessing.Process] = []
+        self.progress_bar: tqdm = None
 
     def process_chunk(self, reserve_vram_gb: list[float] = [], num_inference_workers: int = 1, ids_to_collect: list = [], data_manager = None, validation: bool = False):
         self._sort_datasets_by_len()
@@ -92,7 +93,6 @@ class TeacherModel(BaseModel):
         self.stop_id = 0
         self.dataset_sorted = False
         self.validation_dataset_sorted = False
-        gc.collect()
     
     def _start_workers(self, done_chunk, num_inference_workers, made_distributions, model_loaded, start_inference, inference_queue, result_queue, disk_queue, pbar_queue, dataset_chunk: list[ConvoTokenized]):
         self.progress_bar.set_postfix_str(f"Starting workers for {self.model_name[:20]}...")
@@ -140,6 +140,7 @@ class TeacherModel(BaseModel):
 
     def close(self):
         self._unload_full()
+        
         if self.progress_bar is not None:
             self.progress_bar.close()
         torch.cuda.empty_cache()
