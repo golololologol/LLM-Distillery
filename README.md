@@ -1,2 +1,2 @@
-# LLM-distillation
-[See Wiki for installation instructions](https://github.com/golololologol/LLM-distillation/wiki)
+# LLM-Distillery
+[See Wiki for installation instructions](https://github.com/golololologol/LLM-Distillery/wiki)
