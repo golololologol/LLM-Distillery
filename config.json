@@ -1,0 +1,63 @@
+{
+    "max_cache_size_gb": 320,
+    "cache_folder": "C:\\Users\\PC\\Desktop\\cache3",
+
+    "dataset_path": "C:\\Users\\PC\\Downloads\\Converted_conv_main.jsonl",
+    "validation_dataset_path": "C:\\Users\\PC\\Converted_val_completion.jsonl",
+    "teacher_models_folder": "C:\\Users\\PC\\Desktop\\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T",
+    "student_path": "C:\\Users\\PC\\Desktop\\TinyLlama-1.1B-intermediate-step-1195k-token-2.5T",
+
+    "ignore_model_type": true,
+    "rebase_dataset": false,
+    "use_teachers": true,
+
+    "context_len": 2048,
+    "save_sys_range": true,
+    "save_user_range": true,
+    "save_assistant_range": true,
+    "crop_distr_to_size": 32000,
+    "enable_topK": true,
+    "save_topK": 400,
+    "device": "cuda:0",
+
+    "num_inference_workers": 1,
+    "reserve_vram": [0.5, 0.5],
+
+    "num_epochs": 1,
+    "num_warmup_steps": 200,
+    "batch_size": 4,
+    "grad_accum_batches": 4,
+    "grad_checkpointing": false,
+    "temperature": 1,
+    "lr": 1e-5,
+    "decay_start": 0.9,
+    "alpha": 2,
+    "lr_scheduler": "wsd",
+    "optimizer": "adamw",
+    "data_order": "sorted",
+    "training_precision": "bf16",
+    "validate_every_n_epochs": 0.5,
+    "save_student_every_n_epochs": 4,
+    
+    "num_gpu0_layers": 9,
+    "device_map": "custom",
+    "max_memory": {
+        "0": "40GB",
+        "cpu": "200GB"
+    }, 
+    "multi_gpu": true,
+    "save_final_state": false,
+    "use_flash_attn_2": true,
+    "wandb_comment": "FFT",
+
+    "freeze_layers": [".block_sparse_moe.gate"],
+    "add_bos": true,
+    "prompt_format": {
+        "SYS_START": "#System:\\n",
+        "USER_START": "#User:\\n",
+        "ASSISTANT_START": "#AI:\\n",
+        "SYS_END": "\\n\\n",
+        "USER_END": "\\n\\n",
+        "ASSISTANT_END": "\\n\\n"
+    }
+}

@@ -1,9 +1,10 @@
-import json
-import os
+from safetensors.torch import load_file, save_file
+from collections import defaultdict
 import shutil
 import torch
-from collections import defaultdict
-from safetensors.torch import load_file, save_file
+import json
+import os
+
 
 def shared_pointers(tensors):
     ptrs = defaultdict(list)
@@ -11,11 +12,13 @@ def shared_pointers(tensors):
         ptrs[v.data_ptr()].append(k)
     return [names for names in ptrs.values() if len(names) > 1]
 
+
 def check_file_size(sf_filename, pt_filename):
     sf_size = os.stat(sf_filename).st_size
     pt_size = os.stat(pt_filename).st_size
     if (sf_size - pt_size) / pt_size > 0.01:
         raise RuntimeError(f"File size difference exceeds 1% between {sf_filename} and {pt_filename}")
+
 
 def convert_file(pt_filename, sf_filename, copy_add_data=True):
     source_folder = os.path.dirname(pt_filename)
@@ -40,8 +43,10 @@ def convert_file(pt_filename, sf_filename, copy_add_data=True):
         if not torch.equal(v, reloaded[k]):
             raise RuntimeError(f"Mismatch in tensors for key {k}.")
 
+
 def rename(pt_filename):
     return pt_filename.replace("pytorch_model", "model").replace(".bin", ".safetensors")
+
 
 def copy_additional_files(source_folder, dest_folder):
     for file in os.listdir(source_folder):
@@ -49,11 +54,13 @@ def copy_additional_files(source_folder, dest_folder):
         if os.path.isfile(file_path) and not (file.endswith('.bin') or file.endswith('.py') or file.endswith('.git')):
             shutil.copy(file_path, dest_folder)
 
+
 def find_index_file(source_folder):
     for file in os.listdir(source_folder):
         if file.endswith('.bin.index.json'):
             return file
     return None
+
 
 def convert_files(source_folder, dest_folder):
     index_file = find_index_file(source_folder)
@@ -75,6 +82,7 @@ def convert_files(source_folder, dest_folder):
         new_map = {k: rename(v) for k, v in index_data["weight_map"].items()}
         json.dump({**index_data, "weight_map": new_map}, f, indent=4)
 
+
 def convert_model(pytorch_folder):
     model_name = os.path.basename(os.path.normpath(pytorch_folder))
     print(f"Converting {model_name} to SafeTensors format...")
@@ -87,4 +95,6 @@ def convert_model(pytorch_folder):
         convert_file(os.path.join(pytorch_folder, "pytorch_model.bin"), os.path.join(safetensors_folder, "model.safetensors"), copy_add_data=True)
     else:
         convert_files(pytorch_folder, safetensors_folder)
+
+    shutil.rmtree(pytorch_folder)  # Remove the directory and its contents
     return safetensors_folder
