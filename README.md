@@ -1,1 +1,1 @@
-# LLM-distillation
+# LLMDistillery
