@@ -3,8 +3,6 @@ from multiprocessing import shared_memory
 from multiprocessing import get_context
 import multiprocessing
 import numpy as np
-import signal
-import tables
 import torch
 import time
 import h5py
