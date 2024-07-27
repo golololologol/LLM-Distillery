@@ -6,6 +6,8 @@ Main features:
 * Single and Multi-Teacher distillation
 * Distillation on instruct and completion text
 * Offline distillation: collects the dataset, and only then trains (Yes, you can share the collected datasets)
+* Windows and Linux support
+* Automatic hdf5 dataset synchronization, with continued collection after force-exit
 * Lots of knobs to tweak! From temperature to the device mapping strategy
 * And a lot more!
   
