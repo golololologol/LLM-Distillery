@@ -15,7 +15,7 @@ Main features:
 [See Wiki for installation instructions](https://github.com/golololologol/LLM-Distillery/wiki)
 
 # Contributions
-Big thanks to [kalomaze](https://github.com/kalomaze) for keeping me sane while I was building this project!\
+Big thanks to [kalomaze](https://github.com/kalomaze) for help and keeping me sane while I was building this project!\
 Also, thanks to [AlpinDale](https://github.com/AlpinDale) for giving access to compute during the development!
  
 If you want to contribute to this project, feel free!\
