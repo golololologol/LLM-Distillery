@@ -1,15 +1,22 @@
+from multiprocessing.managers import SharedMemoryManager
 import torch
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM, LlamaTokenizer, AutoConfig
 import math
 import torch.nn.functional as F
+import joblib
 import json
 import nvidia_smi
+import time
 import codecs
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config, ExLlamaV2Cache, ExLlamaV2
 from tqdm import tqdm
 from collections import defaultdict
+import subprocess
+import os
 import multiprocessing as mp
+from multiprocessing.managers import SharedMemoryManager
+from multiprocessing.shared_memory import ShareableList
 
 # init cuda
 if not torch.cuda.is_initialized():
@@ -529,32 +536,33 @@ def truncated_kldiv(student_probs, teacher_probs):
 #KL_div = F.kl_div(student_logprobs, teacher_logprobs, reduction='batchmean', log_target=True)
 #
 #print(KL_div)
+#
+#
+## Given data and indices tensors
+#data = torch.tensor([[0.123, 24.3, 9.4], [0.62, 0.121, 53.23]])
+#indices = torch.tensor([[6, 95, 2124], [934, 953, 11]])
+#
+## Sequence of IDs you want to retrieve
+#sequence = torch.tensor([411, 11])
+#
+## Flatten the data and indices tensors
+#flat_data = data.flatten()
+#flat_indices = indices.flatten()
+#
+## Create a sparse tensor
+#sparse_indices = flat_indices.unsqueeze(0)
+#sparse_data = flat_data
+#sparse_tensor = torch.sparse_coo_tensor(sparse_indices, sparse_data)
+#
+## Function to retrieve values from the sequence
+#def retrieve_values(sequence, sparse_tensor):
+#    dense_lookup = sparse_tensor.to_dense()
+#    result = torch.zeros(sequence.size(), dtype=dense_lookup.dtype)
+#    valid_indices = sequence < dense_lookup.size(0)
+#    result[valid_indices] = dense_lookup[sequence[valid_indices]]
+#    return result
+#
+## Retrieve the correct values
+#retrieved_values = retrieve_values(sequence, sparse_tensor)
+#print(retrieved_values)
 
-
-# Given data and indices tensors
-data = torch.tensor([[0.123, 24.3, 9.4], [0.62, 0.121, 53.23]])
-indices = torch.tensor([[6, 95, 2124], [934, 953, 11]])
-
-# Sequence of IDs you want to retrieve
-sequence = torch.tensor([411, 11])
-
-# Flatten the data and indices tensors
-flat_data = data.flatten()
-flat_indices = indices.flatten()
-
-# Create a sparse tensor
-sparse_indices = flat_indices.unsqueeze(0)
-sparse_data = flat_data
-sparse_tensor = torch.sparse_coo_tensor(sparse_indices, sparse_data)
-
-# Function to retrieve values from the sequence
-def retrieve_values(sequence, sparse_tensor):
-    dense_lookup = sparse_tensor.to_dense()
-    result = torch.zeros(sequence.size(), dtype=dense_lookup.dtype)
-    valid_indices = sequence < dense_lookup.size(0)
-    result[valid_indices] = dense_lookup[sequence[valid_indices]]
-    return result
-
-# Retrieve the correct values
-retrieved_values = retrieve_values(sequence, sparse_tensor)
-print(retrieved_values)

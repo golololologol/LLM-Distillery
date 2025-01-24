@@ -187,7 +187,7 @@ def rewrite_custom(input_path, output_path, dataset_name, sort): # used to updat
             sample = json.loads(line.strip())
             
             sys = sample.get('init', "")
-            source = sample.get('source', "")
+            source = sample.get('source', dataset_name)
             tags = sample.get('tags', [])
             reversed = "reversed" in tags or sample.get('reversed', False)
             turns = []
@@ -218,7 +218,7 @@ def rewrite_custom(input_path, output_path, dataset_name, sort): # used to updat
 
         write_records(samples, outfile, sort)
 
-input_file_path = r"C:\Users\PC\Downloads\converted_native_8k_EDU.jsonl"
+input_file_path = r"E:\docs save\distil_dataset_v1.jsonl"
 path = os.path.dirname(input_file_path)
 name = os.path.basename(input_file_path).split('.')[0]
 output_file_path = os.path.join(path, f"Converted_{name}.jsonl")

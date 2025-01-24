@@ -2,6 +2,7 @@ from utils.dataset_utils import tokenize_dataset
 from classes.teacher.model import TeacherModel
 from classes.student.model import StudentModel
 from classes.data_manager import H5DataManager
+from joblib import Parallel, delayed
 from classes.paths import Paths
 from tqdm import tqdm
 import multiprocessing
@@ -16,6 +17,9 @@ import os
 nvidia_smi.nvmlInit()
     
 def calculate_loop_ids(student: StudentModel, max_cache_size_gb, enable_topK, save_topK):
+    """
+    Computes loop-based distribution IDs for later usage.
+    """
     if enable_topK:
         kb_per_distr_val = (0.001953125 * 3) / 1.7 # storage of one FP16 value * 3 (for int32 index) / 1.7 (avg compression ratio)
         distr_size_kb = kb_per_distr_val * save_topK
@@ -49,6 +53,9 @@ def calculate_loop_ids(student: StudentModel, max_cache_size_gb, enable_topK, sa
 
 
 def get_teachers(models_folder, use_teachers: bool) -> list[TeacherModel]:
+    """
+    Loads teacher models if use_teachers is True, else returns an empty list.
+    """
     teachers = []
 
     if not use_teachers:
@@ -74,6 +81,9 @@ def get_teachers(models_folder, use_teachers: bool) -> list[TeacherModel]:
             
 
 def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel, use_teachers: bool):
+    """
+    Ensures that teachers and student share tokenization settings before finetuning.
+    """
     if not use_teachers:
         return
     
@@ -92,12 +102,20 @@ def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel, us
         
 
 def prepare_datasets(dataset_path, data_manager: H5DataManager, validation_dataset_path, validation_data_manager: H5DataManager, teachers: list[TeacherModel], student: StudentModel, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type, use_teachers):
+    """
+    Prepares and tokenizes the training/validation datasets, optionally ignoring certain model types.
+    """
     print("Preparing datasets for the student...")
+
+    all_not_add_bos = False
+    if not student.add_bos and all(not teacher.add_bos for teacher in teachers):
+        all_not_add_bos = True
+    
     student.dataset, relevant_ids = tokenize_dataset(
-        dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type)
+        dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type, all_not_add_bos)
 
     student.validation_dataset, relevant_ids_val = tokenize_dataset(
-        validation_dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type)
+        validation_dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type, all_not_add_bos)
 
     teachers_ids = set()
     teachers_ids_val = set()
@@ -105,10 +123,10 @@ def prepare_datasets(dataset_path, data_manager: H5DataManager, validation_datas
     for teacher in teachers:
         print(f"Preparing datasets for {teacher.model_name}...")
         teacher.dataset, teacher_ids = tokenize_dataset(
-            dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, teacher, ignore_model_type)
+            dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, teacher, ignore_model_type, all_not_add_bos)
 
         teacher.validation_dataset, teacher_ids_val = tokenize_dataset(
-            validation_dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, teacher, ignore_model_type)
+            validation_dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, teacher, ignore_model_type, all_not_add_bos)
         
         teachers_ids.update(teacher_ids)
         teachers_ids_val.update(teacher_ids_val)
@@ -140,6 +158,9 @@ def prepare_datasets(dataset_path, data_manager: H5DataManager, validation_datas
     
 
 def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str, save_topK: int, enable_topK: bool):
+    """
+    Configures model parameters (e.g., temperature, device).
+    """
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
@@ -156,7 +177,9 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
 
 def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs, 
                         save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers, use_flash_attn_2):
-    
+    """
+    Configures and schedules all essential training hyperparameters.
+    """
     student.num_epochs = num_epochs
     student.eff_batch_size = grad_accum_batches * student.batch_size
     student.num_warmup_steps = math.ceil(num_warmup_steps / student.eff_batch_size)
@@ -186,44 +209,66 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
 
 
 def calculate_sync(student_dataset, data_manager: H5DataManager, student_vocab_family: str):
+    """
+    Keeps the datasets in sync by removing or renaming mismatched IDs, and telling which IDs to collect.
+    """
     def check_shas(disk_sha: dict[str, str], current_sha: dict[str, str]):
         # Create reverse mappings from SHA to set of IDs
         sha_to_ids1 = {}
         sha_to_ids2 = {}
+
         for id1, sha1 in disk_sha.items():
             sha_to_ids1.setdefault(sha1, set()).add(id1)
+
         for id2, sha2 in current_sha.items():
             sha_to_ids2.setdefault(sha2, set()).add(id2)
 
         ids_to_remove = []
         ids_to_collect = []
         ids_to_rename = {}
-
+        
         # Process SHAs to align both datasets
+        pbar = tqdm(total=len(disk_sha) + len(current_sha), desc="Checking SHAs", leave=False, postfix="Calculating sync...")
         all_shas = set(sha_to_ids1.keys()).union(set(sha_to_ids2.keys()))
-        for sha in all_shas:
+        
+        def process_sha(sha):
+            local_ids_to_remove = []
+            local_ids_to_collect = []
+            local_ids_to_rename = {}
             ids1 = sha_to_ids1.get(sha, set())
             ids2 = sha_to_ids2.get(sha, set())
 
             if len(ids1) > len(ids2):
                 surplus = len(ids1) - len(ids2)
-                ids_to_remove.extend(list(ids1)[:surplus])
-                ids1 = ids1 - set(ids_to_remove)
+                local_ids_to_remove.extend(list(ids1)[:surplus])
+                ids1 = ids1 - set(local_ids_to_remove)
 
             if len(ids2) > len(ids1):
                 missing = len(ids2) - len(ids1)
-                ids_to_collect.extend(list(ids2)[:missing])
-                ids2 = ids2 - set(ids_to_collect)
+                local_ids_to_collect.extend(list(ids2)[:missing])
+                ids2 = ids2 - set(local_ids_to_collect)
 
             ids1 = list(ids1)
             ids2 = list(ids2)
             for id1, id2 in zip(ids1, ids2):
                 if id1 != int(id2):
-                    ids_to_rename[id1] = id2
+                    local_ids_to_rename[id1] = id2
+
+            return local_ids_to_collect, local_ids_to_rename, local_ids_to_remove
+
+        results = Parallel(n_jobs=-1, prefer='threads')(delayed(process_sha)(sha) for sha in all_shas)
+        
+        for collect, rename, remove in results:
+            ids_to_collect.extend(collect)
+            ids_to_rename.update(rename)
+            ids_to_remove.extend(remove)
+            pbar.update()
+        
+        pbar.close()
 
         return ids_to_collect, ids_to_rename, ids_to_remove
 
-    def get_collection_info(current_shas, data_manager: H5DataManager, student_vocab_family: str):
+    def get_collection_info(current_shas: dict[str: str], data_manager: H5DataManager, student_vocab_family: str):
         disk_shas = data_manager.get_available_shas()
         data_manager_vocab_family = data_manager.get_vocab_family()
 
@@ -236,7 +281,7 @@ def calculate_sync(student_dataset, data_manager: H5DataManager, student_vocab_f
 
         return check_shas(disk_shas, current_shas)
 
-    current_shas = {f"{convo.origin_convo_id}": convo.content_sha for convo in student_dataset}
+    current_shas:dict[str, str] = {f"{convo.origin_convo_id}": convo.content_sha for convo in student_dataset}
 
     ids_collect, ids_rename, ids_remove = get_collection_info(current_shas, data_manager, student_vocab_family)
 
@@ -400,6 +445,9 @@ def handle_termination(signum, frame):
         for teacher in teachers:
             teacher.close()
 
+    if student is not None:
+        student.close()
+
     os._exit(0)
 
 
@@ -482,8 +530,8 @@ def main():
     student = StudentModel(student_path, paths, add_bos, prompt_format, batch_size)
 
     print("Launching data managers...")
-    data_manager = H5DataManager(paths.dataset, device)
-    validation_data_manager = H5DataManager(paths.dataset_validation, device)
+    data_manager = H5DataManager(paths.dataset, device, manager_name="main")
+    validation_data_manager = H5DataManager(paths.dataset_validation, device, manager_name="validation")
     
     ensure_compatibility(teachers, student, use_teachers)
     prepare_datasets(dataset_path, data_manager, validation_dataset_path, validation_data_manager, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range,

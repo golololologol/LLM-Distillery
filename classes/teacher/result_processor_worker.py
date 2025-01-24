@@ -1,12 +1,11 @@
 from classes.data_classes import Distribution
 from multiprocessing import shared_memory
 from numpy import ndarray
-from tqdm import tqdm
 import numpy as np
 import signal
 
 
-def _result_processor_worker(result_queue, made_distributions, done_chunk_writes, disk_queue, pbar_queue: tqdm, max_queue_size: int, num_inference_workers: int):
+def _result_processor_worker(result_queue, made_distributions, done_chunk_writes, disk_queue, pbar_queue, max_queue_size: int, num_inference_workers: int):
     def _signal_handler(signum, frame):
         while not result_queue.empty():
             result_queue.get()
@@ -67,7 +66,6 @@ def _result_processor_worker(result_queue, made_distributions, done_chunk_writes
         made_distributions.wait()
         while not result_queue.empty():
             shd_mem_name, batch_logp_shape, batch_logp_dtype, batch_distributions, indices_np = result_queue.get()
-            result_queue.task_done()
 
             if batch_distributions is None:
                 num_inference_exits += 1

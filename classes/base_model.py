@@ -1,12 +1,10 @@
-from utils.vocab_utils import get_vocab_family
 from utils.convert_to_safetensor import convert_model
 from classes.data_classes import ConvoTokenized
+from utils.vocab_utils import get_vocab_family
 from transformers import AutoTokenizer
 from typing import Optional
 from tqdm import tqdm
-import numpy as np
 import codecs
-import torch
 import json
 import os
 
@@ -183,6 +181,24 @@ class BaseModel:
         self.seq_chunk_len = config.get('seq_chunk_len', 256)
         self.vocab_family = get_vocab_family(model_path=self.model_path)
     
+    def _write_convo_to_file(self, file, file_content, convo, tokenizer):
+        convo_dict = {
+            "tokenized": convo.tokenized.tolist(),
+            "decoded": [tokenizer.decode(convo.tokenized)],
+            "content_ranges": convo.content_ranges,
+            "content_indices": [list(range(start, end)) for start, end in convo.content_ranges],
+            "content_decoded": [tokenizer.decode(convo.tokenized[start:end]) for start, end in convo.content_ranges],
+            "padding": convo.padding,
+            "cropped_end": convo.cropped_end,
+            "origin_convo_id": convo.origin_convo_id
+        }
+
+        content_convo_dict = convo_dict.copy()
+        content_convo_dict.pop("tokenized")
+
+        file.write(json.dumps(convo_dict, ensure_ascii=False) + "\n")
+        file_content.write(json.dumps(content_convo_dict, ensure_ascii=False) + "\n")
+
     def write_dataset_to_file(self, folder: str):
         tokenizer = AutoTokenizer.from_pretrained(self.model_path)
         path = os.path.join(folder, "tokenized_dataset.jsonl")
@@ -190,22 +206,7 @@ class BaseModel:
         with open(path, 'w', encoding='utf-8') as file:
             with open(path_content, 'w', encoding='utf-8') as file_content:
                 for convo in tqdm(self.dataset, desc="Writing dataset to file"):
-                    convo_dict = {
-                        "tokenized": convo.tokenized.tolist(),
-                        "decoded": [tokenizer.decode(convo.tokenized)],
-                        "content_ranges": convo.content_ranges,
-                        "content_indices": [list(range(start, end)) for start, end in convo.content_ranges],
-                        "content_decoded": [tokenizer.decode(convo.tokenized[start:end]) for start, end in convo.content_ranges],
-                        "padding": convo.padding,
-                        "cropped_end": convo.cropped_end,
-                        "origin_convo_id": convo.origin_convo_id
-                    }
-
-                    content_convo_dict = convo_dict.copy()
-                    content_convo_dict.pop("tokenized")
-
-                    file.write(json.dumps(convo_dict, ensure_ascii=False) + "\n")
-                    file_content.write(json.dumps(content_convo_dict, ensure_ascii=False) + "\n")
+                    self._write_convo_to_file(file, file_content, convo, tokenizer)
 
     def write_validation_dataset_to_file(self, folder: str):
         tokenizer = AutoTokenizer.from_pretrained(self.model_path)
@@ -214,20 +215,5 @@ class BaseModel:
         with open(path, 'w', encoding='utf-8') as file:
             with open(path_content, 'w', encoding='utf-8') as file_content:
                 for convo in tqdm(self.validation_dataset, desc="Writing validation dataset to file"):
-                    convo_dict = {
-                        "tokenized": convo.tokenized.tolist(),
-                        "decoded": [tokenizer.decode(convo.tokenized)],
-                        "content_ranges": convo.content_ranges,
-                        "content_indices": [list(range(start, end)) for start, end in convo.content_ranges],
-                        "content_decoded": [tokenizer.decode(convo.tokenized[start:end]) for start, end in convo.content_ranges],
-                        "padding": convo.padding,
-                        "cropped_end": convo.cropped_end,
-                        "origin_convo_id": convo.origin_convo_id
-                    }
-
-                    content_convo_dict = convo_dict.copy()
-                    content_convo_dict.pop("tokenized")
-
-                    file.write(json.dumps(convo_dict, ensure_ascii=False) + "\n")
-                    file_content.write(json.dumps(content_convo_dict, ensure_ascii=False) + "\n")
+                    self._write_convo_to_file(file, file_content, convo, tokenizer)
 

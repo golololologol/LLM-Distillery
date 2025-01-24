@@ -1,7 +1,8 @@
 import pandas as pd
-import json
-import base64
 import numpy as np
+import base64
+import json
+
 
 def convert_parquet_to_jsonl(parquet_path):
     jsonl_path = parquet_path.replace('.parquet', '.jsonl')

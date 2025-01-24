@@ -47,14 +47,14 @@ class Paths:
         return os.path.exists(os.join(self.dataset_validation, "distributions.hdf5"))
 
     def empty_folder(self, folder: str):
-        if not os.path.exists(folder):
+        folder_path = pathlib.Path(folder)
+        if not folder_path.exists():
             return
-        for file in os.listdir(folder):
-            file_path = os.path.join(folder, file)
-            if os.path.isdir(file_path):
-                shutil.rmtree(file_path)
+        for file in folder_path.iterdir():
+            if file.is_dir():
+                shutil.rmtree(file)
             else:
-                pathlib.Path(file_path).unlink()
+                file.unlink()
 
     def empty_dataset(self):
         self.empty_folder(self.dataset)
