@@ -13,9 +13,11 @@ import os
 
 class H5DataManager:
     """
-    DataManager class for handling the distribution data in a HDF5 file.
-    It is asynchronous and uses multiprocessing to handle the data loading and saving.
+    DataManager class for handling the distribution data in a HDF5 file.\\
+    It is asynchronous and uses multiprocessing to handle the data loading and saving.\\
     This class is designed to be used with the `Distribution` class from `classes/data_classes.py`.
+    
+    Note: If multiple teachers were used, logsoftmax the distributions before usage in training.
     """
     def __init__(self, dataset_path, device, max_queue_size=7, manager_name=""):
         self.file_path = os.path.join(dataset_path, "distributions.hdf5")

@@ -558,7 +558,7 @@ def main():
 
         validation_data_manager.set_vocab_family(student.vocab_family)
 
-        for teacher in teachers:
+        for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False, disable=len(teachers) == 1):
             teacher.process_chunk(reserve_vram, num_inference_workers, data_manager=validation_data_manager, ids_to_collect=ids_collect_val, validation=True)
     
     else:
@@ -576,7 +576,7 @@ def main():
             topk_to_use = check_topk(data_manager, enable_topK, save_topK)
             update_teachers_param(teachers, "topK", topk_to_use)
 
-            for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):
+            for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False, disable=len(teachers) == 1):
                 teacher.process_chunk(reserve_vram, num_inference_workers, ids_to_collect=ids_collect, data_manager=data_manager)
 
             student.train_chunk(data_manager, validation_data_manager, full_collect)
