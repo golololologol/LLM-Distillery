@@ -2,11 +2,17 @@ import pandas as pd
 import numpy as np
 import base64
 import json
+import glob
+import os
 
+def convert_parquet_to_jsonl(parquet_pattern):
+    files = sorted(glob.glob(parquet_pattern))
+    if not files:
+        raise FileNotFoundError(f"No files found for pattern: {parquet_pattern}")
 
-def convert_parquet_to_jsonl(parquet_path):
-    jsonl_path = parquet_path.replace('.parquet', '.jsonl')
-    df = pd.read_parquet(parquet_path)
+    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
+
+    jsonl_path = os.path.splitext(files[-1])[0].replace('-00000-of', '') + '.jsonl'
     
     def handle_item(item):
         if isinstance(item, bytes):
@@ -34,6 +40,17 @@ def convert_parquet_to_jsonl(parquet_path):
             json_string = json.dumps(corrected_row, ensure_ascii=False)
             file.write(json_string + '\n')
 
-parquet_file_path = r"C:\Users\PC\Downloads\en-00000-of-00001-6291ef0dc79c47ed.parquet"
-convert_parquet_to_jsonl(parquet_file_path)
-print('Conversion complete.')
+    with open(jsonl_path, 'r', encoding='utf-8') as file:
+        sample = json.loads(file.readline())
+        def crop_value(val, max_len=50):
+            return val[:max_len] if isinstance(val, str) and len(val) > max_len else val
+        dataset_format = "\n ".join([f"{key}: {crop_value(sample[key])}" for key in sample.keys()])
+        
+    return dataset_format
+
+
+# replace the name of the parquet file with the pattern, e.g. from 'train-00000-of-00001.parquet' to 'train-*.parquet'
+parquet_pattern = r"C:\Users\User\Downloads\train-*.parquet"
+dataset_format = convert_parquet_to_jsonl(parquet_pattern)
+print("Conversion complete.")
+print(f"Dataset format:\n{dataset_format}")
