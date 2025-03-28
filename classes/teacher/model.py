@@ -1,11 +1,12 @@
-import multiprocessing.spawn
 from classes.teacher.batch_creator_worker import _batch_creator_worker
 from classes.teacher.inference_worker import _inference_worker
 from classes.teacher.result_processor_worker import _result_processor_worker
 from classes.data_classes import ConvoTokenized
+from classes.data_manager import H5DataManager
 from classes.base_model import BaseModel
 from multiprocessing import get_context
 from tqdm import tqdm
+import multiprocessing.spawn
 import multiprocessing
 import nvidia_smi
 import torch
@@ -32,7 +33,7 @@ class TeacherModel(BaseModel):
         self.inference_workers: list[multiprocessing.Process] = []
         self.progress_bar: tqdm = None
 
-    def process_chunk(self, reserve_vram_gb: list[float] = [], num_inference_workers: int = 1, ids_to_collect: list = [], data_manager = None, validation: bool = False):
+    def process_chunk(self, reserve_vram_gb: list[float] = [], num_inference_workers: int = 1, ids_to_collect: list = [], data_manager: H5DataManager = None, validation: bool = False):
         self._sort_datasets_by_len()
 
         dataset_chunk = (self.validation_dataset if validation else self.dataset)
@@ -55,7 +56,7 @@ class TeacherModel(BaseModel):
 
             while True:
                 self._manage_queues(pbar_queue)
-                if done_chunk.is_set() and self.data_manager.queue.empty() and pbar_queue.empty():
+                if done_chunk.is_set() and self.data_manager.done_everything.is_set() and pbar_queue.empty():
                     break
 
             self.data_manager.done_everything.wait()

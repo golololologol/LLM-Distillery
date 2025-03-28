@@ -6,7 +6,8 @@ import torch
 
 class Distribution:
     """
-    Class for probability distribution data.
+    Holds probability distribution data and manages shared memory usage
+    for storing large arrays across processes.
     """
     def __init__(self, origin_convo_id: int, length: int = 0, cropped_end: bool = False, content_ranges: list[tuple[int, int]] = [], tokenized: ndarray = None, content_sha: str = "", sample: str = ""):
         self.distribution: ndarray|torch.Tensor = None

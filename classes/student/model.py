@@ -1,15 +1,14 @@
 from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_divergence
-from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from classes.data_classes import ConvoTokenized
 from classes.data_manager import H5DataManager
+from transformers import BitsAndBytesConfig
 from multiprocessing import shared_memory
 from classes.base_model import BaseModel
 from classes.losses import Losses
 from classes.paths import Paths
 from typing import Optional
 from tqdm import tqdm
-import torch.nn.functional as F
 import numpy as np
 import torch
 import wandb
@@ -137,6 +136,18 @@ class StudentModel(BaseModel):
             device_map = self.device_map_name if self.multi_gpu else self.device
 
         use_bnb_quant = self.training_precision_name == "4bit" or self.training_precision_name == "8bit"
+        bnb_config = None
+        
+        if use_bnb_quant:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=self.training_precision_name == "4bit",
+                load_in_8bit=self.training_precision_name == "8bit",
+                bnb_4bit_compute_dtype=train_precision,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+        
+        
         num_gpus = torch.cuda.device_count()
         max_memory = self.max_memory if len(self.max_memory) == num_gpus else None
 
@@ -145,9 +156,8 @@ class StudentModel(BaseModel):
                 path,
                 device_map="auto",
                 torch_dtype=train_precision if not use_bnb_quant else None,
-                load_in_4bit=self.training_precision_name == "4bit",
-                load_in_8bit = self.training_precision_name == "8bit",
-                max_memory = max_memory
+                max_memory=max_memory,
+                quantization_config=bnb_config
                 )
 
             layer_names = list(model.hf_device_map.keys())
@@ -183,10 +193,9 @@ class StudentModel(BaseModel):
 
         self.model = AutoModelForCausalLM.from_pretrained(
             path,
-            device_map=device_map,
+            device_map=device_map if self.multi_gpu else self.device,
             torch_dtype=train_precision if not use_bnb_quant else None,
-            load_in_4bit=self.training_precision_name == "4bit",
-            load_in_8bit = self.training_precision_name == "8bit",
+            quantization_config=bnb_config,
             attn_implementation="flash_attention_2" if self.use_fa2 else "sdpa",
             max_memory = max_memory
         )
@@ -247,6 +256,17 @@ class StudentModel(BaseModel):
         elif self.data_order == "native":
             self.dataset_sorted = True
 
+    def _save_model(self, step: int|str):
+        self._set_postfix(f"Saving model at step {step}...")
+
+        folder_name = f"{self.model_name}_step_{step}"
+
+        self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
+
+        self.tokenizer.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
+
+        self._release_postfix()
+
     def _save_state(self):
         self._set_postfix("Saving state...")
 
@@ -256,17 +276,6 @@ class StudentModel(BaseModel):
         torch.save(self.model.state_dict(), os.path.join(self.paths.student_states, "model_state.pt"))
         torch.save(self.optimizer.state_dict(), os.path.join(self.paths.student_states, "optimizer_state.pt"))
         torch.save(self.lr_scheduler.state_dict(), os.path.join(self.paths.student_states, "scheduler_state.pt"))
-
-        self._release_postfix()
-
-    def _save_model(self, step: int|str):
-        self._set_postfix(f"Saving model at step {step}...")
-
-        folder_name = f"{self.model_name}_step_{step}"
-
-        self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
-
-        self.tokenizer.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
 
         self._release_postfix()
 
@@ -343,10 +352,12 @@ class StudentModel(BaseModel):
             self._validate_distillation(validation_data_manager)
         
         # Main training loop
+
+        data_list = self._prefetch_dataset_chunk(data_manager, [], full_collect, trainable_ids)
+
         if full_collect:
             data_manager_left_shuffles = self.num_epochs - 1
-            data_list = self._prefetch_dataset_chunk(data_manager, [], full_collect, trainable_ids)
-                
+            
             for i in range(self.num_epochs):
                 if data_manager_left_shuffles > 0:
                     data_list = self._prefetch_dataset_chunk(data_manager, data_list, full_collect, trainable_ids)
@@ -354,7 +365,6 @@ class StudentModel(BaseModel):
 
                 updated_grads = self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager)
         else:
-            data_list = self._prefetch_dataset_chunk(data_manager, [], full_collect, trainable_ids)
             updated_grads = self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager)
 
         if not updated_grads:
@@ -523,9 +533,6 @@ class StudentModel(BaseModel):
 
     def close(self):
         if self.logger is not None:
-            try:
-                self.logger.finish()
-                del self.logger
-            except:
-                pass
+            self.logger.finish()
+            del self.logger
             

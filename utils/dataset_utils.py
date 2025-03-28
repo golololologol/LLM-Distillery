@@ -1,10 +1,10 @@
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
 from classes.data_classes import ConvoTokenized
 from utils.vocab_utils import get_family_bos_id
 from classes.base_model import BaseModel
 from transformers import AutoTokenizer
 from multiprocessing import cpu_count
+from joblib import Parallel, delayed
 from tqdm import tqdm
 import numpy as np
 import logging
@@ -41,7 +41,7 @@ def read_jsonl(file_path) -> list[dict]:
     return data_list
 
 
-def good_encode(text: str, tokenizer, encode_special=False):
+def good_encode(text: str, tokenizer: ExLlamaV2Tokenizer|AutoTokenizer, encode_special=False):
     if tokenizer.__class__.__name__ != "ExLlamaV2Tokenizer":
         encoded_ids = tokenizer.encode("\n" + text, add_special_tokens=False)[2:]
     else:
@@ -50,6 +50,9 @@ def good_encode(text: str, tokenizer, encode_special=False):
     encoded_text = np.array(encoded_ids, dtype=np.int64)
 
     return encoded_text
+
+
+
 
 
 def encode_prompt_format(prompt_format: dict, tokenizer) -> dict[str, list[int]]:
@@ -61,18 +64,30 @@ def encode_prompt_format(prompt_format: dict, tokenizer) -> dict[str, list[int]]
 
 
 def tokenize_sample(args):
-    convo_id, json_item, tokenizer, pf, bos_token_id, save_sys_range, save_user_range, save_assistant_range, context_len, model_completion, model_student, model_add_bos, ignore_model_type = args
+    # Break out arguments for clarity
+    convo_id, json_item, tokenizer, pf, bos_token_id, save_sys_range, save_user_range, \
+        save_assistant_range, context_len, model_completion, model_student, \
+        model_add_bos, ignore_model_type, all_not_add_bos = args
 
+    # Prepare an array to hold the tokenized conversation
     conversation_tokenized = np.zeros(context_len, dtype=np.int64)
 
-    if model_add_bos and not bos_token_id is None:
+    if model_add_bos and bos_token_id is not None:
+        # If configured, place a BOS token at the start
+        # and adjust indexing for subsequent tokens
         conversation_tokenized[0] = bos_token_id
         num_toks = 1
         start_idx = 0
+        end_crop = 0
     else:
+        # Without BOS, shift the start index and num tokens by 1
+        # and possibly reserve end space to make sure overlength convos
+        # have the same ammount of content tokens regardless of BOS pesence
         num_toks = 0
         start_idx = -1
+        end_crop = 0 if all_not_add_bos else 1
 
+    # Track where specific conversation segments start and end
     conversation_content_ranges = []
     tags = json_item.get("tags", [])
     empty = False
@@ -80,14 +95,16 @@ def tokenize_sample(args):
     student = model_student or ignore_model_type
 
     if completion:
+        # If the conversation is flagged for "completion" usage,
+        # we handle the first conversation turn directly
         if model_completion or student:
             turn = json_item.get("conversations", [""])[0]
             text = turn.get("value", "")
             if text:
-                text_tokenized = good_encode(text.strip(), tokenizer)[:context_len - num_toks]
+                text_tokenized = good_encode(text.strip(), tokenizer)[:context_len - num_toks - end_crop]
                 conversation_tokenized[num_toks:num_toks + len(text_tokenized)] = text_tokenized
+                conversation_content_ranges.append((num_toks, num_toks + len(text_tokenized)))
                 num_toks += len(text_tokenized)
-                conversation_content_ranges.append((0, num_toks))
                 return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
             else:
                 empty = True
@@ -96,8 +113,11 @@ def tokenize_sample(args):
             empty = True
     
     elif model_completion and not student:
+        # If the model is strictly for completion,
+        # and we're not ignoring model type, skip if no "completion" tag
         empty = True
 
+    # If there's no conversation content or we're flagged empty, return
     num_turns = len(json_item["conversations"])
 
     if num_turns == 0:
@@ -109,13 +129,13 @@ def tokenize_sample(args):
 
     sys_content = json_item.get("init", "")
     if sys_content:
+        # Insert system prompt text, wrapping it with SYS_START / SYS_END
         sys_content_tokenized = good_encode(sys_content.strip(), tokenizer)
         sys_tokenized = np.zeros(len(pf['SYS_START']) + len(sys_content_tokenized) + len(pf['SYS_END']), dtype=np.int64)
         sys_tokenized[:len(pf['SYS_START'])] = pf['SYS_START']
         sys_tokenized[len(pf['SYS_START']):len(pf['SYS_START']) + len(sys_content_tokenized)] = sys_content_tokenized
         sys_tokenized[len(pf['SYS_START']) + len(sys_content_tokenized):] = pf['SYS_END']
-        sys_tokenized = sys_tokenized[:context_len - num_toks]
-        conversation_tokenized[num_toks:num_toks + len(sys_tokenized)] = sys_tokenized
+        conversation_tokenized[num_toks:num_toks + len(sys_tokenized)] = sys_tokenized[:context_len - num_toks]
         num_toks += len(sys_tokenized)
         if save_sys_range:
             conversation_content_ranges.append((len(pf['SYS_START']) + start_idx, num_toks - len(pf['SYS_END'])))
@@ -132,6 +152,9 @@ def tokenize_sample(args):
 
         assistant = turn_speaker == "gpt"
 
+        # For each turn in the conversation:
+        # Determine if it's user or assistant,
+        # tokenize, and wrap with start/end tokens
         turn_start_tokenized = pf['ASSISTANT_START'] if assistant else pf['USER_START']
         turn_end_tokenized = pf['ASSISTANT_END'] if assistant else pf['USER_END']
         turn_tokenized = good_encode(turn_text.strip(), tokenizer)
@@ -144,6 +167,7 @@ def tokenize_sample(args):
         end_idx = start_idx + len(full_turn_tokenized)
 
         if (save_assistant_range and assistant) or (save_user_range and not assistant):
+            # save relevant content ranges for later use
             content_start_index = start_idx + len(turn_start_tokenized)
             content_end_index = content_start_index + turn_len + 1
             conversation_content_ranges.append((content_start_index, content_end_index))
@@ -151,23 +175,28 @@ def tokenize_sample(args):
         start_idx = end_idx
 
         if num_toks + len(full_turn_tokenized) > context_len:
-            conversation_tokenized[num_toks:] = full_turn_tokenized[:context_len - num_toks]
-            num_toks = context_len
+            # Stop if adding tokens would exceed the maximum allowed length
+            # and break out of the loop
+            conversation_tokenized[num_toks:context_len - end_crop] = full_turn_tokenized[:context_len - num_toks - end_crop]
+            num_toks = context_len - end_crop
             break
 
+        # Otherwise, place the turn tokens into the main conversation array
         conversation_tokenized[num_toks:num_toks + len(full_turn_tokenized)] = full_turn_tokenized
         num_toks += len(full_turn_tokenized)
     
     if not conversation_content_ranges:
+        # If no ranges were recorded, the conversation ends up empty
         empty = True
         return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
 
     if conversation_content_ranges[0][0] > context_len:
+        # If the first content range is beyond what fits, it's all empty
         empty = True
 
     return convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty
 
-def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, model: BaseModel, ignore_model_type) -> tuple[list[ConvoTokenized], set[int]]:
+def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, model: BaseModel, ignore_model_type, all_not_add_bos) -> tuple[list[ConvoTokenized], set[int]]:
     try:
         config = ExLlamaV2Config()
         config.model_dir = model.model_path
@@ -184,36 +213,48 @@ def tokenize_dataset(dataset_path, context_len, save_sys_range, save_user_range,
     model_completion = model.completion
     model_student = model.student
     model_add_bos = model.add_bos
-    id_to_sample = {}
+    id_to_sample = {convo_id: item for convo_id, item in enumerate(read_jsonl(dataset_path))}
+    num_samples = len(id_to_sample)
+    num_cores = cpu_count()
+    prefer = 'processes' if num_samples > 2048 else 'threads'
+    
+    results = Parallel(n_jobs=num_cores, batch_size=num_samples//num_cores, pre_dispatch=num_samples//10, prefer=prefer, return_as="generator")(
+        delayed(tokenize_sample)(
+            (
+                convo_id, item, tokenizer, pf, bos_token_id, 
+                save_sys_range, save_user_range, save_assistant_range, 
+                context_len, model_completion, model_student, 
+                model_add_bos, ignore_model_type, all_not_add_bos
+            )
+        ) for convo_id, item in id_to_sample.items()
+    )
+    
+    for convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty in tqdm(results, total=num_samples, desc="Tokenizing", unit="convo", leave=False):
+        if empty:
+            continue
 
-    def generate_tasks():
-        for convo_id, item in enumerate(read_jsonl(dataset_path)):
-            id_to_sample[convo_id] = str(item)
-            yield (convo_id, item, tokenizer, pf, bos_token_id, save_sys_range, save_user_range, save_assistant_range, context_len, model_completion, model_student, model_add_bos, ignore_model_type)
+        num_pad_tokens = context_len - num_toks
+        cropped_end = False
 
-    with ThreadPoolExecutor(max_workers=cpu_count()) as executor:
-        futures = {executor.submit(tokenize_sample, task): task for task in generate_tasks()}
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Tokenizing", unit="convo", smoothing=0.06, leave=False):
-            convo_id, conversation_tokenized, conversation_content_ranges, num_toks, empty = future.result()
-            
-            if empty:
-                continue
-
-            num_pad_tokens = context_len - num_toks
-            cropped_end = False
-
-            corrected_content_ranges = []
-            for start, end in conversation_content_ranges:
-                if start > context_len:
-                    break
-                if end > context_len:
-                    end = context_len
-                    cropped_end = True
-                corrected_content_ranges.append((start, end))
-
-            conversation = ConvoTokenized(conversation_tokenized, corrected_content_ranges, num_pad_tokens, cropped_end, convo_id, id_to_sample[convo_id])
-            ids.add(convo_id)
-            dataset.append(conversation)
+        corrected_content_ranges = []
+        for start, end in conversation_content_ranges:
+            if start > context_len:
+                break
+            if end > context_len:
+                end = context_len
+                cropped_end = True
+            corrected_content_ranges.append((start, end))
+        
+        conversation = ConvoTokenized(
+            conversation_tokenized, 
+            corrected_content_ranges, 
+            num_pad_tokens, 
+            cropped_end, 
+            convo_id, 
+            str(id_to_sample[convo_id])
+        )
+        ids.add(convo_id)
+        dataset.append(conversation)
 
     if not dataset:
         raise ValueError("No conversations were tokenized.\nIf you are using a completion model, make sure the completion tag is present in the conversations of your dataset.")
