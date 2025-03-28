@@ -2,6 +2,7 @@ from utils.dataset_utils import tokenize_dataset
 from classes.teacher.model import TeacherModel
 from classes.student.model import StudentModel
 from classes.data_manager import H5DataManager
+from joblib import Parallel, delayed
 from classes.paths import Paths
 from tqdm import tqdm
 import multiprocessing
@@ -12,10 +13,15 @@ import math
 import time
 import json
 import os
+import wandb
+import sys
 
 nvidia_smi.nvmlInit()
     
 def calculate_loop_ids(student: StudentModel, max_cache_size_gb, enable_topK, save_topK):
+    """
+    Computes loop-based distribution IDs for later usage.
+    """
     if enable_topK:
         kb_per_distr_val = (0.001953125 * 3) / 1.7 # storage of one FP16 value * 3 (for int32 index) / 1.7 (avg compression ratio)
         distr_size_kb = kb_per_distr_val * save_topK
@@ -49,6 +55,9 @@ def calculate_loop_ids(student: StudentModel, max_cache_size_gb, enable_topK, sa
 
 
 def get_teachers(models_folder, use_teachers: bool) -> list[TeacherModel]:
+    """
+    Loads teacher models if use_teachers is True, else returns an empty list.
+    """
     teachers = []
 
     if not use_teachers:
@@ -74,6 +83,9 @@ def get_teachers(models_folder, use_teachers: bool) -> list[TeacherModel]:
             
 
 def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel, use_teachers: bool):
+    """
+    Ensures that teachers and student share tokenization settings before finetuning.
+    """
     if not use_teachers:
         return
     
@@ -92,12 +104,20 @@ def ensure_compatibility(teachers: list[TeacherModel], student: StudentModel, us
         
 
 def prepare_datasets(dataset_path, data_manager: H5DataManager, validation_dataset_path, validation_data_manager: H5DataManager, teachers: list[TeacherModel], student: StudentModel, context_len, save_sys_range, save_user_range, save_assistant_range, ignore_model_type, use_teachers):
+    """
+    Prepares and tokenizes the training/validation datasets, optionally ignoring certain model types.
+    """
     print("Preparing datasets for the student...")
+
+    all_not_add_bos = False
+    if not student.add_bos and all(not teacher.add_bos for teacher in teachers):
+        all_not_add_bos = True
+    
     student.dataset, relevant_ids = tokenize_dataset(
-        dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type)
+        dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type, all_not_add_bos)
 
     student.validation_dataset, relevant_ids_val = tokenize_dataset(
-        validation_dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type)
+        validation_dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, student, ignore_model_type, all_not_add_bos)
 
     teachers_ids = set()
     teachers_ids_val = set()
@@ -105,10 +125,10 @@ def prepare_datasets(dataset_path, data_manager: H5DataManager, validation_datas
     for teacher in teachers:
         print(f"Preparing datasets for {teacher.model_name}...")
         teacher.dataset, teacher_ids = tokenize_dataset(
-            dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, teacher, ignore_model_type)
+            dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, teacher, ignore_model_type, all_not_add_bos)
 
         teacher.validation_dataset, teacher_ids_val = tokenize_dataset(
-            validation_dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, teacher, ignore_model_type)
+            validation_dataset_path, context_len, save_sys_range, save_user_range, save_assistant_range, teacher, ignore_model_type, all_not_add_bos)
         
         teachers_ids.update(teacher_ids)
         teachers_ids_val.update(teacher_ids_val)
@@ -140,6 +160,9 @@ def prepare_datasets(dataset_path, data_manager: H5DataManager, validation_datas
     
 
 def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size: int, context_len: int, temperature: float, device: str, save_topK: int, enable_topK: bool):
+    """
+    Configures model parameters (e.g., temperature, device).
+    """
     for teacher in teachers:
         teacher.crop_to_size = crop_to_size
         teacher.context_len = context_len
@@ -154,20 +177,24 @@ def set_params(teachers: list[TeacherModel], student: StudentModel, crop_to_size
     student.device = device
 
 
-def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs, 
-                        save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers, use_flash_attn_2):
-    
+def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr, adam_betas, adam_decay, lr_scheduler, optimizer, grad_accum_batches, training_precision, lr_decay_start, multi_gpu, data_order, validate_every_n_epochs, 
+                        save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, wandb_project, alpha, device_map, max_memory, num_gpu0_layers, use_flash_attn_2):
+    """
+    Configures and schedules all essential training hyperparameters.
+    """
     student.num_epochs = num_epochs
     student.eff_batch_size = grad_accum_batches * student.batch_size
     student.num_warmup_steps = math.ceil(num_warmup_steps / student.eff_batch_size)
     student.total_training_steps = num_epochs * student.dataset_len
     student.lr = lr
+    student.adam_betas = adam_betas
+    student.adam_decay = adam_decay
     student.lr_scheduler_name = lr_scheduler.lower()
     student.optimizer_name = optimizer.lower()
     student.grad_accum = grad_accum_batches
     student.num_grad_accum_batches = math.ceil(student.total_training_steps / student.eff_batch_size)
     student.training_precision_name = training_precision.lower()
-    student.decay_start = decay_start
+    student.lr_decay_start = lr_decay_start
     student.multi_gpu = multi_gpu
     student.data_order = data_order.lower()
     student.validation_every_steps = validate_every_n_epochs * student.dataset_len
@@ -179,51 +206,88 @@ def set_training_params(student: StudentModel, num_epochs, num_warmup_steps, lr,
     student.freeze_layers = freeze_layers
     student.use_fa2 = use_flash_attn_2
     student.wandb_comment = wandb_comment
+    student.wandb_project = wandb_project
     student.alpha = alpha
     student.device_map_name = device_map
     student.max_memory = max_memory
     student.num_gpu0_layers = num_gpu0_layers
 
 
-def calculate_sync(student_dataset, data_manager: H5DataManager, student_vocab_family: str):
+def calculate_sync(student_dataset: list, data_manager: H5DataManager, student_vocab_family: str):
+    """
+    Calculates the IDs to collect, rename, and remove based on the current SHAs and the disk SHAs.
+    
+    This function is used to synchronize the datasets between the current text dataset and the logit dataset on disk.
+    
+    Args:
+        student_dataset (list): The dataset to be synchronized.
+        data_manager (H5DataManager): The data manager for the dataset.
+        student_vocab_family (str): The vocabulary family of the student model.
+        
+
+    Returns:
+        tuple: with three lists:
+            - IDs to collect from the main dataset.
+            - IDs to rename in the main dataset.
+            - IDs to remove from the main dataset.
+    """
     def check_shas(disk_sha: dict[str, str], current_sha: dict[str, str]):
         # Create reverse mappings from SHA to set of IDs
         sha_to_ids1 = {}
         sha_to_ids2 = {}
+
         for id1, sha1 in disk_sha.items():
             sha_to_ids1.setdefault(sha1, set()).add(id1)
+
         for id2, sha2 in current_sha.items():
             sha_to_ids2.setdefault(sha2, set()).add(id2)
 
         ids_to_remove = []
         ids_to_collect = []
         ids_to_rename = {}
-
+        
         # Process SHAs to align both datasets
+        pbar = tqdm(total=len(disk_sha) + len(current_sha), desc="Checking SHAs", leave=False, postfix="Calculating sync...")
         all_shas = set(sha_to_ids1.keys()).union(set(sha_to_ids2.keys()))
-        for sha in all_shas:
+        
+        def process_sha(sha):
+            local_ids_to_remove = []
+            local_ids_to_collect = []
+            local_ids_to_rename = {}
             ids1 = sha_to_ids1.get(sha, set())
             ids2 = sha_to_ids2.get(sha, set())
 
             if len(ids1) > len(ids2):
                 surplus = len(ids1) - len(ids2)
-                ids_to_remove.extend(list(ids1)[:surplus])
-                ids1 = ids1 - set(ids_to_remove)
+                local_ids_to_remove.extend(list(ids1)[:surplus])
+                ids1 = ids1 - set(local_ids_to_remove)
 
             if len(ids2) > len(ids1):
                 missing = len(ids2) - len(ids1)
-                ids_to_collect.extend(list(ids2)[:missing])
-                ids2 = ids2 - set(ids_to_collect)
+                local_ids_to_collect.extend(list(ids2)[:missing])
+                ids2 = ids2 - set(local_ids_to_collect)
 
             ids1 = list(ids1)
             ids2 = list(ids2)
             for id1, id2 in zip(ids1, ids2):
                 if id1 != int(id2):
-                    ids_to_rename[id1] = id2
+                    local_ids_to_rename[id1] = id2
+
+            return local_ids_to_collect, local_ids_to_rename, local_ids_to_remove
+
+        results = Parallel(n_jobs=-1, prefer='threads')(delayed(process_sha)(sha) for sha in all_shas)
+        
+        for collect, rename, remove in results:
+            ids_to_collect.extend(collect)
+            ids_to_rename.update(rename)
+            ids_to_remove.extend(remove)
+            pbar.update()
+        
+        pbar.close()
 
         return ids_to_collect, ids_to_rename, ids_to_remove
 
-    def get_collection_info(current_shas, data_manager: H5DataManager, student_vocab_family: str):
+    def get_collection_info(current_shas: dict[str: str], data_manager: H5DataManager, student_vocab_family: str):
         disk_shas = data_manager.get_available_shas()
         data_manager_vocab_family = data_manager.get_vocab_family()
 
@@ -236,7 +300,7 @@ def calculate_sync(student_dataset, data_manager: H5DataManager, student_vocab_f
 
         return check_shas(disk_shas, current_shas)
 
-    current_shas = {f"{convo.origin_convo_id}": convo.content_sha for convo in student_dataset}
+    current_shas:dict[str, str] = {f"{convo.origin_convo_id}": convo.content_sha for convo in student_dataset}
 
     ids_collect, ids_rename, ids_remove = get_collection_info(current_shas, data_manager, student_vocab_family)
 
@@ -246,7 +310,26 @@ def calculate_sync(student_dataset, data_manager: H5DataManager, student_vocab_f
     return ids_collect, ids_rename, ids_remove
 
 
-def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataManager, rebase, student: StudentModel, use_teachers: bool):
+def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataManager, rebase: bool, student: StudentModel, use_teachers: bool):
+    """
+    Synchronize main and validation datasets.
+
+    If rebase is True, update both data managers with the student's current SHAs and vocab family,
+    and return empty lists. If use_teachers is False, no sync is performed and empty lists are returned.
+    Otherwise, perform teacher-led synchronization by computing and applying SHA changes, and return
+    lists of IDs to collect for the main and validation datasets.
+
+    Args:
+        validation_data_manager (H5DataManager): Manager for the validation dataset.
+        data_manager (H5DataManager): Manager for the main dataset.
+        rebase (bool): If True, reset SHAs and vocabulary families.
+        student (StudentModel): Student model containing datasets and vocab_family.
+        use_teachers (bool): If True, perform teacher-based synchronization.
+
+    Returns:
+        tuple: Two lists containing IDs to collect from the main and validation datasets, respectively.
+    """
+    
     if rebase:
         current_shas = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.dataset}
         current_shas_val = {f"{convo.origin_convo_id}": convo.content_sha for convo in student.validation_dataset}
@@ -270,7 +353,18 @@ def sync_datasets(validation_data_manager: H5DataManager, data_manager: H5DataMa
     return ids_collect, ids_collect_val
 
 
-def check_topk(data_manager: H5DataManager, enable_topk, save_topk: int, validation=False):
+def check_topk(data_manager: H5DataManager, enable_topk, save_topk: int, check_validation=False):
+    """Checks if the topk value in the dataset matches the one in the config.
+
+    Args:
+        data_manager (H5DataManager): data_manager object to check the topk value.
+        enable_topk (_type_): argument to enable or disable topk sampling.
+        save_topk (int): topk value to save.
+        validation (bool, optional): whether to check the validation dataset, else the main one. Defaults to False.
+
+    Returns:
+        int: topk value to use.
+    """
     if not enable_topk:
         return save_topk
     
@@ -280,7 +374,7 @@ def check_topk(data_manager: H5DataManager, enable_topk, save_topk: int, validat
         data_manager.set_topk(save_topk)
         return save_topk
     
-    text_insert = "validation" if validation else "main"
+    text_insert = "validation" if check_validation else "main"
 
     if dataset_topk != save_topk:
         print(f"\nTopK mismatch between the {text_insert} h5 dataset, and your config!\n{text_insert.upper()} dataset has TopK={dataset_topk}, while you set TopK={save_topk}.")
@@ -351,7 +445,9 @@ def get_params():
     training_group.add_argument('--grad_checkpointing', type=bool, help='Enable gradient checkpointing for memory savings,\nbut slower training. {bool}')
     training_group.add_argument('--temperature', '-t', type=float, help='Temperature for distillation. {float}')
     training_group.add_argument('--lr', '-lr', type=float, help='Learning rate. {float}')
-    training_group.add_argument('--decay_start', type=float, help='Start decaying learning rate to 0 at this percentage of total training steps,\nonly used by the wsd learning rate scheduler. {float}')
+    training_group.add_argument('--adam_betas', '-ab', type=float, nargs='+', help='Adam optimizer betas.\nMust be a list of two floats. {list}')
+    training_group.add_argument('--adam_decay', type=float, help='Adam optimizer decay. {float}')
+    training_group.add_argument('--lr_decay_start', type=float, help='Start decaying learning rate to 0 at this percentage of total training steps,\nonly used by the wsd learning rate scheduler. {float}')
     training_group.add_argument('--alpha', type=float, help='Weighting factor for weighted losses.\nCurrently used as: weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha). {float}')
     training_group.add_argument('--lr_scheduler', type=str, help='Learning rate scheduler name.\nOptions include a custom implementation of Warmup Stable Decay learning rate scheduler from MiniCPM,\nand any other learning rate scheduler from Transformer\'s get_scheduler() function (e.g., cosine, linear, constant). {string}')
     training_group.add_argument('--optimizer', type=str, help='Optimizer name.\nCurrently available options include: adam, adamw, adamw8bit, adamw32bit,\npaged_adamw, paged_adamw8bit, paged_adamw32bit, sgd, rmsprop, rmsprop8bit, rmsprop32bit, adagrad. {string}')
@@ -365,6 +461,7 @@ def get_params():
     training_group.add_argument('--multi_gpu', type=bool, help='Whether to do multi-GPU training. {bool}')
     training_group.add_argument('--save_final_state', type=bool, help='Save the final model state after training.\nCan consume enormous amounts of storage and RAM. {bool}')
     training_group.add_argument('--wandb_comment', '-wdb', type=str, help='A comment for Weights and Biases logging.\nExample: {comment} ModelName lr(lr) (Date/Time). {string}')
+    training_group.add_argument('--wandb_project', type=str, help='Weights and Biases project name. {string}')
     training_group.add_argument('--use_flash_attn_2', '-fa2', type=bool, help='Whether to use Flash Attention 2,\nor default to sdpa. {bool}')
 
     # Student settings
@@ -384,6 +481,8 @@ def get_params():
         params["enable_topK"] = True
 
     params['max_memory'] = {int(key): value for key, value in params['max_memory'].items() if key.lower() != 'cpu'}
+    
+    params['adam_betas'] = tuple(params['adam_betas'])
 
     return params
 
@@ -399,6 +498,9 @@ def handle_termination(signum, frame):
     if teachers is not None:
         for teacher in teachers:
             teacher.close()
+
+    if student is not None:
+        student.close()
 
     os._exit(0)
 
@@ -448,7 +550,9 @@ def main():
     grad_checkpointing = params['grad_checkpointing']
     temperature = params['temperature']
     lr = params['lr']
-    decay_start = params['decay_start'] # Start decay at this % of total steps trained
+    adam_betas = params['adam_betas'] # Adam optimizer betas
+    adam_decay = params['adam_decay'] # Adam optimizer decay
+    lr_decay_start = params['lr_decay_start'] # Start decay at this % of total steps trained
     alpha = params['alpha'] # weighted losses
     lr_scheduler = params['lr_scheduler'] # "wsd", "cosine", "linear", "constant"
     optimizer = params['optimizer'] # "adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit", "sgd", "rmsprop", "rmsprop8bit", "rmsprop32bit", "adagrad"
@@ -463,15 +567,19 @@ def main():
     save_final_state = params['save_final_state'] # Save the final state of the model after training
     use_flash_attn_2 = params['use_flash_attn_2']
     wandb_comment = params['wandb_comment'] # Comment for wandb: {comment} ModelName lr(lr) (Date/Time)
+    wandb_project = params['wandb_project'] # Project name for wandb
 
     # Student settings
     freeze_layers = params['freeze_layers']
     add_bos = params['add_bos']
     prompt_format = params['prompt_format']
 
-
     # Initialization
     global data_manager, validation_data_manager, teachers, student
+    
+    if not wandb.api.api_key:
+        print("Not logged in to wandb! (`wandb.api.api_key` is empty)\nPlease type `wandb login` in the terminal before next launch of the pipeline!\nExiting...")
+        handle_termination(None, None)
 
     signal.signal(signal.SIGTERM, handle_termination)
     signal.signal(signal.SIGINT, handle_termination)
@@ -482,16 +590,16 @@ def main():
     student = StudentModel(student_path, paths, add_bos, prompt_format, batch_size)
 
     print("Launching data managers...")
-    data_manager = H5DataManager(paths.dataset, device)
-    validation_data_manager = H5DataManager(paths.dataset_validation, device)
+    data_manager = H5DataManager(paths.dataset, device, manager_name="main")
+    validation_data_manager = H5DataManager(paths.dataset_validation, device, manager_name="validation")
     
     ensure_compatibility(teachers, student, use_teachers)
     prepare_datasets(dataset_path, data_manager, validation_dataset_path, validation_data_manager, teachers, student, context_len, save_sys_range, save_user_range, save_assistant_range,
                      ignore_model_type, use_teachers)
 
     set_params(teachers, student, crop_distr_to_size, context_len, temperature, device, save_topK, enable_topK)
-    set_training_params(student, num_epochs, num_warmup_steps, lr, lr_scheduler, optimizer, grad_accum_batches, training_precision, decay_start, multi_gpu, data_order, validate_every_n_epochs, 
-                        save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, alpha, device_map, max_memory, num_gpu0_layers, use_flash_attn_2)
+    set_training_params(student, num_epochs, num_warmup_steps, lr, adam_betas, adam_decay, lr_scheduler, optimizer, grad_accum_batches, training_precision, lr_decay_start, multi_gpu, data_order, validate_every_n_epochs, 
+                        save_student_every_n_epochs, save_final_state, grad_checkpointing, freeze_layers, wandb_comment, wandb_project, alpha, device_map, max_memory, num_gpu0_layers, use_flash_attn_2)
 
     student.reorder_dataset()
     
@@ -510,7 +618,7 @@ def main():
 
         validation_data_manager.set_vocab_family(student.vocab_family)
 
-        for teacher in teachers:
+        for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False, disable=len(teachers) == 1):
             teacher.process_chunk(reserve_vram, num_inference_workers, data_manager=validation_data_manager, ids_to_collect=ids_collect_val, validation=True)
     
     else:
@@ -528,7 +636,7 @@ def main():
             topk_to_use = check_topk(data_manager, enable_topK, save_topK)
             update_teachers_param(teachers, "topK", topk_to_use)
 
-            for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False):
+            for teacher in tqdm(teachers, desc="Teachers", smoothing=0.06, position=0, leave=False, disable=len(teachers) == 1):
                 teacher.process_chunk(reserve_vram, num_inference_workers, ids_to_collect=ids_collect, data_manager=data_manager)
 
             student.train_chunk(data_manager, validation_data_manager, full_collect)

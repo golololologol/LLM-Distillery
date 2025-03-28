@@ -1,21 +1,21 @@
 from utils.finetuning_utils import set_optimizer, set_lr_scheduler, calculate_divergence
-from exllamav2 import ExLlamaV2, ExLlamaV2Config, ExLlamaV2Cache
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from classes.data_classes import ConvoTokenized
 from classes.data_manager import H5DataManager
+from transformers import BitsAndBytesConfig
 from multiprocessing import shared_memory
 from classes.base_model import BaseModel
 from classes.losses import Losses
 from classes.paths import Paths
 from typing import Optional
 from tqdm import tqdm
-import torch.nn.functional as F
 import numpy as np
 import torch
 import wandb
 import math
 import time
 import os
+import gc
 
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -39,8 +39,10 @@ class StudentModel(BaseModel):
         self.lr_scheduler_name = ""
         self.lr_scheduler = None
         self.lr = 0.0
-        self.decay_start = 0.0 # wsd only
-        self.final_lr = 5e-7 # wsd only
+        self.adam_betas = (0.9, 0.99)
+        self.adam_decay = 2e-6
+        self.lr_decay_start = 0.0 # wsd only
+        self.final_lr = 1e-9 # wsd only
         self.alpha: float = 1
 
         self.num_epochs = 0
@@ -71,6 +73,7 @@ class StudentModel(BaseModel):
         self.multi_gpu = False
         self.use_fa2 = False
         self.wandb_comment = ""
+        self.wandb_project = ""
         self.device_map_name = ""
         self.device_map = {}
         self.max_memory = {}
@@ -136,7 +139,20 @@ class StudentModel(BaseModel):
         else:
             device_map = self.device_map_name if self.multi_gpu else self.device
 
-        use_bnb_quant = self.training_precision_name == "4bit" or self.training_precision_name == "8bit"
+        use_bnb_quant = self.training_precision_name in ["4bit", "8bit"]
+        bnb_config = None
+        
+        if use_bnb_quant:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=self.training_precision_name == "4bit",
+                load_in_8bit=self.training_precision_name == "8bit",
+                bnb_4bit_compute_dtype=train_precision if self.training_precision_name == "4bit" else None,
+                bnb_8bit_compute_dtype=train_precision if self.training_precision_name == "8bit" else None,
+                bnb_4bit_use_double_quant=self.training_precision_name == "4bit",
+                bnb_4bit_quant_type="nf4" if self.training_precision_name == "4bit" else None
+            )
+        
+        
         num_gpus = torch.cuda.device_count()
         max_memory = self.max_memory if len(self.max_memory) == num_gpus else None
 
@@ -145,9 +161,8 @@ class StudentModel(BaseModel):
                 path,
                 device_map="auto",
                 torch_dtype=train_precision if not use_bnb_quant else None,
-                load_in_4bit=self.training_precision_name == "4bit",
-                load_in_8bit = self.training_precision_name == "8bit",
-                max_memory = max_memory
+                max_memory=max_memory,
+                quantization_config=bnb_config
                 )
 
             layer_names = list(model.hf_device_map.keys())
@@ -183,10 +198,9 @@ class StudentModel(BaseModel):
 
         self.model = AutoModelForCausalLM.from_pretrained(
             path,
-            device_map=device_map,
+            device_map=device_map if self.multi_gpu else self.device,
             torch_dtype=train_precision if not use_bnb_quant else None,
-            load_in_4bit=self.training_precision_name == "4bit",
-            load_in_8bit = self.training_precision_name == "8bit",
+            quantization_config=bnb_config,
             attn_implementation="flash_attention_2" if self.use_fa2 else "sdpa",
             max_memory = max_memory
         )
@@ -217,11 +231,11 @@ class StudentModel(BaseModel):
         self._set_postfix("Loading optimizer...")
 
         self.optimizer = set_optimizer(
-            self.model.parameters(),
+            self.model,
             lr=self.lr,
-            betas=(0.9, 0.99),
+            betas=self.adam_betas,
             optimizer_name=self.optimizer_name,
-            weight_decay=2e-8
+            weight_decay=self.adam_decay
         )
 
         self._release_postfix()
@@ -239,13 +253,26 @@ class StudentModel(BaseModel):
         """
         if self.dataset_sorted:
             return
-        if self.data_order == "shuffle":
+        if self.data_order == "shuffle" or self.data_order == "random":
             np.random.shuffle(self.dataset)
         elif self.data_order == "sorted":
-            self.dataset.sort(key=lambda convo: convo.length, reverse=True)
+            self.dataset.sort(key=lambda convo: convo.length, reverse=True) # Reverse to have the longest conversations first, will OOM on start instead of randomly
             self.dataset_sorted = True
         elif self.data_order == "native":
             self.dataset_sorted = True
+        else:
+            print(f"Invalid data order. Please choose 'shuffle'/'random' (yes, both of them will do the same thing), 'sorted' or 'native'.\n Got: {self.data_order}")
+
+    def _save_model(self, step: int|str):
+        self._set_postfix(f"Saving model at step {step}...")
+
+        folder_name = f"{self.model_name}_step_{step}"
+
+        self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
+
+        self.tokenizer.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
+
+        self._release_postfix()
 
     def _save_state(self):
         self._set_postfix("Saving state...")
@@ -256,17 +283,6 @@ class StudentModel(BaseModel):
         torch.save(self.model.state_dict(), os.path.join(self.paths.student_states, "model_state.pt"))
         torch.save(self.optimizer.state_dict(), os.path.join(self.paths.student_states, "optimizer_state.pt"))
         torch.save(self.lr_scheduler.state_dict(), os.path.join(self.paths.student_states, "scheduler_state.pt"))
-
-        self._release_postfix()
-
-    def _save_model(self, step: int|str):
-        self._set_postfix(f"Saving model at step {step}...")
-
-        folder_name = f"{self.model_name}_step_{step}"
-
-        self.model.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
-
-        self.tokenizer.save_pretrained(os.path.join(self.paths.student_trained, folder_name))
 
         self._release_postfix()
 
@@ -281,10 +297,12 @@ class StudentModel(BaseModel):
         optimizer_state = torch.load(os.path.join(self.paths.student_states, "optimizer_state.pt"))
         self.optimizer.load_state_dict(optimizer_state)
 
-        self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_grad_accum_batches, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
+        self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_grad_accum_batches, self.dataset_len, self.lr_decay_start, self.lr, self.final_lr) 
         scheduler_state = torch.load(os.path.join(self.paths.student_states, "scheduler_state.pt"))
         self.lr_scheduler.load_state_dict(scheduler_state)
 
+        self.paths.empty_student_states()
+        self.saved_state = False
         self._release_postfix()
 
     def _construct_batches(self, dataset_chunk: list[ConvoTokenized]) -> tuple[list[list[ConvoTokenized]], list[list[int]]]:
@@ -306,8 +324,27 @@ class StudentModel(BaseModel):
             data_list.append(batched_chunk_convos)
             data_manager.enqueue_get_batches(id_batches)
             return data_list
+        
+    def _setup_logger(self):
+        name = f"{self.wandb_comment} " if self.wandb_comment else ""
+        model_name = self.model_name if len(self.model_name) <= 20 else f"{self.model_name[:20]}..."
+        name += f"{model_name} lr({self.lr}) ({time.strftime('%d.%m.%Y / %H:%M:%S')})"
+        
+        project = self.wandb_project if self.wandb_project else "LLM Distillation"
+        
+        self.logger = wandb.init(project=project, name=name, config=self.__dict__, group=self.model_name, reinit=True, dir=self.paths.cache)
+        
 
     def train_chunk(self, data_manager: H5DataManager, validation_data_manager: H5DataManager, full_collect):
+        """
+        The main function that manages everything related to the training loop of the student model.
+        Args:
+            data_manager (H5DataManager): Data manager for the training dataset.
+            validation_data_manager (H5DataManager): Data manager for the validation dataset.
+            full_collect (bool): Whether to collect the entire dataset or not.
+        Returns:
+            None
+        """
         trainable_ids = data_manager.get_dataset_ids()
         self.distr_device = ""
 
@@ -317,10 +354,7 @@ class StudentModel(BaseModel):
             validation_data_manager.read_only_mode(self.val_batch_order_ids)
 
         if self.logger is None:
-            name = f"{self.wandb_comment} " if self.wandb_comment else ""
-            model_name = self.model_name if len(self.model_name) <= 20 else f"{self.model_name[:20]}..."
-            name += f"{model_name} lr({self.lr}) ({time.strftime('%d.%m.%Y / %H:%M:%S')})"
-            self.logger = wandb.init(project="student_training", name=name, config=self.__dict__, group=self.model_name, reinit=True, dir=self.paths.cache)
+            self._setup_logger()
 
         if self.tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
@@ -329,12 +363,10 @@ class StudentModel(BaseModel):
 
         if self.saved_state:
             self._load_state()
-            self.paths.empty_student_states()
-            self.saved_state = False
         else:
             self._load_model()
             self._load_optimizer()
-            self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_grad_accum_batches, self.dataset_len, self.decay_start, self.lr, self.final_lr) 
+            self.lr_scheduler = set_lr_scheduler(self.optimizer, self.lr_scheduler_name, self.num_warmup_steps, self.num_grad_accum_batches, self.dataset_len, self.lr_decay_start, self.lr, self.final_lr) 
 
         if self.losses is None:
             self.losses = Losses(self.logger)
@@ -343,10 +375,12 @@ class StudentModel(BaseModel):
             self._validate_distillation(validation_data_manager)
         
         # Main training loop
+
+        data_list = self._prefetch_dataset_chunk(data_manager, [], full_collect, trainable_ids)
+
         if full_collect:
             data_manager_left_shuffles = self.num_epochs - 1
-            data_list = self._prefetch_dataset_chunk(data_manager, [], full_collect, trainable_ids)
-                
+            
             for i in range(self.num_epochs):
                 if data_manager_left_shuffles > 0:
                     data_list = self._prefetch_dataset_chunk(data_manager, data_list, full_collect, trainable_ids)
@@ -354,7 +388,6 @@ class StudentModel(BaseModel):
 
                 updated_grads = self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager)
         else:
-            data_list = self._prefetch_dataset_chunk(data_manager, [], full_collect, trainable_ids)
             updated_grads = self._run_distillation_cycle(data_list.pop(0), data_manager, validation_data_manager)
 
         if not updated_grads:
@@ -381,6 +414,16 @@ class StudentModel(BaseModel):
 
     # main training loop
     def _run_distillation_cycle(self, batched_chunk_convos, data_manager: H5DataManager, validation_data_manager: H5DataManager) -> bool:
+        """
+        The main training loop for the student model.
+        Runs a single distillation cycle on the given batch of conversations.
+        Args:
+            batched_chunk_convos (list): A list of batched conversations.
+            data_manager (H5DataManager): Data manager for the training dataset.
+            validation_data_manager (H5DataManager): Data manager for the validation dataset.
+        Returns:
+            bool: True if gradients were updated, False otherwise.
+        """
         updated_grads = False
         for batch_convos in batched_chunk_convos:
             updated_grads = False
@@ -446,6 +489,7 @@ class StudentModel(BaseModel):
 
                 updated_grads = True
                 self.next_accum_step += self.eff_batch_size
+                torch.cuda.empty_cache()
 
             shd_mem.close()
             shd_mem.unlink()
@@ -463,6 +507,7 @@ class StudentModel(BaseModel):
         self.model.eval()
         pbar = tqdm(total=self.validation_dataset_len, desc="Validating", leave=False, smoothing=0.06)
         losses = Losses(self.logger, validation=True)
+        torch.cuda.empty_cache()
 
         with torch.no_grad():
             for val_convo_batch in self.validation_dataset_batched:
@@ -519,13 +564,11 @@ class StudentModel(BaseModel):
         pbar.close()
         self.model.train()
         self.next_val_step += self.validation_every_steps
+        gc.collect()
         torch.cuda.empty_cache()
 
     def close(self):
         if self.logger is not None:
-            try:
-                self.logger.finish()
-                del self.logger
-            except:
-                pass
+            self.logger.finish()
+            del self.logger
             

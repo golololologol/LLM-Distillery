@@ -1,3 +1,19 @@
+"""
+This tool optimizes training data for language models by packing multiple
+shorter samples into combined samples to maximize context window utilization.
+
+Purpose:
+- Processes JSONL training data files containing conversation samples
+- Tokenizes samples to determine their exact token lengths
+- Efficiently packs multiple short samples together to fill the context window
+- Preserves proper separation between samples using BOS/EOS tokens
+- Outputs a new JSONL file with the packed samples sorted by length
+
+The packing algorithm prioritizes fitting the biggest samples possible into the
+available space without exceeding it, which very efficiently utilizes the
+available samples for packing.
+"""
+
 import json
 import os
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
@@ -34,6 +50,26 @@ def find_longest_fitting_len(current_len, candidates, context_len, special_token
     return int(valid_indices[-1]) if len(valid_indices) > 0 else None
 
 def prepack(input_path, output_path, model_path, context_len, min_desired_len, bos, eos):
+    """
+        Pack conversation samples to optimize context window utilization.
+        This function processes a JSONL file containing conversation samples, encodes them
+        using the specified tokenizer, and packs multiple shorter conversations together
+        to better utilize the context length during training. The packing algorithm tries
+        to combine samples to approach but not exceed the context length.
+        Args:
+            input_path (str): Path to the input JSONL file containing conversation samples
+            output_path (str): Path where packed samples will be written as JSONL
+            model_path (str): Path to the ExLlamaV2 model for tokenization
+            context_len (int): Maximum allowed context length in tokens
+            min_desired_len (int): Target minimum length for packed sequences
+            bos (str): Beginning of sequence token/string to use between packed samples
+            eos (str): End of sequence token/string to use between packed samples
+        Returns:
+            None: Results are written to the output_path file
+        Note:
+            Each input sample is expected to be a JSON object with a 'conversations' field
+            containing an array, where the first element is the conversation text.
+    """
     config = ExLlamaV2Config()
     config.model_dir = model_path
     config.prepare()

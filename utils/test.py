@@ -1,15 +1,24 @@
+from multiprocessing.managers import SharedMemoryManager
 import torch
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaForCausalLM, LlamaTokenizer, AutoConfig
 import math
 import torch.nn.functional as F
+import joblib
 import json
 import nvidia_smi
+import time
 import codecs
 from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config, ExLlamaV2Cache, ExLlamaV2
 from tqdm import tqdm
 from collections import defaultdict
+import subprocess
+import os
 import multiprocessing as mp
+from multiprocessing.managers import SharedMemoryManager
+from multiprocessing.shared_memory import ShareableList
+from aphrodite import LLM, SamplingParams
+from joblib import Parallel, delayed
 
 # init cuda
 if not torch.cuda.is_initialized():
@@ -529,32 +538,275 @@ def truncated_kldiv(student_probs, teacher_probs):
 #KL_div = F.kl_div(student_logprobs, teacher_logprobs, reduction='batchmean', log_target=True)
 #
 #print(KL_div)
+#
+#
+## Given data and indices tensors
+#data = torch.tensor([[0.123, 24.3, 9.4], [0.62, 0.121, 53.23]])
+#indices = torch.tensor([[6, 95, 2124], [934, 953, 11]])
+#
+## Sequence of IDs you want to retrieve
+#sequence = torch.tensor([411, 11])
+#
+## Flatten the data and indices tensors
+#flat_data = data.flatten()
+#flat_indices = indices.flatten()
+#
+## Create a sparse tensor
+#sparse_indices = flat_indices.unsqueeze(0)
+#sparse_data = flat_data
+#sparse_tensor = torch.sparse_coo_tensor(sparse_indices, sparse_data)
+#
+## Function to retrieve values from the sequence
+#def retrieve_values(sequence, sparse_tensor):
+#    dense_lookup = sparse_tensor.to_dense()
+#    result = torch.zeros(sequence.size(), dtype=dense_lookup.dtype)
+#    valid_indices = sequence < dense_lookup.size(0)
+#    result[valid_indices] = dense_lookup[sequence[valid_indices]]
+#    return result
+#
+## Retrieve the correct values
+#retrieved_values = retrieve_values(sequence, sparse_tensor)
+#print(retrieved_values)
+#
+#import time
+#import multiprocessing
+#
+#def worker(input_queue, output_queue):
+#    """Worker function that listens for messages and echoes them back."""
+#    while True:
+#        message, data = input_queue.get()
+#        if message == 'STOP':
+#            break  # exit the loop when receiving a stop signal
+#        output_queue.put(message)
+#
+#def test_latency(iterations=2):
+#    # Create two queues: one for sending messages to the worker,
+#    # and another for receiving the responses.
+#    input_queue = multiprocessing.Queue()
+#    output_queue = multiprocessing.Queue()
+#    
+#    # Create and start the worker process.
+#    process = multiprocessing.Process(target=worker, args=(input_queue, output_queue))
+#    process.start()
+#
+#    latencies = []
+#    for _ in range(iterations):
+#        # create a random array of data to send
+#        data = np.random.rand(4, 2048, 500).astype(np.float32)
+#        # print the amount of data in MB once
+#        if _ == 0:
+#            print(f"Sending {data.nbytes / 1024**2:.2f} MB of data")
+#        start_time = time.perf_counter()
+#        input_queue.put(("ping", data.tobytes()))
+#        # Wait for the worker to echo the message back.
+#        _ = output_queue.get()
+#        end_time = time.perf_counter()
+#        latencies.append(end_time - start_time)
+#
+#    # Signal the worker to stop and wait for it to finish.
+#    input_queue.put("STOP")
+#    process.join()
+#
+#    # Calculate and print the average latency in milliseconds.
+#    avg_latency = (sum(latencies) / iterations) * 1000
+#    print(f"Average round-trip latency: {avg_latency:.3f} ms")
+#
+#if __name__ == '__main__':
+#    test_latency(10000)
+#
+#
+#import torch
+#import numpy as np
+#from vllm import LLM, SamplingParams
+#
+#def test_vllm_inference():
+#    # --- Configuration ---
+#    model_name = r"E:\fucking_virus\desctop\TinyLlama-1.1B-intermediate-step-1431k-3T_safetensors"
+#    crop_to_size = 32000
+#    enable_topK = False
+#    topK = 5                   
+#
+#    # --- Load the Model ---
+#    print(f"Loading model {model_name}...")
+#    llm = LLM(model=model_name)
+#    print("Model loaded.\n")
+#
+#    # --- Prepare a Sample Batch ---
+#    # Simulated pre-tokenized & pre-padded input:
+#    # For demonstration, zeros (0) represent padding tokens.
+#    # In practice, use the model's tokenizer to prepare these sequences.
+#    sample_batch = np.array([
+#        [50256, 464, 318, 257, 50256, 0, 0],  # Example 1 (with padding)
+#        [50256, 137, 345, 50256, 0, 0, 0]      # Example 2 (with padding)
+#    ], dtype=np.int32)
+#
+#    # Decode tokens back to text using the model's tokenizer.
+#    # Remove any padding (assumed to be zeros).
+#    prompts = [llm.tokenizer.decode(tokens[tokens != 0].tolist()) for tokens in sample_batch]
+#    print("Prompts:")
+#    for idx, prompt in enumerate(prompts):
+#        print(f"  Sample {idx}: {prompt}")
+#    print()
+#
+#    # --- Perform Inference ---
+#    # Set sampling parameters with max_tokens=0 to obtain logits for the provided prompt only.
+#    sampling_params = SamplingParams(max_tokens=0)
+#    outputs = llm.generate(prompts, sampling_params)
+#
+#    # --- Process and Print Logits ---
+#    for i, output in enumerate(outputs):
+#        # Convert logits to a torch tensor (shape: [prompt_length, vocab_size])
+#        logits = torch.tensor(output.logits)
+#        # Compute log probabilities and crop logits to crop_to_size if desired
+#        logp = torch.log_softmax(logits[:, :crop_to_size].float(), dim=-1)
+#        print(f"Sample {i} log probabilities shape: {logp.shape}")
+#
+#        if enable_topK:
+#            # Optionally, compute top-K log probabilities and indices.
+#            top_logp, top_indices = torch.topk(logp, topK, dim=-1)
+#            print(f"Sample {i} top-{topK} log probabilities shape: {top_logp.shape}")
+#            print(f"Sample {i} top-{topK} indices shape: {top_indices.shape}")
+#    print("\nInference test completed.")
+#
+#if __name__ == "__main__":
+#    test_vllm_inference()
+#
+#
+#
 
 
-# Given data and indices tensors
-data = torch.tensor([[0.123, 24.3, 9.4], [0.62, 0.121, 53.23]])
-indices = torch.tensor([[6, 95, 2124], [934, 953, 11]])
 
-# Sequence of IDs you want to retrieve
-sequence = torch.tensor([411, 11])
+def _process_logprobs_dict(prob_dict, topK, include_sampled):
+    """
+    Process a dictionary of topK token logprobs and indices into NumPy arrays.
 
-# Flatten the data and indices tensors
-flat_data = data.flatten()
-flat_indices = indices.flatten()
+    It selects the topK tokens based on their ranking.
+    If an extra sampled token is present and `include_sampled` is True,
+    the candidate with the lowest log probability is replaced by this sampled token.
 
-# Create a sparse tensor
-sparse_indices = flat_indices.unsqueeze(0)
-sparse_data = flat_data
-sparse_tensor = torch.sparse_coo_tensor(sparse_indices, sparse_data)
+    Args:
+        prob_dict (dict): A dictionary where keys are token IDs and values are objects 
+            containing attributes `logprob` and `rank`. An empty dictionary will result in empty arrays.
+        topK (int): The number of top tokens to select.
+        include_sampled (bool): Whether to include a sampled token by replacing the candidate 
+            with the worst log probability if the dictionary has an extra element.
 
-# Function to retrieve values from the sequence
-def retrieve_values(sequence, sparse_tensor):
-    dense_lookup = sparse_tensor.to_dense()
-    result = torch.zeros(sequence.size(), dtype=dense_lookup.dtype)
-    valid_indices = sequence < dense_lookup.size(0)
-    result[valid_indices] = dense_lookup[sequence[valid_indices]]
-    return result
+    Returns:
+        tuple: A tuple containing two numpy.ndarray objects:
+            - The first array holds the log probability values for the selected tokens.
+            - The second array holds the corresponding token IDs.
+    """
+    if not prob_dict:
+        return np.array([]), np.array([])
 
-# Retrieve the correct values
-retrieved_values = retrieve_values(sequence, sparse_tensor)
-print(retrieved_values)
+    # Convert dictionary items to a list of tuples (token_id, logprob_object) and sort by rank.
+    items = list(prob_dict.items())
+    items.sort(key=lambda x: x[1].rank)
+
+    if len(items) == topK:
+        # No extra sampled token; use the provided tokens.
+        candidates = items
+    else:
+        # The last element is the sampled token (with rank > topK)
+        sampled = items[-1]
+        candidates = items[:topK]
+        if include_sampled:
+            # Replace the worst candidate with the sampled token.
+            candidates[-1] = sampled
+
+    # Extract logprob values and token IDs.
+    values = [entry[1].logprob for entry in candidates]
+    indices = [entry[0] for entry in candidates]
+    return np.array(values), np.array(indices)
+
+
+def gather_aphrodite_logprobs(request_outputs, topK=3, include_sampled=False, worker_pool=None):
+    """
+    Gather token logprobs and indices from multiple request outputs from Aphrodite
+    and return the results as stacked NumPy arrays.
+
+    This function iterates over a collection of output objects, each containing 
+    log probability information for both prompt tokens and the final predicted token. 
+    It flattens these tokens into a list, processes each using `_process_logprobs_dict`
+    in parallel, and then stacks the resulting arrays to produce aggregated log 
+    probability values and token indices.
+
+    Args:
+        request_outputs (iterable): A collection of output objects, where each object 
+            is expected to have:
+                - `prompt_logprobs`: a list where the first element is always None and 
+                  subsequent elements are token log probability dictionaries.
+                - `outputs`: a list whose first element contains a `logprobs` attribute, 
+                  which is itself a list (the first element is used).
+        topK (int, optional): The number of top candidate tokens to select from each token's 
+            log probabilities. Defaults to 3.
+        include_sampled (bool, optional): If True, includes a sampled token in the candidates 
+            by replacing the candidate with the worst log probability. Defaults to False.
+        worker_pool (Parallel, optional): A parallel worker pool for processing the tokens.
+            If None, a new Parallel pool using all available cores with a threaded backend is created.
+
+    Returns:
+        dict: A dictionary with two keys:
+            - "values": A numpy.ndarray containing the stacked log probability values for each token.
+            - "indices": A numpy.ndarray containing the corresponding token IDs.
+    """
+    tokens_to_process = []
+
+    # Flatten all valid token logprobs from all outputs.
+    for output in request_outputs:
+        # Skip the first token in prompt_logprobs as it is always None.
+        tokens_to_process.extend(output.prompt_logprobs[1:])
+        # Append the final output token predictions.
+        tokens_to_process.append(output.outputs[0].logprobs[0])
+
+    # Use the provided worker pool or create a new one.
+    if worker_pool is None:
+        worker_pool = Parallel(n_jobs=-1, backend="threading")
+
+    results = worker_pool(
+        delayed(_process_logprobs_dict)(token, topK, include_sampled)
+        for token in tokens_to_process
+    )
+
+    # Unzip the results into separate lists for values and indices.
+    values_list, indices_list = zip(*results)
+
+    return {
+        "values": np.stack(values_list, axis=0),
+        "indices": np.stack(indices_list, axis=0)
+    }
+
+
+if __name__ == "__main__":
+    path = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
+#
+#tokenizer = AutoTokenizer.from_pretrained(path)
+#
+#print(len(tokenizer.get_vocab()))
+#
+#
+#
+
+    prompt = "Hello, how are you"
+    prompt_ids = [15043, 29892, 920, 526, 366]
+    prompt_ids_tensor = torch.tensor(prompt_ids, device="cuda:0").unsqueeze(0)
+    topK = 3
+    include_sampled = True
+
+    model = LLM(model=path, tensor_parallel_size=1, enforce_eager=True, gpu_memory_utilization=0.4)
+    sampling_params = SamplingParams(max_tokens=1, prompt_logprobs=topK, logprobs=topK, skip_special_tokens=False)
+    outputs = model.generate(prompt_token_ids=prompt_ids, sampling_params=sampling_params, use_tqdm=True)
+
+    print(outputs)
+    print(type(outputs))
+    
+    print(gather_aphrodite_logprobs(outputs, topK=3, include_sampled=include_sampled))
+    
+    del model
+    
+    model_torch = AutoModelForCausalLM.from_pretrained(path, attn_implementation="sdpa").to("cuda:0")
+    
+    outputs = model_torch(prompt_ids_tensor)
+    logits = outputs.logits.squeeze(0)
+    
+    print(torch.topk(F.log_softmax(logits, dim=-1), 3, dim=-1))

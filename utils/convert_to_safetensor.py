@@ -1,3 +1,6 @@
+# Kindly borrowed from here: https://github.com/Silver267/pytorch-to-safetensor-converter
+# and modified to suit the needs of the project
+
 from safetensors.torch import load_file, save_file
 from collections import defaultdict
 import shutil

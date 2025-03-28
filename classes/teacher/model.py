@@ -1,11 +1,12 @@
-import multiprocessing.spawn
-from classes.teacher.batch_creator_worker import _batch_creator_worker
-from classes.teacher.inference_worker import _inference_worker
-from classes.teacher.result_processor_worker import _result_processor_worker
+from classes.teacher.exllamav2_runner.batch_creator_worker import _batch_creator_worker
+from classes.teacher.exllamav2_runner.inference_worker import _inference_worker
+from classes.teacher.exllamav2_runner.result_processor_worker import _result_processor_worker
 from classes.data_classes import ConvoTokenized
+from classes.data_manager import H5DataManager
 from classes.base_model import BaseModel
 from multiprocessing import get_context
 from tqdm import tqdm
+import multiprocessing.spawn
 import multiprocessing
 import nvidia_smi
 import torch
@@ -32,36 +33,6 @@ class TeacherModel(BaseModel):
         self.inference_workers: list[multiprocessing.Process] = []
         self.progress_bar: tqdm = None
 
-    def process_chunk(self, reserve_vram_gb: list[float] = [], num_inference_workers: int = 1, ids_to_collect: list = [], data_manager = None, validation: bool = False):
-        self._sort_datasets_by_len()
-
-        dataset_chunk = (self.validation_dataset if validation else self.dataset)
-        dataset_chunk = [convo for convo in dataset_chunk if convo.origin_convo_id in ids_to_collect]
-
-        with multiprocessing.Manager() as manager:
-            done_chunk = manager.Event()
-            made_distributions = manager.Event()
-            model_loaded = manager.Event()
-            start_inference = manager.Event()
-            inference_queue = manager.Queue(self.max_queue_size)
-            result_queue = manager.Queue(self.max_queue_size)
-            pbar_queue = manager.Queue(self.max_queue_size)
-
-            self.progress_bar = tqdm(total=len(dataset_chunk), desc="Convos", smoothing=0.06, leave=False)
-            self.data_manager = data_manager
-            self.reserve_vram = reserve_vram_gb
-
-            self._start_workers(done_chunk, num_inference_workers, made_distributions, model_loaded, start_inference, inference_queue, result_queue, self.data_manager.queue, pbar_queue, dataset_chunk)
-
-            while True:
-                self._manage_queues(pbar_queue)
-                if done_chunk.is_set() and self.data_manager.queue.empty() and pbar_queue.empty():
-                    break
-
-            self.data_manager.done_everything.wait()
-            self._stop_workers()
-            self.progress_bar.close()
-
     def _sort_datasets_by_len(self):
         if not self.dataset_sorted:
             self.dataset.sort(key=lambda convo: convo.length, reverse=True)
@@ -74,26 +45,13 @@ class TeacherModel(BaseModel):
     def _manage_queues(self, pbar_queue):
         while not pbar_queue.empty():
             action, value = pbar_queue.get()
-            self._pbar_actions(action, value)
+            match action:
+                case "increment":
+                    self.progress_bar.update(value)
+                case "str":
+                    self.progress_bar.set_postfix_str(value)
         time.sleep(0.05)
 
-    def _pbar_actions(self, action: str, value: int):
-        if action == "increment":
-            self.progress_bar.update(value)
-        elif action == "str":
-            self.progress_bar.set_postfix_str(value)
-
-    def _unload_full(self):
-        if self.progress_bar is not None:
-            self.progress_bar.set_postfix_str(f"Fully unloading {self.model_name}...")
-        self._stop_workers()
-        self.dataset = []
-        self.dataset_len = 0
-        self.validation_dataset = []
-        self.stop_id = 0
-        self.dataset_sorted = False
-        self.validation_dataset_sorted = False
-    
     def _start_workers(self, done_chunk, num_inference_workers, made_distributions, model_loaded, start_inference, inference_queue, result_queue, disk_queue, pbar_queue, dataset_chunk: list[ConvoTokenized]):
         self.progress_bar.set_postfix_str(f"Starting workers for {self.model_name[:20]}...")
 
@@ -137,9 +95,47 @@ class TeacherModel(BaseModel):
 
         if self.result_processor is not None and self.result_processor.is_alive():
             self.result_processor.terminate()
+            
+    def process_chunk(self, reserve_vram_gb: list[float] = [], num_inference_workers: int = 1, ids_to_collect: list = [], data_manager: H5DataManager = None, validation: bool = False):
+        self._sort_datasets_by_len()
+
+        dataset_chunk = (self.validation_dataset if validation else self.dataset)
+        dataset_chunk = [convo for convo in dataset_chunk if convo.origin_convo_id in ids_to_collect]
+
+        with multiprocessing.Manager() as manager:
+            done_chunk = manager.Event()
+            made_distributions = manager.Event()
+            model_loaded = manager.Event()
+            start_inference = manager.Event()
+            inference_queue = manager.Queue(self.max_queue_size)
+            result_queue = manager.Queue(self.max_queue_size)
+            pbar_queue = manager.Queue(self.max_queue_size)
+
+            self.progress_bar = tqdm(total=len(dataset_chunk), desc="Convos", smoothing=0.06, leave=False)
+            self.data_manager = data_manager
+            self.reserve_vram = reserve_vram_gb
+
+            self._start_workers(done_chunk, num_inference_workers, made_distributions, model_loaded, start_inference, inference_queue, result_queue, self.data_manager.queue, pbar_queue, dataset_chunk)
+
+            while True:
+                self._manage_queues(pbar_queue)
+                if done_chunk.is_set() and self.data_manager.done_everything.is_set() and pbar_queue.empty():
+                    break
+
+            self.data_manager.done_everything.wait()
+            self._stop_workers()
+            self.progress_bar.close()
 
     def close(self):
-        self._unload_full()
+        if self.progress_bar is not None:
+            self.progress_bar.set_postfix_str(f"Fully unloading {self.model_name}...")
+        self._stop_workers()
+        self.dataset = []
+        self.dataset_len = 0
+        self.validation_dataset = []
+        self.stop_id = 0
+        self.dataset_sorted = False
+        self.validation_dataset_sorted = False
         
         if self.progress_bar is not None:
             self.progress_bar.close()
