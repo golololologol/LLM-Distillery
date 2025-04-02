@@ -1,238 +1,291 @@
 import argparse
 import json
 import os
+from typing import List, Dict, Tuple, get_origin, get_args
+from pydantic import BaseModel, Field, field_validator, model_validator
+import sys
 
-class PathArgs:
-    def __init__(self, cache_folder: str, dataset_path: str, validation_dataset_path: str, teacher_models_folder: str, student_path: str):
-        self.cache_folder = cache_folder
-        self.dataset_path = dataset_path
-        self.validation_dataset_path = validation_dataset_path
-        self.teacher_models_folder = teacher_models_folder
-        self.student_path = student_path
 
-class PipelineArgs:
-    def __init__(self, max_cache_size_gb: float, ignore_model_type: bool, rebase_dataset: bool, use_teachers: bool):
-        self.max_cache_size_gb = max_cache_size_gb
-        self.ignore_model_type = ignore_model_type
-        self.rebase_dataset = rebase_dataset
-        self.use_teachers = use_teachers
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.lower() in ('yes', 'true', 't', '1'):
+        return True
+    elif isinstance(v, str) and v.lower() in ('no', 'false', 'f', '0'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
 
-class ModelArgs:
-    def __init__(self, context_len: int, save_sys_range: bool, save_user_range: bool, save_assistant_range: bool,
-                 crop_distr_to_size: int, enable_topK: bool, save_topK: int, device: str):
-        self.context_len = context_len
-        self.save_sys_range = save_sys_range
-        self.save_user_range = save_user_range
-        self.save_assistant_range = save_assistant_range
-        self.crop_distr_to_size = crop_distr_to_size
-        self.enable_topK = enable_topK
-        self.save_topK = save_topK
-        self.device = device
 
-class CollectionArgs:
-    def __init__(self, num_inference_workers: int, reserve_vram: list):
-        self.num_inference_workers = num_inference_workers
-        self.reserve_vram = reserve_vram
+class PipelineConfig(BaseModel):
+    """
+    Configuration class for the pipeline, containing all necessary parameters.\\
+    This class uses Pydantic for validation and serialization.
+    
+    If you want to add a new parameter, please follow the guidelines below:
+    1. Choose the correct section for the parameter based on its purpose (e.g., Paths, Cache settings, etc.).
+    2. Choose a descriptive name for the parameter that reflects its purpose.
+    3. Add the parameter to the appropriate section in this class and to the `config.json` file.
+    4. Make sure to add a description for the parameter in the pydantic `Field` and the docstring.
+    5. If you think that the parameter must be validated, add the appropriate validators to the parameter.
 
-class TrainingArgs:
-    def __init__(self, num_epochs: int, num_warmup_steps: int, batch_size: int, grad_accum_batches: int, grad_checkpointing: bool,
-                 temperature: float, lr: float, adam_betas: tuple, adam_decay: float, lr_decay_start: float, alpha: float,
-                 lr_scheduler: str, optimizer: str, data_order: str, training_precision: str, validate_every_n_epochs: float,
-                 save_student_every_n_epochs: float, num_gpu0_layers: int, device_map: str, max_memory: dict, multi_gpu: bool,
-                 save_final_state: bool, wandb_comment: str, wandb_project: str, use_flash_attn_2: bool):
-        self.num_epochs = num_epochs
-        self.num_warmup_steps = num_warmup_steps
-        self.batch_size = batch_size
-        self.grad_accum_batches = grad_accum_batches
-        self.grad_checkpointing = grad_checkpointing
-        self.temperature = temperature
-        self.lr = lr
-        self.adam_betas = adam_betas
-        self.adam_decay = adam_decay
-        self.lr_decay_start = lr_decay_start
-        self.alpha = alpha
-        self.lr_scheduler = lr_scheduler
-        self.optimizer = optimizer
-        self.data_order = data_order
-        self.training_precision = training_precision
-        self.validate_every_n_epochs = validate_every_n_epochs
-        self.save_student_every_n_epochs = save_student_every_n_epochs
-        self.num_gpu0_layers = num_gpu0_layers
-        self.device_map = device_map
-        self.max_memory = max_memory
-        self.multi_gpu = multi_gpu
-        self.save_final_state = save_final_state
-        self.wandb_comment = wandb_comment
-        self.wandb_project = wandb_project
-        self.use_flash_attn_2 = use_flash_attn_2
+    Example parameter:
+    ```
+    new_parameter: type_of_param = Field(..., description="User-facing description of the new parameter. {type_of_param}")
+    \"\"\"Developer-facing description of the new parameter.\"\"\"
+    ```
+    
+    Pydantic Field validators:
+    - `Field(..., gt=x)` gt - greater than
+    - `Field(..., ge=x)` ge - greater than or equal to
+    - `Field(..., lt=x)` lt - less than
+    - `Field(..., le=x)` le - less than or equal to
+    - ...
+    """
+    
+    
+    # Paths
+    cache_folder: str = Field(..., min_length=1, description="Directory for cache storage. Ideally should be an empty folder. {string}")
+    """Directory for cache storage."""
+    
+    dataset_path: str = Field(..., min_length=1, description="Path to the training dataset. {string}")
+    """Path to the training dataset."""
+    
+    validation_dataset_path: str = Field(..., min_length=1, description="Path to the validation dataset. {string}")
+    """Path to the validation dataset."""
+    
+    teacher_models_folder: str = Field(..., min_length=1, description="Directory containing teacher models, or a path to just one teacher directly. {string}")
+    """Directory containing teacher models, or a path to just one teacher directly."""
+    
+    student_path: str = Field(..., min_length=1, description="Path to the student model. {string}")
+    """Path to the student model."""
 
-class StudentArgs:
-    def __init__(self, freeze_layers: list, add_bos: bool, prompt_format: dict):
-        self.freeze_layers = freeze_layers
-        self.add_bos = add_bos
-        self.prompt_format = prompt_format
 
-class Config:
-    def __init__(self, path_args: PathArgs, pipeline_args: PipelineArgs,
-                 model_args: ModelArgs, collection_args: CollectionArgs, training_args: TrainingArgs, student_args: StudentArgs):
-        self.paths = path_args
-        self.pipeline = pipeline_args
-        self.model = model_args
-        self.collection = collection_args
-        self.training = training_args
-        self.student = student_args
+    # Cache settings
+    max_cache_size_gb: float = Field(..., gt=0, description="Maximum cache size in GB. Used to keep the main h5 dataset under this limit, and use chunked collection+training when the calculated size of the collected h5 dataset is over this limit. Only tracks the main h5 dataset's size, any misc. files/states are not counted. {float}")
+    """Maximum cache size in GB."""
 
-def load_config_args():
-    parser = argparse.ArgumentParser(
-        description="Set parameters for the script.",
-        formatter_class=argparse.RawTextHelpFormatter
-    )
 
-    # ----- Path Arguments -----
-    path_group = parser.add_argument_group('Path args')
-    path_group.add_argument('--cache_folder', '-c', type=str, help='Directory for cache storage.')
-    path_group.add_argument('--dataset_path', '-d', type=str, help='Path to the training dataset.')
-    path_group.add_argument('--validation_dataset_path', '-vd', type=str, help='Path to the validation dataset.')
-    path_group.add_argument('--teacher_models_folder', '-tm', type=str, help='Directory containing teacher models.')
-    path_group.add_argument('--student_path', '-s', type=str, help='Path to the student model.')
+    # Pipeline settings
+    ignore_model_type: bool = Field(..., description="If True, will let completion teachers collect instruct data, and instruct teachers completion data. Use at your own discretion. {bool}")
+    """Flag to ignore teacher model type checks."""
+    
+    rebase_dataset: bool = Field(..., description="Rebase the dataset without safety checks. Overwrites all metadata in the h5 dataset. {bool}")
+    """Flag to rebase the dataset."""
 
-    # ----- Cache Arguments -----
-    cache_group = parser.add_argument_group('Cache args')
-    cache_group.add_argument('--max_cache_size_gb', '-maxgb', type=float, help='Maximum cache size in GB.')
 
-    # ----- Pipeline Arguments -----
-    pipeline_group = parser.add_argument_group('Pipeline args')
-    pipeline_group.add_argument('--ignore_model_type', type=bool, help='If True, ignore model type.')
-    pipeline_group.add_argument('--rebase_dataset', type=bool, help='Rebase the dataset without safety checks.')
-    pipeline_group.add_argument('--use_teachers', type=bool, help='Whether to use teacher models.')
+    # General model settings
+    use_teachers: bool = Field(..., description="Whether to use teachers for distillation. {bool}")
+    """Flag to enable teacher models for distillation."""
+    
+    context_len: int = Field(..., gt=0, description="Context length to collect and train on. {int}")
+    """Context length for training."""
+    
+    save_sys_range: bool = Field(..., description="Boolean flag to save specific token ranges within conversations (system role). {bool}")
+    """Flag to save system token range."""
+    
+    save_user_range: bool = Field(..., description="Boolean flag to save specific token ranges within conversations (user role). {bool}")
+    """Flag to save user token range."""
+    
+    save_assistant_range: bool = Field(..., description="Boolean flag to save specific token ranges within conversations (assistant role). {bool}")
+    """Flag to save assistant token range."""
+    
+    crop_distr_to_size: int = Field(..., gt=0, description="Crop distribution size for token filtering. Must be set to the base-model's vocabulary size. {int}")
+    """Size limit for distribution cropping."""
+    
+    enable_topK: bool = Field(..., description="Enable top-K sampling for collecting and training. {bool}")
+    """Flag to enable top-K sampling."""
+    
+    save_topK: int = Field(..., ge=0, description="Configure top-K sampling for collecting and training. {int}")
+    """Number of top-K tokens to save."""
+    
+    device: str = Field(..., min_length=1, description="Main device for any single-device tensor operations (e.g., cuda:0). {string}")
+    """Main device for computations (e.g., cuda:0)."""
 
-    # ----- General Model Arguments -----
-    model_group = parser.add_argument_group('General model args')
-    model_group.add_argument('--context_len', '-ctx', type=int, help='Context length.')
-    model_group.add_argument('--save_sys_range', type=bool, help='Save system token range.')
-    model_group.add_argument('--save_user_range', type=bool, help='Save user token range.')
-    model_group.add_argument('--save_assistant_range', type=bool, help='Save assistant token range.')
-    model_group.add_argument('--crop_distr_to_size', type=int, help='Crop distribution size.')
-    model_group.add_argument('--enable_topK', type=bool, help='Enable top-K sampling.')
-    model_group.add_argument('--save_topK', '-topk', type=int, help='Top-K value.')
-    model_group.add_argument('--device', type=str, help='Device to use.')
 
-    # ----- Collection Arguments -----
-    collection_group = parser.add_argument_group('Collection args')
-    collection_group.add_argument('--num_inference_workers', '-niw', type=int, help='Number of inference workers.')
-    collection_group.add_argument('--reserve_vram', type=float, nargs='+', help='Amount of VRAM to reserve per GPU.')
+    # Collection settings
+    num_inference_workers: int = Field(..., gt=0, description="Number of inference workers to use. {int}")
+    """Number of inference workers to use."""
+    
+    reserve_vram: List[float] = Field(..., description="Amount of VRAM to reserve per GPU during collection. {float list}")
+    """Amount of VRAM to reserve per GPU."""
 
-    # ----- Training Arguments -----
-    training_group = parser.add_argument_group('Training args')
-    training_group.add_argument('--num_epochs', '-ne', type=int, help='Number of training epochs.')
-    training_group.add_argument('--num_warmup_steps', '-nws', type=int, help='Number of warmup steps.')
-    training_group.add_argument('--batch_size', '-bs', type=int, help='Training batch size.')
-    training_group.add_argument('--grad_accum_batches', '-g', type=int, help='Gradient accumulation batches.')
-    training_group.add_argument('--grad_checkpointing', type=bool, help='Enable gradient checkpointing.')
-    training_group.add_argument('--temperature', '-t', type=float, help='Temperature.')
-    training_group.add_argument('--lr', '-lr', type=float, help='Learning rate.')
-    training_group.add_argument('--adam_betas', '-ab', type=float, nargs='+', help='Adam betas.')
-    training_group.add_argument('--adam_decay', type=float, help='Adam decay.')
-    training_group.add_argument('--lr_decay_start', type=float, help='LR decay start percentage.')
-    training_group.add_argument('--alpha', type=float, help='Alpha weighting factor.')
-    training_group.add_argument('--lr_scheduler', type=str, help='LR scheduler name.')
-    training_group.add_argument('--optimizer', type=str, help='Optimizer name.')
-    training_group.add_argument('--data_order', type=str, help='Order of data samples.')
-    training_group.add_argument('--training_precision', type=str, help='Training precision.')
-    training_group.add_argument('--validate_every_n_epochs', type=float, help='Validation frequency in epochs.')
-    training_group.add_argument('--save_student_every_n_epochs', type=float, help='Student saving frequency in epochs.')
-    training_group.add_argument('--num_gpu0_layers', type=int, help='Number of layers for GPU 0.')
-    training_group.add_argument('--device_map', type=str, help='Device mapping strategy.')
-    training_group.add_argument('--max_memory', type=json.loads, help='Maximum memory allocation as a JSON dict.')
-    training_group.add_argument('--multi_gpu', type=bool, help='Enable multi-GPU training.')
-    training_group.add_argument('--save_final_state', type=bool, help='Save final model state.')
-    training_group.add_argument('--wandb_comment', '-wdb', type=str, help='Wandb comment.')
-    training_group.add_argument('--wandb_project', type=str, help='Wandb project name.')
-    training_group.add_argument('--use_flash_attn_2', '-fa2', type=bool, help='Use Flash Attention 2.')
 
-    # ----- Student Arguments -----
-    student_group = parser.add_argument_group('Student args')
-    student_group.add_argument('--freeze_layers', '-fl', type=str, nargs='+', help='List of layers to freeze.')
-    student_group.add_argument('--add_bos', type=bool, help='Add beginning-of-sequence token.')
-    student_group.add_argument('--prompt_format', type=json.loads, help='Prompt format as JSON.')
+    # Training settings
+    num_epochs: int = Field(..., gt=0, description="Number of training epochs. {int}")
+    """Number of training epochs."""
+    
+    num_warmup_steps: int = Field(..., ge=0, description="Number of warmup steps for learning rate. {int}")
+    """Number of warmup steps for learning rate."""
+    
+    batch_size: int = Field(..., gt=0, description="Training batch size. {int}")
+    """Batch size for training."""
+    
+    grad_accum_batches: int = Field(..., gt=0, description="Number of gradient accumulations before calling optimizer.step(). {int}")
+    """Number of gradient accumulations before optimizer step."""
+    
+    grad_checkpointing: bool = Field(..., description="Enable gradient checkpointing for memory savings. {bool}")
+    """Flag to enable gradient checkpointing."""
+    
+    temperature: float = Field(..., ge=0, description="Temperature for distillation. {float}")
+    """Distillation temperature."""
+    
+    lr: float = Field(..., gt=0, description="Learning rate. {float}")
+    """Learning rate."""
+    
+    adam_betas: Tuple[float, float] = Field(..., description="Betas for Adam-like optimizers. Must be a list of two floats. {list}")
+    """Betas for Adam-like optimizers."""
+    
+    adam_decay: float = Field(..., ge=0, description="Decay for Adam-like optimizers. {float}")
+    """Decay for Adam-like optimizers."""
+    
+    lr_decay_start: float = Field(..., ge=0, le=1, description="Start decaying learning rate to 0 at this percentage of total training steps (0.1 for 10% of total training steps). {float}")
+    """Start ratio for lr decay."""
+    
+    alpha: float = Field(..., description="Weighting factor for weighted losses. {float}")
+    """Weighting factor for weighted losses."""
+    
+    lr_scheduler: str = Field(..., description="Learning rate scheduler name. {string}")
+    """Name of the learning rate scheduler to use."""
+    
+    optimizer: str = Field(..., description="Optimizer name. (adam, adamw, etc.) {string}")
+    """Name of the optimizer to use."""
+    
+    data_order: str = Field(..., description="Order of samples during training. {string}")
+    """Name of the order of samples to use during training."""
+    
+    training_precision: str = Field(..., description="Training precision. (fp32, fp16, bf16, etc.) {string}")
+    """Name of the precision to use for training."""
+    
+    validate_every_n_epochs: float = Field(..., gt=0, description="Validation frequency measured in epochs. Accepts floating point values. {float}")
+    """Validation frequency in epochs."""
+    
+    save_student_every_n_epochs: float = Field(..., gt=0, description="Frequency of saving student model in epochs. {float}")
+    """Frequency to save the student model in epochs."""
+    
+    num_gpu0_layers: int = Field(..., ge=0, description="Number of layers for GPU 0. Used only with device_map = \"custom\". {int}")
+    """Number of layers on GPU 0."""
+    
+    device_map: str = Field(..., description="Device mapping strategy. {string}")
+    """Name of the device mapping strategy to use."""
+    
+    max_memory: Dict[int, str] = Field(..., description="Maximum memory allocation for each device. {dict[str, str]}")
+    """Maximum memory allocation for each device."""
+    
+    multi_gpu: bool = Field(..., description="Whether to do multi-GPU training. {bool}")
+    """Flag to enable multi-GPU training."""
+    
+    save_final_state: bool = Field(..., description="Save the final model state after training. {bool}")
+    """Flag to save the final model state."""
+    
+    wandb_comment: str = Field(..., description="A comment for Weights and Biases logging. {string}")
+    """Comment for Weights and Biases logging."""
+    
+    wandb_project: str = Field(..., description="Weights and Biases project name. {string}")
+    """Weights and Biases project name."""
+    
+    use_flash_attn_2: bool = Field(..., description="Whether to use Flash Attention 2. {bool}")
+    """Flag to use Flash Attention 2."""
 
+
+    # Student settings
+    freeze_layers: List[str] = Field(..., description="Layers to freeze during training. {string list}")
+    """List of layers to freeze during training."""
+    
+    add_bos: bool = Field(..., description="Add a beginning-of-sequence token to every sample. {bool}")
+    """Flag to add a BOS token to every sample."""
+    
+    prompt_format: Dict = Field(..., description="Prompt format to use for instruct samples. {JSON}")
+    """Prompt format for instruct samples."""
+
+
+    @field_validator('adam_betas', 'max_memory', 'prompt_format', mode='before')
+    def convert_fields(cls, v, info):
+        if info.field_name == 'adam_betas' and isinstance(v, list):
+            return tuple(v)
+        if info.field_name == 'max_memory' and isinstance(v, dict):
+            return {int(k): val for k, val in v.items() if k.lower() != 'cpu'}
+        if info.field_name == 'prompt_format' and isinstance(v, str):
+            return json.loads(v)
+        return v
+
+    @model_validator(mode='before')
+    def enforce_topk_flag(cls, values):
+        if values.get('save_topK') not in (None, 0):
+            values['enable_topK'] = True
+        return values
+
+
+def load_json_config(config_path: str) -> dict:
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"Config file not found at {config_path}!\nPlease ensure the file exists in the specified location."
+        )
+    with open(config_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def generate_cli_arguments(parser: argparse.ArgumentParser, model: BaseModel):
+    """
+    Auto-generate CLI arguments from the Pydantic model's fields.
+    """
+    for field_name, model_field in model.model_fields.items():
+        arg_name = f"--{field_name}"
+        field_type = model_field.annotation
+        help_text = model_field.description
+        kwargs = {"help": help_text, "dest": field_name, "required": False}
+        origin = get_origin(field_type)
+
+        # Handle list or tuple types
+        if origin in (list, tuple):
+            kwargs["nargs"] = "+"
+            # Infer element type if available
+            args_type = get_args(field_type)
+            kwargs["type"] = args_type[0] if args_type else str
+        elif field_type == bool:
+            # For booleans, use custom conversion function
+            kwargs["type"] = str2bool
+        else:
+            kwargs["type"] = field_type
+
+        parser.add_argument(arg_name, **kwargs)
+
+
+def merge_config(cli_args: dict, json_config: dict) -> dict:
+    """
+    Merge CLI arguments with JSON config values. CLI args override JSON config.
+    """
+    merged = json_config.copy()
+    for key, value in cli_args.items():
+        if value is not None:
+            merged[key] = value
+    return merged
+
+
+def get_config(config_path=None) -> PipelineConfig:
+    """
+    Loads JSON configuration and merges it with CLI arguments,
+    then returns a validated PipelineConfig instance.
+    """
+    config_path = os.path.join(os.path.dirname(__file__), 'config.json') if config_path is None else config_path
+    json_config = load_json_config(config_path)
+
+    # Check if config.json has all the parameters of the PipelineConfig
+    missing_keys = [field for field in PipelineConfig.model_fields if field not in json_config]
+    if missing_keys:
+        print(f"Error: config.json is missing the following parameters: {', '.join(missing_keys)}")
+        print("\nPlease add them to the config file!")
+        sys.exit(1)
+
+    parser = argparse.ArgumentParser(description="Set parameters for the script.")
+    generate_cli_arguments(parser, PipelineConfig)
     args = parser.parse_args()
+    cli_args = vars(args)
 
-    # Load file-based defaults if available
-    config_path = os.path.join(os.path.dirname(__file__), 'config.json')
-    file_config = {}
-    if os.path.exists(config_path):
-        with open(config_path, 'r') as f:
-            file_config = json.load(f)
+    merged_params = merge_config(cli_args, json_config)
+    return PipelineConfig(**merged_params)
 
-    # Utility to return the command-line argument if given, else fallback to the config file default
-    def get_arg(key, default=None):
-        return getattr(args, key, None) if getattr(args, key, None) is not None else file_config.get(key, default)
 
-    path_args = PathArgs(
-        cache_folder=get_arg('cache_folder'),
-        dataset_path=get_arg('dataset_path'),
-        validation_dataset_path=get_arg('validation_dataset_path'),
-        teacher_models_folder=get_arg('teacher_models_folder'),
-        student_path=get_arg('student_path')
-    )
-
-    pipeline_args = PipelineArgs(
-        max_cache_size_gb=get_arg('max_cache_size_gb'),
-        ignore_model_type=get_arg('ignore_model_type'),
-        rebase_dataset=get_arg('rebase_dataset'),
-        use_teachers=get_arg('use_teachers')
-    )
-
-    model_args = ModelArgs(
-        context_len=get_arg('context_len'),
-        save_sys_range=get_arg('save_sys_range'),
-        save_user_range=get_arg('save_user_range'),
-        save_assistant_range=get_arg('save_assistant_range'),
-        crop_distr_to_size=get_arg('crop_distr_to_size'),
-        enable_topK=get_arg('enable_topK'),
-        save_topK=get_arg('save_topK'),
-        device=get_arg('device')
-    )
-
-    collection_args = CollectionArgs(
-        num_inference_workers=get_arg('num_inference_workers'),
-        reserve_vram=get_arg('reserve_vram')
-    )
-
-    adam_betas_val = tuple(get_arg('adam_betas')) if get_arg('adam_betas') is not None else None
-    training_args = TrainingArgs(
-        num_epochs=get_arg('num_epochs'),
-        num_warmup_steps=get_arg('num_warmup_steps'),
-        batch_size=get_arg('batch_size'),
-        grad_accum_batches=get_arg('grad_accum_batches'),
-        grad_checkpointing=get_arg('grad_checkpointing'),
-        temperature=get_arg('temperature'),
-        lr=get_arg('lr'),
-        adam_betas=adam_betas_val,
-        adam_decay=get_arg('adam_decay'),
-        lr_decay_start=get_arg('lr_decay_start'),
-        alpha=get_arg('alpha'),
-        lr_scheduler=get_arg('lr_scheduler'),
-        optimizer=get_arg('optimizer'),
-        data_order=get_arg('data_order'),
-        training_precision=get_arg('training_precision'),
-        validate_every_n_epochs=get_arg('validate_every_n_epochs'),
-        save_student_every_n_epochs=get_arg('save_student_every_n_epochs'),
-        num_gpu0_layers=get_arg('num_gpu0_layers'),
-        device_map=get_arg('device_map'),
-        max_memory=get_arg('max_memory'),
-        multi_gpu=get_arg('multi_gpu'),
-        save_final_state=get_arg('save_final_state'),
-        wandb_comment=get_arg('wandb_comment'),
-        wandb_project=get_arg('wandb_project'),
-        use_flash_attn_2=get_arg('use_flash_attn_2')
-    )
-
-    student_args = StudentArgs(
-        freeze_layers=get_arg('freeze_layers'),
-        add_bos=get_arg('add_bos'),
-        prompt_format=get_arg('prompt_format')
-    )
-
-    return Config(path_args, pipeline_args, model_args, collection_args, training_args, student_args)
+if __name__ == '__main__':
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.json')
+    config = get_config(config_path=config_path)
+    print(config.model_dump_json(indent=4))

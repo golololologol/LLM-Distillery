@@ -1,12 +1,17 @@
 from utils.convert_to_safetensor import convert_model
 from classes.data_classes import ConvoTokenized
 from utils.vocab_utils import get_vocab_family
+from classes.args import PipelineConfig
 from transformers import AutoTokenizer
-from typing import Optional
+from typing import Optional, Any
 from tqdm import tqdm
 import codecs
 import json
 import os
+
+
+__CONFIG_NAME__ = "pipeline_config.json"
+__PROMPT_FORMAT_NAME__ = "prompt_format.json"
 
 
 def is_model_safetensors(model_path: str):
@@ -15,37 +20,7 @@ def is_model_safetensors(model_path: str):
             if file.endswith('.safetensors'):
                 return True
     return False
-
-
-def load_prompt_format(model_path: str) -> None | dict:
-    prompt_format_path = os.path.join(model_path, "prompt_format.json")
-    if not os.path.exists(prompt_format_path):
-        return None
-    
-    with open(prompt_format_path, 'r', encoding='utf-8') as file:
-        return json.load(file)
-    
-
-def save_prompt_format(prompt_format: dict, save_folder: str):
-    prompt_format_path = os.path.join(save_folder, "prompt_format.json")
-    with open(prompt_format_path, 'w', encoding='utf-8') as file:
-        json.dump(prompt_format, file, ensure_ascii=False, indent=4)
-
-
-def load_config(model_path):
-    config_path = os.path.join(model_path, "pipeline_config.json")
-    if not os.path.exists(config_path):
-        return None
-    
-    with open(config_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
-    
-
-def save_config(config, model_path):
-    config_path = os.path.join(model_path, "pipeline_config.json")
-    with open(config_path, 'w', encoding='utf-8') as f:
-        json.dump(config, f, ensure_ascii=False, indent=4)
-
+        
 
 def input_prompt_format():
     prompt_format = {
@@ -120,41 +95,42 @@ class BaseModel:
     """
     Base class for all models, contains common attributes and methods.
     """
-    def __init__(self, model_path: str, student: bool = False):
+    def __init__(self, pipe_config: PipelineConfig, model_path: str, student: bool = False):
         self.student: bool = student
         self.model_path: str = model_path
+        
         self.model_name: str = ""
-        self.device: str = "cuda:0"
-        self.prompt_format: dict = {}
-        self.completion: bool = False
+        self.device: str = pipe_config.device
+        self.prompt_format: dict = None
+        self.completion: bool = None
 
-        self.batch_size: int = 0
-        self.add_bos: bool = False
-        self.context_len: int = 0
-        self.seq_chunk_len: int = 0
+        self.batch_size: int = None
+        self.add_bos: bool = None
+        self.context_len: int = None
+        self.seq_chunk_len: int = None
 
         self.progress_bar: Optional[tqdm] = None
 
-        self.dataset: list[ConvoTokenized] = []
-        self.dataset_len: int = 0
-        self.dataset_sorted: bool = False
+        self.dataset: list[ConvoTokenized] = None
+        self.dataset_len: int = None
+        self.dataset_sorted: bool = None
 
-        self.validation_dataset: list[ConvoTokenized] = []
-        self.validation_dataset_batched: list[list[ConvoTokenized]] = []
-        self.validation_dataset_len: int = 0
-        self.validation_dataset_sorted: bool = False
+        self.validation_dataset: list[ConvoTokenized] = None
+        self.validation_dataset_batched: list[list[ConvoTokenized]] = None
+        self.validation_dataset_len: int = None
+        self.validation_dataset_sorted: bool = None
         
         self.vocab: dict = {}
         self.vocab_tokens_set: set = set()
         self.vocab_family: str = ""
         self.special_tokens: dict = {}
-        self.temperature: float = 1.0
-        self.crop_to_size: int = 0
-        self.enable_topK: bool = False
-        self.topK: int = 0
-        self._prepare()
+        self.temperature: float = pipe_config.temperature
+        self.crop_to_size: int = pipe_config.crop_distr_to_size
+        self.enable_topK: bool = pipe_config.enable_topK
+        self.topK: int = pipe_config.save_topK
+        self._prepare(pipe_config)
 
-    def _prepare(self):
+    def _prepare(self, pipe_config: PipelineConfig):
         self.model_name = os.path.basename(self.model_path)
 
         if os.path.exists(f"{self.model_path}_safetensors"):
@@ -163,24 +139,29 @@ class BaseModel:
         if not is_model_safetensors(self.model_path):
             self.model_path = convert_model(self.model_path)
 
-        pf = load_prompt_format(self.model_path)
-        if pf is None:
-            print(f"\n{self.model_name} has no prompt format")
-            pf = input_prompt_format()
-            save_prompt_format(pf, self.model_path)
+        if self.student:
+            pf = pipe_config.prompt_format
+            config = {
+                'batch_size': pipe_config.batch_size,
+                'add_bos': pipe_config.add_bos,
+            }
+        else:
+            pf = self.load_json_data(__PROMPT_FORMAT_NAME__)
+            if pf is None:
+                print(f"\n{self.model_name} has no prompt format")
+                pf = input_prompt_format()
+                save_prompt_format(pf, self.model_path)
 
-        config = load_config(self.model_path)
-        if config is None:
-            print(f"\n{self.model_name} has no config")
-            config = input_config()
-            save_config(config, self.model_path)
+            config = load_config(self.model_path)
+            if config is None:
+                print(f"\n{self.model_name} has no config")
+                config = input_config()
+                save_config(config, self.model_path)
 
         self.prompt_format = pf
         self.batch_size = config.get('batch_size', 1)
         self.add_bos = config.get('add_bos', True)
         self.completion = config.get('completion', False)
-        
-        self.seq_chunk_len = config.get('seq_chunk_len', 256)
         self.vocab_family = get_vocab_family(model_path=self.model_path)
         
         tokenizer = AutoTokenizer.from_pretrained(self.model_path)
@@ -205,21 +186,60 @@ class BaseModel:
         file.write(json.dumps(convo_dict, ensure_ascii=False) + "\n")
         file_content.write(json.dumps(content_convo_dict, ensure_ascii=False) + "\n")
 
-    def write_dataset_to_file(self, folder: str):
+    def write_dataset_to_file(self, folder: str, identifier: str = "", validation: bool = False):
+        """
+        Write the dataset to a file in JSONL format. Each line is a JSON object representing a conversation 
+
+        Args:
+            folder (str): The folder where the dataset will be saved.
+            identifier (str): An optional identifier to append to the filenames.
+            validation (bool): Whether to write the validation dataset or the main dataset.
+            
+        
+        """
+        insert = "validation_" if validation else ""
+        dataset = self.validation_dataset if validation else self.dataset
+        
         tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        path = os.path.join(folder, "tokenized_dataset.jsonl")
-        path_content = os.path.join(folder, "content_tokenized_dataset.jsonl")
+        path = os.path.join(folder, f"{identifier}_tokenized_{insert}dataset.jsonl")
+        path_content = os.path.join(folder, f"{identifier}_content_tokenized_{insert}dataset.jsonl")
         with open(path, 'w', encoding='utf-8') as file:
             with open(path_content, 'w', encoding='utf-8') as file_content:
-                for convo in tqdm(self.dataset, desc="Writing dataset to file"):
+                for convo in tqdm(dataset, desc="Writing dataset to file"):
                     self._write_convo_to_file(file, file_content, convo, tokenizer)
+                    
+    def load_json_data(self, file_name: str) -> None | Any:
+        """
+        Load JSON data from a file in the model directory.\\
+        If the file does not exist, return None. Else return the data.
+        
+        Args:
+            file_name (str): The name of the file to load.
 
-    def write_validation_dataset_to_file(self, folder: str):
-        tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        path = os.path.join(folder, "tokenized_validation_dataset.jsonl")
-        path_content = os.path.join(folder, "content_tokenized_validation_dataset.jsonl")
-        with open(path, 'w', encoding='utf-8') as file:
-            with open(path_content, 'w', encoding='utf-8') as file_content:
-                for convo in tqdm(self.validation_dataset, desc="Writing validation dataset to file"):
-                    self._write_convo_to_file(file, file_content, convo, tokenizer)
+        Returns:
+            None | Any: The loaded data or None if the file does not exist.
+        """
+        
+        data_path = os.path.join(self.model_path, file_name)
+        
+        if not os.path.exists(data_path):
+            return None
+    
+        with open(data_path, 'r', encoding='utf-8') as file:
+            return json.load(file)
+        
+    def save_json_data(self, data: Any, file_name: str) -> None:
+        """
+        Save JSON data to a file in the model directory.\\
+        If the file does not exist, create it.\\
+        If the file exists, overwrite it.
 
+        Args:
+            data (Any): The data to save.
+            file_name (str): The name of the file to save the data to.
+        """
+        
+        data_path = os.path.join(self.model_path, file_name)
+        
+        with open(data_path, 'w', encoding='utf-8') as file:
+            json.dump(data, file, ensure_ascii=False, indent=4)

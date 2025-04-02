@@ -5,6 +5,7 @@ from classes.data_manager import H5DataManager
 from transformers import BitsAndBytesConfig
 from multiprocessing import shared_memory
 from classes.base_model import BaseModel
+from classes.args import PipelineConfig
 from classes.losses import Losses
 from classes.paths import Paths
 from typing import Optional
@@ -22,28 +23,26 @@ os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['WANDB_SILENT'] = 'true'
 
 class StudentModel(BaseModel):
-    def __init__(self, model_path: str, paths: Paths, add_bos: bool, prompt_format: dict, batch_size: int):
-        super().__init__(model_path, student=True)
+    def __init__(self, config: PipelineConfig, paths: Paths):
+        super().__init__(config, student=True)
 
         self.model: Optional[AutoModelForCausalLM] = None
         self.adapter = None
         self.tokenizer: Optional[AutoTokenizer] = None
-        self.add_bos = add_bos
-        self.prompt_format = prompt_format
-        self.batch_size = batch_size
+        self.batch_size = 0
         self.paths: Paths = paths
         self.losses: Losses = None
 
-        self.optimizer_name = ""
+        self.optimizer_name = config.optimizer
         self.optimizer = None
         self.lr_scheduler_name = ""
         self.lr_scheduler = None
         self.lr = 0.0
-        self.adam_betas = (0.9, 0.99)
-        self.adam_decay = 2e-6
+        self.adam_betas = (0.0, 0.0)
+        self.adam_decay = 0.0
         self.lr_decay_start = 0.0 # wsd only
-        self.final_lr = 1e-9 # wsd only
-        self.alpha: float = 1
+        self.final_lr = 0 # wsd only
+        self.alpha: float = 0
 
         self.num_epochs = 0
         self.total_training_steps = 0
