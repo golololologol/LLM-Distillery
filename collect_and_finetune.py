@@ -190,7 +190,7 @@ def main():
         world_size = num_gpus()
     else:
         world_size = 1
-    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(find_free_port())
 
     if world_size > 1:

@@ -112,24 +112,33 @@ class StudentModel:
         self.optimizer = None
         self.lr_scheduler = None
         self.logger = None
+        self.rank = 0
+        self.world_size = 1
+
+    def _log(self, msg):
+        if self.rank == 0:
+            print(msg)
+
+    def _barrier(self):
+        if self.world_size > 1:
+            dist.barrier()
 
     def train(self, train_target, rank, world_size):
+        self.rank = rank
+        self.world_size = world_size
         c = self.config
 
-        if rank == 0:
-            print(f"  Preparing tokenizer and byte vocab index for {self.model_name}...")
+        self._log(f"  Preparing tokenizer and byte vocab index for {self.model_name}...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
         if c.chat_template:
             self.tokenizer.chat_template = c.chat_template
-        self.byte_vocab = ByteVocabIndex(self.tokenizer)
+        self.byte_vocab = ByteVocabIndex(self.tokenizer, device=f"cuda:{rank}")
 
         save_roles = set(c.save_roles)
-        if rank == 0:
-            print("  Preprocessing training data...")
+        self._log("  Preprocessing training data...")
         train_samples = read_jsonl(c.dataset_path)
         train_convos = preprocess_samples(train_samples[rank::world_size], self.tokenizer, self.context_len, save_roles)
-        if rank == 0:
-            print("  Preprocessing validation data...")
+        self._log("  Preprocessing validation data...")
         val_samples = read_jsonl(c.validation_dataset_path)
         val_convos = preprocess_samples(val_samples, self.tokenizer, self.context_len, save_roles)
         val_convos.sort(key=lambda cv: cv.length, reverse=True)
@@ -141,23 +150,19 @@ class StudentModel:
                 self.student_config.resume_from, self.paths.student_states, self.model_name
             )
             self.model_path = checkpoint_dir
-            if rank == 0:
-                print(f"  Resuming from checkpoint: {checkpoint_dir}")
+            self._log(f"  Resuming from checkpoint: {checkpoint_dir}")
 
-        if rank == 0:
+        if self.rank == 0:
             cleanup_incomplete_checkpoints(self.paths.student_states)
             cleanup_incomplete_checkpoints(self.paths.student_trained)
-        if world_size > 1:
-            dist.barrier()
+        self._barrier()
 
-        if rank == 0:
-            print(f"  Loading model: {self.model_name}...")
+        self._log(f"  Loading model: {self.model_name}...")
         self._load_model(rank)
         self.model = wrap_distributed(self.model, self._resolve_strategy(), self.config.training_precision, rank, world_size)
 
         if c.torch_compile:
-            if rank == 0:
-                print("  Compiling model with torch.compile...")
+            self._log("  Compiling model with torch.compile...")
             logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             # Per-layer compilation avoids layer_idx recompilation (5-8x faster compile)
@@ -180,18 +185,16 @@ class StudentModel:
                 self.optimizer, c.lr_scheduler, warmup_steps,
                 grad_accum_steps, dataset_steps, c.lr_decay_start, c.lr, 1e-9
             )
-        if rank == 0:
-            print(f"  Optimizer: {c.optimizer}, Scheduler: {c.lr_scheduler}, LR: {c.lr}")
+        self._log(f"  Optimizer: {c.optimizer}, Scheduler: {c.lr_scheduler}, LR: {c.lr}")
 
         if checkpoint_dir:
             resume_state = load_training_state(
                 checkpoint_dir, self.model, self.optimizer, self.lr_scheduler,
                 self._resolve_strategy(), rank, world_size
             )
-            if rank == 0:
-                print(f"  Restored training state: epoch={resume_state.epoch}, num_trained={resume_state.num_trained}")
+            self._log(f"  Restored training state: epoch={resume_state.epoch}, num_trained={resume_state.num_trained}")
 
-        if rank == 0:
+        if self.rank == 0:
             self._setup_logger(resume_state)
 
         data_manager = H5DataManager(self.paths.dataset, teacher_name=train_target, read_only=True)
@@ -202,25 +205,24 @@ class StudentModel:
         train_convos = [convo for convo in train_convos if convo.origin_convo_id in train_available]
         val_convos = [convo for convo in val_convos if convo.origin_convo_id in val_available]
 
-        if world_size > 1:
-            local_count = torch.tensor([len(train_convos)], dtype=torch.long, device=f"cuda:{rank}")
-            all_counts = [torch.zeros(1, dtype=torch.long, device=f"cuda:{rank}") for _ in range(world_size)]
+        if self.world_size > 1:
+            local_count = torch.tensor([len(train_convos)], dtype=torch.long, device=f"cuda:{self.rank}")
+            all_counts = [torch.zeros(1, dtype=torch.long, device=f"cuda:{self.rank}") for _ in range(self.world_size)]
             dist.all_gather(all_counts, local_count)
             max_count = max(int(t.item()) for t in all_counts)
             assert max_count > 0, "No training conversations available after filtering"
             if len(train_convos) < max_count:
-                assert len(train_convos) > 0, f"Rank {rank} has 0 conversations after filtering, cannot pad"
+                assert len(train_convos) > 0, f"Rank {self.rank} has 0 conversations after filtering, cannot pad"
                 original_len = len(train_convos)
                 train_convos.extend(train_convos[i % original_len] for i in range(max_count - original_len))
 
         final_meta = None
         interrupted = False
         try:
-            final_meta = self._run_training(train_convos, val_convos, data_manager, val_data_manager, rank, world_size, resume_state=resume_state)
+            final_meta = self._run_training(train_convos, val_convos, data_manager, val_data_manager, resume_state=resume_state)
         except KeyboardInterrupt:
             interrupted = True
-            if rank == 0:
-                print("\n  Training interrupted by user.")
+            self._log("\n  Training interrupted by user.")
         finally:
             data_manager.close()
             val_data_manager.close()
@@ -233,12 +235,12 @@ class StudentModel:
         if interrupted:
             return
 
-        self._save_model("final", rank, world_size)
+        self._save_model("final")
 
         if self.student_config.save_final_training_state:
-            self._save_training_state("final", rank, world_size, final_meta)
+            self._save_training_state("final", final_meta)
 
-        if rank == 0 and final_meta is not None:
+        if self.rank == 0 and final_meta is not None:
             save_path = os.path.join(self.paths.student_trained, f"{self.model_name}_step_final")
             print(f"\n  Training Summary:")
             print(f"    Steps trained: {final_meta.num_trained}")
@@ -286,7 +288,7 @@ class StudentModel:
 
         if strategy == "naive_layer_split":
             if not c.multi_gpu:
-                device_map = {"": "cuda:0"}
+                device_map = {"": f"cuda:{rank}"}
             elif c.device_map == "custom":
                 device_map = _build_custom_device_map(self.model_path, self.config.num_gpu0_layers, self.config.max_memory_hf)
             else:
@@ -335,7 +337,7 @@ class StudentModel:
             self.model.zero_grad(set_to_none=True)
         torch.cuda.empty_cache()
 
-    def _run_training(self, train_convos, val_convos, data_manager, val_data_manager, rank, world_size, resume_state=None):
+    def _run_training(self, train_convos, val_convos, data_manager, val_data_manager, resume_state=None):
         c = self.config
         eff_batch_size = c.batch_size * c.grad_accum_batches
 
@@ -357,14 +359,13 @@ class StudentModel:
             next_save = int(c.save_student_every_n_epochs * len(train_convos))
             start_epoch = 0
             best_val_loss = None
-            self._validate(val_batches, val_data_manager, num_trained, rank, pbar=None)
-            if world_size > 1:
-                dist.barrier()
+            self._validate(val_batches, val_data_manager, num_trained, pbar=None)
+            self._barrier()
 
         if hasattr(self.optimizer, 'train'):
             self.optimizer.train()
 
-        pbar = tqdm(total=len(train_convos) * c.num_epochs - num_trained, desc="Training", disable=(rank != 0), leave=False, smoothing=0.06)
+        pbar = tqdm(total=len(train_convos) * c.num_epochs - num_trained, desc="Training", disable=(self.rank != 0), leave=False, smoothing=0.06)
         last_postfix = ""
 
         sc = self.student_config
@@ -393,15 +394,14 @@ class StudentModel:
                 if batches_to_skip > 0:
                     batches = batches[batches_to_skip:]
                     id_batches = id_batches[batches_to_skip:]
-                    if rank == 0:
-                        print(f"  Skipping {batches_to_skip} batches ({samples_this_epoch} samples) in epoch {epoch}")
+                    self._log(f"  Skipping {batches_to_skip} batches ({samples_this_epoch} samples) in epoch {epoch}")
 
             data_manager.enqueue_get_batches(id_batches)
 
-            losses = Losses(self.logger) if rank == 0 else Losses(None)
+            losses = Losses(self.logger)
 
             for batch_convos in batches:
-                self._forward_batch(batch_convos, data_manager, losses, rank, training=True)
+                self._forward_batch(batch_convos, data_manager, losses, training=True)
 
                 is_accum_step = num_trained + len(batch_convos) < next_accum
                 if is_accum_step and isinstance(self.model, DDP):
@@ -427,7 +427,7 @@ class StudentModel:
                     if self.lr_scheduler:
                         self.lr_scheduler.step()
 
-                    if rank == 0:
+                    if self.rank == 0:
                         avg_loss = losses.loss_dict.get("custom loss", torch.tensor(0.0)).item() / max(losses.num_steps_accumulated, 1)
                         if self.logger:
                             self.logger.log({"Learning Rate": self.optimizer.param_groups[0]["lr"], "grad_norm": grad_norm.item()}, step=num_trained)
@@ -439,16 +439,16 @@ class StudentModel:
 
                     next_state_save = self._maybe_save_training_state_checkpoint(
                         num_trained, epoch, next_accum, next_val, next_save, next_state_save, state_save_interval,
-                        best_val_loss, total_samples, rank, world_size, pbar, last_postfix,
+                        best_val_loss, total_samples, pbar, last_postfix,
                     )
 
                 next_save = self._maybe_save_model_checkpoint(
-                    num_trained, total_samples, next_save, train_convos, rank, world_size, pbar, last_postfix,
+                    num_trained, total_samples, next_save, train_convos, pbar, last_postfix,
                 )
 
                 next_val, best_val_loss = self._maybe_validate_and_save(
                     num_trained, epoch, next_accum, next_val, next_save, next_state_save,
-                    best_val_loss, train_convos, val_batches, val_data_manager, rank, world_size, pbar, last_postfix,
+                    best_val_loss, train_convos, val_batches, val_data_manager, pbar, last_postfix,
                 )
 
         pbar.close()
@@ -463,79 +463,70 @@ class StudentModel:
 
     def _maybe_save_training_state_checkpoint(self, num_trained, epoch, next_accum, next_val, next_save,
                                               next_state_save, state_save_interval, best_val_loss,
-                                              total_samples, rank, world_size, pbar, last_postfix):
+                                              total_samples, pbar, last_postfix):
         if next_state_save is None or num_trained < next_state_save:
             return next_state_save
         next_state_save += state_save_interval
         is_final = self.student_config.save_final_training_state and num_trained >= total_samples
         if not is_final:
-            if rank == 0:
-                pbar.set_postfix_str(f"Saving training state at step {num_trained}...")
+            pbar.set_postfix_str(f"Saving training state at step {num_trained}...")
             metadata = self._make_state(num_trained, epoch, next_accum, next_val, next_save, next_state_save, best_val_loss)
-            self._save_training_state(num_trained, rank, world_size, metadata)
-            if rank == 0 and self.config.keep_last_n_checkpoints:
+            self._save_training_state(num_trained, metadata)
+            if self.rank == 0 and self.config.keep_last_n_checkpoints:
                 pbar.set_postfix_str("Deleting old checkpoints...")
                 rotate_checkpoints(self.paths.student_states, f"{self.model_name}_training_state_step_", self.config.keep_last_n_checkpoints)
-            if rank == 0:
-                pbar.set_postfix_str(last_postfix)
+            pbar.set_postfix_str(last_postfix)
         return next_state_save
 
     def _maybe_save_model_checkpoint(self, num_trained, total_samples, next_save, train_convos,
-                                     rank, world_size, pbar, last_postfix):
+                                     pbar, last_postfix):
         if num_trained < next_save:
             return next_save
         is_final = num_trained >= total_samples
         if not is_final:
-            if rank == 0:
-                pbar.set_postfix_str(f"Saving checkpoint at step {num_trained}...")
-            self._save_model(num_trained, rank, world_size)
-            if rank == 0 and self.config.keep_last_n_checkpoints:
+            pbar.set_postfix_str(f"Saving checkpoint at step {num_trained}...")
+            self._save_model(num_trained)
+            if self.rank == 0 and self.config.keep_last_n_checkpoints:
                 rotate_checkpoints(self.paths.student_trained, f"{self.model_name}_step_", self.config.keep_last_n_checkpoints)
-            if rank == 0:
-                pbar.set_postfix_str(last_postfix)
+            pbar.set_postfix_str(last_postfix)
         return next_save + int(self.config.save_student_every_n_epochs * len(train_convos))
 
     def _maybe_validate_and_save(self, num_trained, epoch, next_accum, next_val, next_save, next_state_save,
-                                 best_val_loss, train_convos, val_batches, val_data_manager, rank, world_size, pbar, last_postfix):
+                                 best_val_loss, train_convos, val_batches, val_data_manager, pbar, last_postfix):
         if num_trained < next_val:
             return next_val, best_val_loss
         c = self.config
-        if rank == 0:
-            pbar.set_postfix_str("Validating...")
-        val_loss = self._validate(val_batches, val_data_manager, num_trained, rank, pbar=pbar if rank == 0 else None, best_val_loss=best_val_loss)
+        pbar.set_postfix_str("Validating...")
+        val_loss = self._validate(val_batches, val_data_manager, num_trained, pbar=pbar, best_val_loss=best_val_loss)
         save_best = False
-        if rank == 0 and val_loss is not None:
+        if self.rank == 0 and val_loss is not None:
             if best_val_loss is None or val_loss < best_val_loss:
                 best_val_loss = val_loss
                 save_best = True
-        if world_size > 1:
-            save_best_t = torch.tensor([1 if save_best else 0], device=f"cuda:{rank}")
+        if self.world_size > 1:
+            save_best_t = torch.tensor([1 if save_best else 0], device=f"cuda:{self.rank}")
             dist.broadcast(save_best_t, src=0)
             save_best = save_best_t.item() == 1
         if save_best:
             if c.save_best_model:
-                if rank == 0:
-                    pbar.set_postfix_str("Saving best model...")
-                self._save_model("best", rank, world_size)
+                pbar.set_postfix_str("Saving best model...")
+                self._save_model("best")
             if c.save_best_state:
-                if rank == 0:
-                    pbar.set_postfix_str("Saving best training state...")
+                pbar.set_postfix_str("Saving best training state...")
                 metadata = self._make_state(num_trained, epoch, next_accum, next_val, next_save, next_state_save, best_val_loss)
-                self._save_training_state("best", rank, world_size, metadata)
-        if rank == 0:
-            pbar.set_postfix_str(last_postfix)
-        if world_size > 1:
-            dist.barrier()
+                self._save_training_state("best", metadata)
+        pbar.set_postfix_str(last_postfix)
+        self._barrier()
         next_val += int(c.validate_every_n_epochs * len(train_convos))
         return next_val, best_val_loss
 
-    def _forward_batch(self, batch_convos, data_manager, losses, rank, training=False):
+    def _forward_batch(self, batch_convos, data_manager, losses, training=False):
         with data_manager.read_next_batch() as batch:
-            teacher_batch = torch.from_numpy(batch.data).to(f"cuda:{rank}", non_blocking=True).float()
+            teacher_batch = torch.from_numpy(batch.data).to(f"cuda:{self.rank}", non_blocking=True).float()
 
             max_len = max(cv.length for cv in batch_convos)
             tokens_np = np.array([cv.tokens[:max_len] for cv in batch_convos])
-            tokens_t = torch.from_numpy(tokens_np).to(f"cuda:{rank}", non_blocking=True)
+            tokens_t = torch.from_numpy(tokens_np).to(f"cuda:{self.rank}", non_blocking=True)
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 logits_all = self.model(tokens_t, use_cache=False).logits
@@ -599,20 +590,20 @@ class StudentModel:
 
         return loss_dict
 
-    def _validate(self, val_batches, val_data_manager, step, rank, pbar=None, best_val_loss=None):
+    def _validate(self, val_batches, val_data_manager, step, pbar=None, best_val_loss=None):
         self.model.eval()
         if hasattr(self.optimizer, 'eval'):
             self.optimizer.eval()
-        losses = Losses(self.logger if rank == 0 else None, validation=True)
+        losses = Losses(self.logger, validation=True)
 
         with torch.no_grad():
-            iterator = tqdm(val_batches, desc="  Validating", leave=False, smoothing=0.06) if rank == 0 else val_batches
+            iterator = tqdm(val_batches, desc="  Validating", leave=False, smoothing=0.06, disable=(self.rank != 0))
             for batch_convos in iterator:
-                self._forward_batch(batch_convos, val_data_manager, losses, rank)
+                self._forward_batch(batch_convos, val_data_manager, losses)
 
         avg_loss = None
         tracked_metric = None
-        if rank == 0:
+        if self.rank == 0:
             n = max(losses.num_steps_accumulated, 1)
             avg_loss = losses.loss_dict.get("custom loss", torch.tensor(0.0)).item() / n
             avg_ce = losses.loss_dict.get("CE loss", torch.tensor(0.0)).item() / n
@@ -645,13 +636,13 @@ class StudentModel:
         elif order == "sorted":
             convos.sort(key=lambda c: c.length, reverse=True)
 
-    def _save_model(self, step, rank=0, world_size=1):
+    def _save_model(self, step):
         folder = os.path.join(self.paths.student_trained, f"{self.model_name}_step_{step}")
-        save_model(self.model, self.tokenizer, folder, self._resolve_strategy(), rank, world_size)
+        save_model(self.model, self.tokenizer, folder, self._resolve_strategy(), self.rank, self.world_size)
 
-    def _save_training_state(self, step, rank, world_size, metadata):
+    def _save_training_state(self, step, metadata):
         folder = os.path.join(self.paths.student_states, f"{self.model_name}_training_state_step_{step}")
-        save_training_state(self.model, self.tokenizer, self.optimizer, self.lr_scheduler, folder, self._resolve_strategy(), rank, world_size, metadata)
+        save_training_state(self.model, self.tokenizer, self.optimizer, self.lr_scheduler, folder, self._resolve_strategy(), self.rank, self.world_size, metadata)
 
     def _setup_logger(self, resume_state=None):
         c = self.config

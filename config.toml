@@ -55,7 +55,7 @@ keep_last_n_checkpoints = 2
 # Multi-GPU / device settings
 num_gpu0_layers = 9
 device_map = "balanced"
-multi_gpu = false
+multi_gpu = true
 wandb_comment = "byte_training"
 wandb_project = "student_training"
 

@@ -29,6 +29,8 @@ pip install -r requirements.txt
 
 PyTorch must be installed separately with CUDA support. See [pytorch.org](https://pytorch.org/get-started/locally/).
 
+> **Windows multi-GPU note:** DDP and FSDP2 training strategies require the Gloo backend, which is broken in PyTorch >= 2.8 on Windows ([pytorch/pytorch#150381](https://github.com/pytorch/pytorch/issues/150381)). Use `training_strategy = "naive_layer_split"` for multi-GPU training on Windows, or downgrade to PyTorch 2.7.0. NCCL *might*  be coming to windows and would resolve all this, but its unclear if/when would it happen ([NVIDIA windows NCCL PR](https://github.com/NVIDIA/nccl/pull/1922)). Linux/WSL is unaffected.
+
 Optional packages:
 - `liger-kernel` + `triton` - for fused Triton ops (set `liger_kernel = true`)
 - `huggingface-hub` - auto-downloads models from HuggingFace (installed with transformers)

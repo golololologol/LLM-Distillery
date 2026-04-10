@@ -195,5 +195,5 @@ def preprocess_samples(
         dropped_ids = [r.origin_convo_id for r in results if not r.content_byte_ranges]
         print(f"  Filtered out {len(results) - len(filtered)} samples (IDs: {dropped_ids}) with no content in "
               f"save_roles={save_roles} at the given context length.\n"
-              f"Consider increasing context_len or adjusting save_roles if this is unexpected.")
+              f"  Consider increasing context_len or adjusting save_roles if this is unexpected.")
     return filtered

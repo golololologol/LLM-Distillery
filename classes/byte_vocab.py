@@ -150,8 +150,16 @@ class ByteVocabIndex:
         # Flat int32 byte sequences for fused training kernel [V, max_byte_len]
         self.token_byte_seqs_i32 = self.token_byte_seqs.int()
 
-        self.byte_matrix_d0 = torch.zeros(self.vocab_size, 256, dtype=torch.float16, device=device)
-        self.byte_matrix_d0[torch.arange(self.vocab_size, device=device), self.first_bytes] = 1.0
+        self._byte_matrix_d0 = None
+        self._device = device
+
+    @property
+    def byte_matrix_d0(self):
+        if self._byte_matrix_d0 is None:
+            m = torch.zeros(self.vocab_size, 256, dtype=torch.float16, device=self._device)
+            m[torch.arange(self.vocab_size, device=self._device), self.first_bytes] = 1.0
+            self._byte_matrix_d0 = m
+        return self._byte_matrix_d0
 
     def cuda_kernel_tensors(self):
         return (self.first_bytes_i32, self.second_bytes_i32, self.third_bytes_i32,

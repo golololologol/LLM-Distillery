@@ -1,4 +1,5 @@
 import dataclasses
+import gc
 import time
 import torch
 import torch.distributed as dist
@@ -12,12 +13,6 @@ from classes.data_classes import TrainingState
 
 
 def _rename_with_retry(src, dst, retries=5, delay=0.5):
-    """Retry rename to handle Windows Defender / antivirus scanning delays.
-    On Windows, real-time AV scanning of newly-written files can briefly hold
-    open handles, blocking os.rename on the containing directory (WinError 5).
-    See: https://devblogs.microsoft.com/oldnewthing/20120907-00/?p=6663
-    """
-    import gc
     for attempt in range(retries):
         try:
             os.rename(src, dst)
@@ -26,7 +21,7 @@ def _rename_with_retry(src, dst, retries=5, delay=0.5):
             if attempt == retries - 1:
                 raise
             gc.collect()
-            time.sleep(delay * (1.5 ** attempt))  # exponential backoff: 0.5, 0.75, 1.1, 1.7, 2.5, ...
+            time.sleep(delay * (1.5 ** attempt))
 
 
 def save_model(model, tokenizer, save_dir, strategy, rank, world_size):
