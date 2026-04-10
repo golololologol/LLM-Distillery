@@ -1,19 +1,18 @@
 from torch.optim.lr_scheduler import LRScheduler
+from torch.optim import Muon
 from transformers import get_scheduler
 from apollo_torch import APOLLOAdamW
 from typing import Any, Tuple
-from torch import Tensor
-import torch.nn.functional as F
+import schedulefree
 import torch
 import math
-import sys
 import re
 import os
 
 # shut the the hell up bnb with its `bin ..bitsandbytes\libbitsandbytes_cuda121.dll`
-sys.stdout = open(os.devnull, 'w')
-import bitsandbytes as bnb
-sys.stdout = sys.__stdout__
+import contextlib
+with contextlib.redirect_stdout(open(os.devnull, 'w')):
+    import bitsandbytes as bnb
 
 
 class WarmupStableDecayLR(LRScheduler):
@@ -44,105 +43,7 @@ class WarmupStableDecayLR(LRScheduler):
             return [self.constant_lr * lr_scale for group in self.optimizer.param_groups]
         else:
             return [self.final_lr for group in self.optimizer.param_groups]
-        
 
-
-def calculate_divergence(student_logits: Tensor, teacher_logits: Tensor, indices: Tensor|None, convo_CE_tokens: Tensor, alpha: Tensor, avoid_indices: Tensor) -> dict[str, Tensor]:
-    """
-    Custom loss function for distillation with all sorts of shenanigans applied.
-
-    Args:
-        student_logits (Tensor): A (num_toks, vocab_size) tensor with the logits from the student model.
-        teacher_logits (Tensor): A (num_toks, top_k or vocab_size) tensor with the logits from the teacher model.\\
-            The logits are expected to come from the same conversation and start predicting from the same point as the student's logits.
-        indices (Tensor | None): A (num_toks, top_k) tensor with the token indices of the top k logits from the teacher model. If None, the logits are used as is.
-        convo_CE_tokens (Tensor): A (num_toks) tensor with the token ids from within the content ranges of the conversation.\\
-        alpha (Tensor): 
-        avoid_indices (Tensor): 
-
-    Returns:
-        dict[str,Tensor]:
-            A dictionary containing the calculated losses.\\
-            It MUST contain the following k/v pair {"train_loss": Tensor} to actually train from!\\
-            You may add any other k/v pairs to be used for logging purposes of any other values you want.
-    """
-
-    def custom_kl_div(student_logprobs: Tensor, teacher_logprobs: Tensor, per_token: bool = False):
-        kl_div_raw = F.kl_div(student_logprobs, teacher_logprobs, reduction='none', log_target=True)
-
-        if per_token:
-            kl_div = kl_div_raw.sum(dim=-1)
-        else:
-            kl_div = kl_div_raw.sum(dim=-1).mean()
-        return kl_div
-
-    def abomination_loss(kl_div_per_token: Tensor, alpha: Tensor, CE_loss_per_token: Tensor):
-        if CE_loss_per_token.numel() < kl_div_per_token.numel():
-            CE_loss_per_token = torch.cat((CE_loss_per_token, torch.zeros(1, device=CE_loss_per_token.device)))
-
-        weights = ((kl_div_per_token / kl_div_per_token.max()) + 1).pow(alpha)
-        weights = weights + CE_loss_per_token
-
-        loss = (kl_div_per_token * weights).mean()
-        return loss
-    
-    def custom_ce_loss(logprobs: Tensor, convo_CE_tokens: Tensor, indices: Tensor, ignore_indexes: Tensor) -> Tensor:
-        crop = 0
-        if convo_CE_tokens.size(-1) < logprobs.size(0):
-            crop = -1
-
-        topk_mask = convo_CE_tokens.unsqueeze(-1) == indices[:crop]
-        topk_mask[ignore_indexes] = False
-        valid_mask = topk_mask.any(dim=-1)
-        
-        valid_logprobs = torch.zeros_like(valid_mask, dtype=torch.float32)
-        valid_logprobs[valid_mask] = logprobs[:crop][topk_mask].squeeze(-1)
-
-        # compute the average of only valid tokens (e.g. tokens that aren't predicting prompt formatting tokens)
-        CE_valid_mean = valid_logprobs[valid_mask].mean()
-
-        valid_logprobs[~valid_mask] = CE_valid_mean
-        return -valid_logprobs
-
-
-    min_len = min(student_logits.size(0), teacher_logits.size(0), indices.size(0) if indices is not None else student_logits.size(0))
-    student_logprobs = F.log_softmax(student_logits[:min_len], dim=-1)
-
-    if indices is not None:
-        teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
-        student_logprobs = torch.gather(student_logprobs, 1, indices[:min_len])
-    else:
-        teacher_logprobs = F.log_softmax(teacher_logits[:min_len], dim=-1)
-
-    convo_CE_tokens = convo_CE_tokens[:min_len]
-    CE_loss = custom_ce_loss(student_logprobs, convo_CE_tokens, indices, avoid_indices)
-    teacher_CE_loss = custom_ce_loss(teacher_logprobs, convo_CE_tokens, indices, avoid_indices)
-        
-    CE_diff = CE_loss - teacher_CE_loss
-
-    corrected_CE_diff = torch.where(CE_diff < 0, torch.zeros_like(CE_diff), CE_diff)
-
-    kl_div = custom_kl_div(student_logprobs, teacher_logprobs, per_token=True)
-    reverse_kl_div = custom_kl_div(teacher_logprobs, F.log_softmax(student_logprobs, dim=-1), per_token=True)
-
-    weighted_kl_div = abomination_loss(kl_div, alpha, corrected_CE_diff)
-    weighted_r_kl_div = abomination_loss(reverse_kl_div, alpha, corrected_CE_diff)
-
-    custom_loss = (weighted_kl_div + weighted_r_kl_div) / 2
-
-    loss_dict = {
-        "train_loss": custom_loss,
-        "custom loss": custom_loss,
-        "CE loss": CE_loss.mean(),
-        "kl_div": kl_div.mean(),
-        "reverse kl_div": reverse_kl_div.mean(),
-        "weighted kl_div": weighted_kl_div,
-        "weighted rev. kl_div": weighted_r_kl_div,
-        "teacher CE loss": teacher_CE_loss.mean(),
-        "CE diff": CE_diff.mean(),
-    }
-
-    return loss_dict
 
 def check_target_module_exists(optim_target_modules, key: str, return_is_regex: bool = False):
     # Fully borrowed from here: https://github.com/zhuhanqing/transformers/blob/apollo-integration/src/transformers/trainer_utils.py#L851
@@ -247,30 +148,37 @@ def setup_low_rank_optimizer(model, optimizer_name: str, target_modules: list[st
     return param_groups
 
 
-def set_optimizer(model: Any, lr: float, betas: Tuple[float, float], optimizer_name: str, weight_decay=1e-2, momentum=0.01, nesterov=False):
-    """
-    A function to set the optimizer for the model.
+class CombinedOptimizer(torch.optim.Optimizer):
+    def __init__(self, *optimizers):
+        self.optimizers = optimizers
+        self.param_groups = []
+        for opt in optimizers:
+            self.param_groups.extend(opt.param_groups)
+        self.defaults = {}
+        self.state = {}
 
-    Args:
-        model (Any): The model to be optimized.
-        lr (float): Learning rate to be used.
-        betas (tuple(float, float)): A tuple of two floats for the betas of adam optimizers.
-        optimizer_name (str): The name of the optimizer to be used.
-        weight_decay (float, optional): The weight decay for adam optimizers. Defaults to 1e-2.
-        momentum (float, optional): The momentum for SGD optimizer. Defaults to 0.01.
-        nesterov (bool, optional): Whether to use nesterov momentum for SGD optimizer. Defaults to False.
+    def step(self, closure=None):
+        for opt in self.optimizers:
+            opt.step(closure)
 
-    Raises:
-        ValueError: If the optimizer name is not valid.
+    def zero_grad(self, set_to_none=False):
+        for opt in self.optimizers:
+            opt.zero_grad(set_to_none=set_to_none)
 
-    Returns:
-        Optimizer: The optimizer to be used for the model.
-    """
-    
+    def state_dict(self):
+        return {f"opt_{i}": opt.state_dict() for i, opt in enumerate(self.optimizers)}
+
+    def load_state_dict(self, state_dict):
+        for i, opt in enumerate(self.optimizers):
+            opt.load_state_dict(state_dict[f"opt_{i}"])
+
+
+def set_optimizer(model: Any, lr: float, betas: Tuple[float, float], optimizer_name: str, weight_decay=1e-2, momentum=0.01, nesterov=False, total_steps=200, training_strategy: str = "auto", warmup_steps: int = 0):
     optimizer_name = optimizer_name.lower()
+    is_fsdp = training_strategy in ("fsdp2",)
     
     optimizer_mapping = {
-        "adam": bnb.optim.Adam,
+        "adamw_torch": torch.optim.AdamW,
         "adamw": bnb.optim.AdamW,
         "adamw8bit": bnb.optim.AdamW8bit,
         "adamw32bit": bnb.optim.AdamW32bit, 
@@ -283,57 +191,81 @@ def set_optimizer(model: Any, lr: float, betas: Tuple[float, float], optimizer_n
         "rmsprop32bit": bnb.optim.RMSprop32bit,
         "adagrad": bnb.optim.Adagrad,
         "apollo": APOLLOAdamW,
-        "apollomini": APOLLOAdamW
+        "apollomini": APOLLOAdamW,
+        "schedulefree": schedulefree.AdamWScheduleFree,
+        "muon": None,
+    }
+
+    fsdp_upgrades = {
+        "adamw": ("adamw32bit", bnb.optim.AdamW32bit),
+        "adamw8bit": ("adamw32bit", bnb.optim.AdamW32bit),
+        "paged_adamw8bit": ("paged_adamw32bit", bnb.optim.PagedAdamW32bit),
+        "rmsprop": ("rmsprop32bit", bnb.optim.RMSprop32bit),
+        "rmsprop8bit": ("rmsprop32bit", bnb.optim.RMSprop32bit),
     }
     
     if optimizer_name not in optimizer_mapping:
         raise ValueError(
             f"Invalid optimizer name: {optimizer_name}\n"
             f"Available optimizers: {list(optimizer_mapping.keys())}"
-            )
-        
-    if optimizer_name in ["adam", "adamw", "adamw8bit", "adamw32bit", "paged_adamw", "paged_adamw8bit", "paged_adamw32bit"]:
-        return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay, eps=1e-8)
-    
-    elif optimizer_name in ["sgd"]:
-        return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov)
-    
-    elif optimizer_name in ["rmsprop", "rmsprop8bit", "rmsprop32bit"]:
-        return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, weight_decay=weight_decay, alpha=0.9, eps=1e-10, centered=True)
-    
-    elif optimizer_name in ["adagrad"]:
-        return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, weight_decay=weight_decay)
-    
-    elif optimizer_name == "apollo":
+        )
 
-        args = {
-            'rank': 256,
-            'proj': 'random',
-            'scale_type': 'channel',
-            'scale': 1,
-            'update_proj_gap': 200,
-            'proj_type': 'std'
-        }
-            
-        param_groups = setup_low_rank_optimizer(model, optimizer_name, target_modules="all-linear", **args)
+    if is_fsdp and optimizer_name in fsdp_upgrades:
+        new_name, new_cls = fsdp_upgrades[optimizer_name]
+        print(f"  Warning: Switching {optimizer_name} -> {new_name} for FSDP compatibility (8-bit optimizer states not supported)")
+        optimizer_name = new_name
+        optimizer_mapping[optimizer_name] = new_cls
 
-        return optimizer_mapping[optimizer_name](param_groups, lr=lr, betas=betas, weight_decay=weight_decay, scale_front=True, no_deprecation_warning=True)
-            
-    elif optimizer_name == "apollomini":
+    match optimizer_name:
+        case "adamw_torch":
+            return torch.optim.AdamW(model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay, eps=1e-8)
+
+        case "schedulefree":
+            return schedulefree.AdamWScheduleFree(model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay, warmup_steps=warmup_steps)
+
+        case "adamw" | "adamw8bit" | "adamw32bit" | "paged_adamw" | "paged_adamw8bit" | "paged_adamw32bit":
+            return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay, eps=1e-8)
         
-        args = {
-            'rank': 1,
-            'proj': 'svd',
-            'scale_type': 'tensor',
-            'scale': 128,
-            'update_proj_gap': 200,
-            'proj_type': 'std'
-        }
+        case "sgd":
+            return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov)
         
-        param_groups = setup_low_rank_optimizer(model, optimizer_name, target_modules="all-linear", **args)
-            
-        return optimizer_mapping[optimizer_name](param_groups, lr=lr, betas=betas, weight_decay=weight_decay, scale_front=True, no_deprecation_warning=True)
-    
+        case "rmsprop" | "rmsprop8bit" | "rmsprop32bit":
+            return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, weight_decay=weight_decay, alpha=0.9, eps=1e-10, centered=True)
+        
+        case "adagrad":
+            return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, weight_decay=weight_decay)
+        
+        case "apollo":
+            args = {
+                'rank': 256,
+                'proj': 'random',
+                'scale_type': 'channel',
+                'scale': 32,
+                'update_proj_gap': max(1, total_steps // 10),
+                'proj_type': 'std'
+            }
+            param_groups = setup_low_rank_optimizer(model, optimizer_name, target_modules="all-linear", **args)
+            return optimizer_mapping[optimizer_name](param_groups, lr=lr, betas=betas, weight_decay=weight_decay, scale_front=True, no_deprecation_warning=True)
+                
+        case "apollomini":
+            args = {
+                'rank': 1,
+                'proj': 'random',
+                'scale_type': 'tensor',
+                'scale': 128,
+                'update_proj_gap': max(1, total_steps // 10),
+                'proj_type': 'std'
+            }
+            param_groups = setup_low_rank_optimizer(model, optimizer_name, target_modules="all-linear", **args)
+            return optimizer_mapping[optimizer_name](param_groups, lr=lr, betas=betas, weight_decay=weight_decay, scale_front=True, no_deprecation_warning=True)
+
+        case "muon":
+            muon_params = [p for p in model.parameters() if p.ndim >= 2]
+            adam_params = [p for p in model.parameters() if p.ndim < 2]
+            muon_opt = Muon(muon_params, lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov)
+            adam_opt = torch.optim.AdamW(adam_params, lr=lr, betas=betas, weight_decay=weight_decay, eps=1e-8)
+            return CombinedOptimizer(muon_opt, adam_opt)
+
 
 def set_lr_scheduler(optimizer, lr_scheduler_name: str, num_warmup_steps, num_training_steps, num_epoch_steps, decay_start=0.5, constant_lr=5e-5, final_lr=1e-9):
     lr_scheduler_name = lr_scheduler_name.lower()
@@ -347,4 +279,3 @@ def set_lr_scheduler(optimizer, lr_scheduler_name: str, num_warmup_steps, num_tr
             return lr_scheduler_classes[lr_scheduler_name](optimizer, num_training_steps, num_warmup_steps, decay_start, final_lr)
     else:
         return get_scheduler(lr_scheduler_name, optimizer, num_warmup_steps, num_training_steps)
-        

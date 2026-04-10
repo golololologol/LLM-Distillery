@@ -1,0 +1,5 @@
+model_path = "Qwen/Qwen3-0.6B"
+freeze_layers = []
+attn_implementation = "eager"
+save_final_training_state = false
+context_len = 2048

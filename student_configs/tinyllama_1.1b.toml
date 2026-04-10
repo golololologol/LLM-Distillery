@@ -1,0 +1,5 @@
+model_path = "TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T"
+freeze_layers = []
+attn_implementation = "flash_attention_2"
+save_final_training_state = false
+context_len = 2048

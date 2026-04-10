@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: requires CUDA GPU",
+    "slow: takes >10 seconds (kernel compilation)",
+]
+addopts = "-x --tb=short"

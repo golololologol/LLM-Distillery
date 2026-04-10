@@ -40,12 +40,6 @@ class Paths:
         os.makedirs(os.path.join(existing_folder, subfolder), exist_ok=True)
         setattr(self, subfolder, os.path.join(existing_folder, subfolder))
 
-    def dataset_present(self):
-        return os.path.exists(os.path.join(self.dataset, "distributions.hdf5"))
-    
-    def validation_present(self):
-        return os.path.exists(os.path.join(self.dataset_validation, "distributions.hdf5"))
-
     def empty_folder(self, folder: str):
         folder_path = pathlib.Path(folder)
         if not folder_path.exists():

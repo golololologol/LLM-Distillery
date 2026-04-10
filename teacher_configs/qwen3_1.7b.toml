@@ -1,0 +1,10 @@
+model_path = "matatonic/Qwen3-1.7B-8.0bpw-h8-exl2"
+context_len = 2048
+merge_weight = 1.0
+
+[exllamav2]
+reserve_vram = [1.0]
+batch_size = 1
+seq_chunk_len = 2048
+num_inference_workers = 1
+one_worker_per_gpu = true

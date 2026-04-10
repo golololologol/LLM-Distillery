@@ -1,0 +1,65 @@
+
+chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}{{ '<|user|>\n' + message['content'] + eos_token }}{% elif message['role'] == 'system' %}{{ '<|system|>\n' + message['content'] + eos_token }}{% elif message['role'] == 'assistant' %}{{ '<|assistant|>\n' + message['content'] + eos_token }}{% endif %}{% if loop.last and add_generation_prompt %}{{ '<|assistant|>' }}{% endif %}{% endfor %}"
+
+# Paths
+cache_folder = "test_data/cache_ablation"
+dataset_path = "test_data/ultrachat_1000.jsonl"
+validation_dataset_path = "test_data/ultrachat_100_val.jsonl"
+teacher_configs_path = "teacher_configs/qwen3_8b.toml"
+student_config_path = "student_configs/tinyllama_1.1b.toml"
+
+# General model settings
+context_len = 2048
+save_roles = ["assistant"]
+auto_approve = false
+
+# Collection settings
+marg_chunk_inference = 256
+marg_chunk_training = 256
+
+# Training settings
+num_epochs = 1
+num_warmup_steps = 50
+batch_size = 4
+grad_accum_batches = 2
+grad_checkpointing = true
+max_grad_norm = 5.0
+torch_compile = true
+torch_compile_mode = "default"
+torch_compile_backend = "inductor"
+liger_kernel = false
+collection_temperature = 2
+training_temperature = 1
+lr = 4e-6
+adam_betas = [0.9, 0.99]
+adam_decay = 2e-3
+lr_decay_start = 0.9
+alpha = 0.5
+loss_type = "skew_kl"
+lr_scheduler = "wsd"
+optimizer = "apollomini"
+data_order = "random"
+training_precision = "bf16"
+train_on = "auto"
+training_strategy = "ddp"
+seed = 42
+
+# Validation & Saving
+validate_every_n_epochs = 0.1
+best_metric = "train_loss"
+save_student_every_n_epochs = 1.0
+save_best_model = true
+save_best_state = false
+keep_last_n_checkpoints = 2
+
+# Multi-GPU / device settings
+num_gpu0_layers = 9
+device_map = "balanced"
+multi_gpu = false
+wandb_comment = "byte_training"
+wandb_project = "student_training"
+
+[max_memory]
+0 = "24GB"
+1 = "24GB"
+cpu = "60GB"
