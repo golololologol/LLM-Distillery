@@ -14,6 +14,11 @@ Offline white-box knowledge distillation pipeline for LLMs. Collects teacher log
 - **Training features** - Gradient checkpointing, torch.compile, Liger Kernel, multi-GPU (DDP/FSDP2), WandB logging, checkpoint rotation.
 - **Windows and Linux support**
 
+Tinyllama 1.1B full finetuning distillation in ~8GB of VRAM! And at decent ~3500 tokens/s on just one RTX 3090, validating at ~18000 tokens/s
+
+<img width="3341" height="1692" alt="image" src="https://github.com/user-attachments/assets/fc3817ad-eb73-43ef-9bc8-5ac2c7f7df7f" />
+
+
 ## Quickstart
 
 ### 1. Install
