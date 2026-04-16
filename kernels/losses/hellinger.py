@@ -1,21 +1,21 @@
+import torch
 from kernels.compiler import _compile_kernel, _compile_kernel_with_header, _cuda_available
 
 
-_TRAINING_SKEW_KL_CUDA = r"""
+_TRAINING_HELLINGER_CUDA = r"""
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
 
-__global__ void fused_skew_kl_kernel(
+__global__ void fused_hellinger_kernel(
     const float* __restrict__ student,      // [N, 256]
     const float* __restrict__ teacher,      // [N, 256]
     const int*   __restrict__ actual_bytes, // [N]
     float* __restrict__ grad_student,       // [N, 256]
-    float* __restrict__ loss_srkl,          // [N]
-    float* __restrict__ loss_ce,            // [N]
-    float* __restrict__ loss_tce,           // [N]
+    float* __restrict__ out_h2,             // [N]
+    float* __restrict__ out_ce,             // [N]
+    float* __restrict__ out_tce,            // [N]
     int N,
-    float lam,
     float alpha
 ) {
     const int pos = blockIdx.x;
@@ -28,109 +28,105 @@ __global__ void fused_skew_kl_kernel(
 
     float S = student[base + b];
     float T_val = teacher[base + b];
-    float S_eps = S + eps;
-    float mix = (1.0f - lam) * T_val + lam * S;
-    float mix_eps = mix + eps;
 
-    // Per-byte SRKL contribution
-    float srkl_b = S * (logf(S_eps) - logf(mix_eps));
+    // Bhattacharyya coefficient per byte
+    float bc_b = sqrtf(fmaxf(S * T_val, 0.0f));
 
-    // Block-reduce to get per-position SRKL
-    float srkl_sum = blockReduceSum(srkl_b);
+    // Block-reduce to get per-position BC sum
+    float bc_sum = blockReduceSum(bc_b);
 
     int actual_b = actual_bytes[pos];
 
     if (b == 0) {
-        loss_srkl[pos] = srkl_sum;
-        loss_ce[pos] = -logf(student[base + actual_b] + eps);
-        loss_tce[pos] = -logf(teacher[base + actual_b] + eps);
+        out_h2[pos] = 1.0f - bc_sum;
+        out_ce[pos] = -logf(student[base + actual_b] + eps);
+        out_tce[pos] = -logf(teacher[base + actual_b] + eps);
     }
 
-    // Gradient of loss w.r.t. S[b]
-    // d(srkl_i)/d(S_b) = log(S_b+eps) + S_b/(S_b+eps) - log(mix_b+eps) - lam*S_b/(mix_b+eps)
-    float grad = inv_N * (logf(S_eps) + S / S_eps - logf(mix_eps) - lam * S / mix_eps);
+    // Gradient of H² = 1 - Σ√(p·q) w.r.t. q_b:
+    // ∂H²/∂q_b = -0.5 * √(p_b / q_b)
+    float grad_b = inv_N * (-0.5f) * sqrtf(T_val / (S + eps));
 
     if (b == actual_b) {
-        grad += alpha * inv_N * (-1.0f / S_eps);
+        grad_b += alpha * inv_N * (-1.0f / (S + eps));
     }
 
-    grad_student[base + b] = grad;
+    grad_student[base + b] = grad_b;
 }
 
-std::vector<torch::Tensor> fused_skew_kl(
+std::vector<torch::Tensor> fused_hellinger(
     torch::Tensor student,
     torch::Tensor teacher,
     torch::Tensor actual_bytes,
-    float lam,
     float alpha
 ) {
     int N = student.size(0);
     auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(student.device());
     auto grad_student = torch::empty({N, 256}, opts);
-    auto loss_srkl = torch::empty({N}, opts);
-    auto loss_ce = torch::empty({N}, opts);
-    auto loss_tce = torch::empty({N}, opts);
+    auto out_h2 = torch::empty({N}, opts);
+    auto out_ce = torch::empty({N}, opts);
+    auto out_tce = torch::empty({N}, opts);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    fused_skew_kl_kernel<<<N, 256, 0, stream>>>(
+    fused_hellinger_kernel<<<N, 256, 0, stream>>>(
         student.data_ptr<float>(),
         teacher.data_ptr<float>(),
         actual_bytes.data_ptr<int>(),
         grad_student.data_ptr<float>(),
-        loss_srkl.data_ptr<float>(),
-        loss_ce.data_ptr<float>(),
-        loss_tce.data_ptr<float>(),
-        N, lam, alpha
+        out_h2.data_ptr<float>(),
+        out_ce.data_ptr<float>(),
+        out_tce.data_ptr<float>(),
+        N, alpha
     );
 
-    return {grad_student, loss_srkl, loss_ce, loss_tce};
+    return {grad_student, out_h2, out_ce, out_tce};
 }
 """
 
-_TRAINING_SKEW_KL_CPP = """
-std::vector<torch::Tensor> fused_skew_kl(
+_TRAINING_HELLINGER_CPP = """
+std::vector<torch::Tensor> fused_hellinger(
     torch::Tensor student,
     torch::Tensor teacher,
     torch::Tensor actual_bytes,
-    float lam,
     float alpha
 );
 """
 
 
-def get_skew_kl_kernel():
+def get_hellinger_kernel():
     if not _cuda_available:
         return None
     return _compile_kernel_with_header(
-        "fused_skew_kl",
-        _TRAINING_SKEW_KL_CPP,
-        _TRAINING_SKEW_KL_CUDA,
-        ["fused_skew_kl"],
+        "fused_hellinger",
+        _TRAINING_HELLINGER_CPP,
+        _TRAINING_HELLINGER_CUDA,
+        ["fused_hellinger"],
     )
 
 
 
-def fused_skew_kl_forward_backward(student_dists, teacher_dists, actual_bytes, alpha, lam=0.1, entropy_weights=None):
-    kernel = get_skew_kl_kernel()
+def fused_hellinger_forward_backward(student_dists, teacher_dists, actual_bytes, alpha, entropy_weights=None):
+    kernel = get_hellinger_kernel()
     if kernel is None:
         return None, None
 
-    grad_student, loss_srkl, loss_ce, loss_tce = kernel.fused_skew_kl(
+    results = kernel.fused_hellinger(
         student_dists.float().contiguous(),
         teacher_dists.float().contiguous(),
         actual_bytes.int().contiguous(),
-        lam, alpha,
+        alpha,
     )
+    grad_student, loss_h2, loss_ce, loss_tce = results
 
     if entropy_weights is not None:
-        N = loss_srkl.shape[0]
+        N = loss_h2.shape[0]
         w_sum = entropy_weights.sum().clamp(min=1e-8)
         scale = entropy_weights * N / w_sum
         grad_student = grad_student * scale.unsqueeze(1)
-        kl_loss = (loss_srkl * entropy_weights).sum() / w_sum
+        kl_loss = (loss_h2 * entropy_weights).sum() / w_sum
         ce_loss = (loss_ce * entropy_weights).sum() / w_sum
     else:
-        kl_loss = loss_srkl.mean()
+        kl_loss = loss_h2.mean()
         ce_loss = loss_ce.mean()
     total_loss = kl_loss + alpha * ce_loss
 
@@ -138,80 +134,85 @@ def fused_skew_kl_forward_backward(student_dists, teacher_dists, actual_bytes, a
         "train_loss": total_loss,
         "custom loss": total_loss,
         "CE loss": loss_ce.mean().detach(),
-        "kl_div": loss_srkl.mean().detach(),
+        "kl_div": loss_h2.mean().detach(),
         "teacher CE loss": loss_tce.mean().detach(),
     }
 
 
 # ============================================================
-# Training kernel: fused abomination loss + gradient (two-pass)
+# Fully fused training kernel: softmax + scatter + hellinger + backward
 # ============================================================
 
 
 
-_FUSED_TRAIN_SKEW_KL_CUDA = r"""
+_FUSED_TRAIN_HELLINGER_CUDA = r"""
 #include <torch/extension.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <ATen/cuda/CUDAContext.h>
 
-// Process one depth: normalize bins, compute loss, compute grad_unnorm, write back to bins.
-// bins: pointer to 256-float bin array (shared or global), must be normalized in-place first.
-// Returns nothing; bins are overwritten with grad_unnorm values.
-__device__ void process_depth_skew_kl(
+__device__ void process_depth_hellinger(
     float* bins, float Z,
     const float* teacher_src, float* teacher_row, float* reduce_buf,
     int dist_idx, const int* actual_bytes,
     float* loss_per_dist, float* ce_per_dist, float* tce_per_dist,
-    float inv_N, float lam, float alpha, int tid
+    float* teacher_entropy_out,
+    float inv_N, float alpha, int tid
 ) {
     const float eps = 1e-8f;
 
-    // Normalize bins
+    // Normalize bins and load teacher
     if (tid < 256) {
         bins[tid] /= Z;
         teacher_row[tid] = teacher_src[tid];
     }
     __syncthreads();
 
-    // Compute per-byte SRKL and reduce for per-dist loss
-    float srkl_b = 0.0f;
+    // Bhattacharyya coefficient per byte
+    float bc_b = 0.0f;
+    float S = 0.0f;
+    float T_val = 0.0f;
     if (tid < 256) {
-        float S = bins[tid];
-        float T_val = teacher_row[tid];
-        float mix = (1.0f - lam) * T_val + lam * S;
-        srkl_b = S * (logf(S + eps) - logf(mix + eps));
+        S = bins[tid];
+        T_val = teacher_row[tid];
+        bc_b = sqrtf(fmaxf(S * T_val, 0.0f));
     }
-    float srkl_sum = blockReduceSum(srkl_b);
+    float bc_sum = blockReduceSum(bc_b);
+    __syncthreads();
+
+    float ent_b = 0.0f;
+    if (tid < 256) {
+        float T = teacher_row[tid];
+        ent_b = (T > 1e-8f) ? -T * logf(T + 1e-8f) : 0.0f;
+    }
+    float ent_sum = blockReduceSum(ent_b);
+    if (tid == 0) {
+        teacher_entropy_out[dist_idx] = ent_sum;
+    }
+    __syncthreads();
 
     int actual_b = actual_bytes[dist_idx];
     if (tid == 0) {
-        loss_per_dist[dist_idx] = srkl_sum;
+        loss_per_dist[dist_idx] = 1.0f - bc_sum;
         ce_per_dist[dist_idx] = -logf(bins[actual_b] + eps);
         tce_per_dist[dist_idx] = -logf(teacher_row[actual_b] + eps);
     }
     __syncthreads();
 
-    // Compute grad_byte and dot(grad, q)
+    // Gradient: ∂H²/∂q_b = -0.5 * √(p_b / q_b)
     float grad_b = 0.0f;
-    float S = 0.0f;
     if (tid < 256) {
-        S = bins[tid];
-        float T_val = teacher_row[tid];
-        float S_eps = S + eps;
-        float mix = (1.0f - lam) * T_val + lam * S;
-        float mix_eps = mix + eps;
-        grad_b = inv_N * (logf(S_eps) + S / S_eps - logf(mix_eps) - lam * S / mix_eps);
-        if (tid == actual_b) grad_b += alpha * inv_N * (-1.0f / S_eps);
+        grad_b = inv_N * (-0.5f) * sqrtf(T_val / (S + eps));
+        if (tid == actual_b) grad_b += alpha * inv_N * (-1.0f / (S + eps));
     }
+
+    // Apply normalization Jacobian: grad_unnorm = (grad - dot(grad, q)) / Z
     float dot_prod = blockReduceSum(grad_b * S);
-    // Broadcast dot_prod
     if (tid == 0) reduce_buf[0] = dot_prod;
     __syncthreads();
     dot_prod = reduce_buf[0];
     __syncthreads();
 
-    // Write grad_unnorm back to bins
     if (tid < 256) {
         bins[tid] = (grad_b - dot_prod) / Z;
     }
@@ -220,7 +221,7 @@ __device__ void process_depth_skew_kl(
 
 // 1 block = 1 token position, 256 threads (8 warps)
 __global__ __launch_bounds__(256, 3)
-void fused_train_skew_kl_kernel(
+void fused_train_hellinger_kernel(
     const __half* __restrict__ logits,           // [T1, V]
     const int* __restrict__ first_bytes,          // [V]
     const int* __restrict__ second_bytes,         // [V]
@@ -236,30 +237,29 @@ void fused_train_skew_kl_kernel(
     float* __restrict__ loss_per_dist,            // [N_total]
     float* __restrict__ ce_per_dist,              // [N_total]
     float* __restrict__ tce_per_dist,             // [N_total]
+    float* __restrict__ teacher_entropy_out,      // [N_total]
     float* __restrict__ grad_unnorm_extra,        // [T1, max_extra, 256] for d3+
     int V, int max_byte_len, int N_total, int max_extra,
-    float lam, float alpha
+    float alpha
 ) {
     const int t = blockIdx.x;
     const int tid = threadIdx.x;
     const int wid = tid >> 5;
     const int lane = tid & 31;
 
-    // Shared memory: d0[256] + d1[256] + d2[256] + reduce[16] + teacher[256] + extra[256]
     extern __shared__ float shared[];
     float* d0_warp_bins = shared;                // [8 * 256] per-warp bins
     float* d1_bins = d0_warp_bins + 8 * 256;     // [256]
     float* d2_bins = d1_bins + 256;              // [256]
     float* reduce_buf = d2_bins + 256;           // [16]
     float* teacher_row = reduce_buf + 16;        // [256]
-    float* extra_bins = teacher_row + 256;       // [256] reusable for d3+
+    float* extra_bins = teacher_row + 256;       // [256]
     int num_tiles = (V / 2 + 255) / 256;
     float* tile_maxima = extra_bins + 256;        // [num_tiles]
 
     int my_num_depths = target_byte_lens[t];
     int my_offset = teacher_offsets[t];
 
-    // Preload target byte sequence for this position
     int target_b0 = target_byte_seqs[t * max_byte_len];
     int target_b1 = (my_num_depths >= 2) ? target_byte_seqs[t * max_byte_len + 1] : -1;
     int target_b2 = (my_num_depths >= 3) ? target_byte_seqs[t * max_byte_len + 2] : -1;
@@ -296,7 +296,7 @@ void fused_train_skew_kl_kernel(
             v1 = 0;
         }
 
-        // Online softmax update — invalid threads contribute -inf (no effect)
+        // Online softmax update
         float m_new = fmaxf(m, val0);
         d = d * __expf(m - m_new) + __expf(val0 - m_new);
         m = m_new;
@@ -304,7 +304,7 @@ void fused_train_skew_kl_kernel(
         d = d * __expf(m - m_new) + __expf(val1 - m_new);
         m = m_new;
 
-        // Track tile max for gradient filtering (warp reduce to minimize atomicMax contention)
+        // Track tile max for gradient filtering
         int tile_id = (i - tid) / 256;
         float tile_local = fmaxf(val0, val1);
         for (int offset = 16; offset > 0; offset >>= 1)
@@ -380,37 +380,37 @@ void fused_train_skew_kl_kernel(
     const float inv_N = 1.0f / (float)N_total;
 
     // d0
-    process_depth_skew_kl(d0_bins, Z0, teacher_dists + (long long)my_offset * 256,
+    process_depth_hellinger(d0_bins, Z0, teacher_dists + (long long)my_offset * 256,
         teacher_row, reduce_buf, my_offset, actual_bytes,
-        loss_per_dist, ce_per_dist, tce_per_dist, inv_N, lam, alpha, tid);
+        loss_per_dist, ce_per_dist, tce_per_dist,
+        teacher_entropy_out, inv_N, alpha, tid);
 
     // d1
     if (my_num_depths >= 2) {
-        process_depth_skew_kl(d1_bins, Z1, teacher_dists + ((long long)my_offset + 1) * 256,
+        process_depth_hellinger(d1_bins, Z1, teacher_dists + ((long long)my_offset + 1) * 256,
             teacher_row, reduce_buf, my_offset + 1, actual_bytes,
-            loss_per_dist, ce_per_dist, tce_per_dist, inv_N, lam, alpha, tid);
+            loss_per_dist, ce_per_dist, tce_per_dist,
+            teacher_entropy_out, inv_N, alpha, tid);
     }
 
     // d2
     if (my_num_depths >= 3) {
-        process_depth_skew_kl(d2_bins, Z2, teacher_dists + ((long long)my_offset + 2) * 256,
+        process_depth_hellinger(d2_bins, Z2, teacher_dists + ((long long)my_offset + 2) * 256,
             teacher_row, reduce_buf, my_offset + 2, actual_bytes,
-            loss_per_dist, ce_per_dist, tce_per_dist, inv_N, lam, alpha, tid);
+            loss_per_dist, ce_per_dist, tce_per_dist,
+            teacher_entropy_out, inv_N, alpha, tid);
     }
 
     // d3+ : process each extra depth using extra_bins
     for (int dep = 3; dep < my_num_depths; dep++) {
-        // Zero extra_bins
         if (tid < 256) extra_bins[tid] = 0.0f;
         __syncthreads();
 
-        // Scatter: check prefix match for first dep bytes, scatter (dep+1)-th byte
         for (int v = tid; v < V; v += 256) {
             if (byte_lens[v] <= dep) continue;
             if (first_bytes[v] != target_b0) continue;
             if (second_bytes[v] != target_b1) continue;
             if (third_bytes[v] != target_b2) continue;
-            // Check bytes 3..dep-1 via token_byte_seqs_flat
             bool match = true;
             long long voff = (long long)v * max_byte_len;
             for (int k = 3; k < dep && match; k++) {
@@ -424,18 +424,16 @@ void fused_train_skew_kl_kernel(
         }
         __syncthreads();
 
-        // Compute Z for this depth
         float zx = (tid < 256) ? extra_bins[tid] : 0.0f;
         float Zx = blockReduceSum(zx);
         if (tid == 0) reduce_buf[0] = fmaxf(Zx, 1e-30f);
         __syncthreads(); Zx = reduce_buf[0]; __syncthreads();
 
-        // Process loss + backward, writes grad_unnorm into extra_bins
-        process_depth_skew_kl(extra_bins, Zx, teacher_dists + ((long long)my_offset + dep) * 256,
+        process_depth_hellinger(extra_bins, Zx, teacher_dists + ((long long)my_offset + dep) * 256,
             teacher_row, reduce_buf, my_offset + dep, actual_bytes,
-            loss_per_dist, ce_per_dist, tce_per_dist, inv_N, lam, alpha, tid);
+            loss_per_dist, ce_per_dist, tce_per_dist,
+            teacher_entropy_out, inv_N, alpha, tid);
 
-        // Copy grad_unnorm to global memory for Pass 4
         if (tid < 256) {
             grad_unnorm_extra[((long long)t * max_extra + (dep - 3)) * 256 + tid] = extra_bins[tid];
         }
@@ -511,71 +509,7 @@ void fused_train_skew_kl_kernel(
     }
 }
 
-std::vector<torch::Tensor> fused_train_skew_kl(
-    torch::Tensor logits,           // [T1, V] fp16
-    torch::Tensor first_bytes,      // [V] int
-    torch::Tensor second_bytes,     // [V] int
-    torch::Tensor third_bytes,      // [V] int
-    torch::Tensor byte_lens,        // [V] int
-    torch::Tensor token_byte_seqs,  // [V, max_byte_len] int
-    torch::Tensor target_byte_seqs, // [T1, max_byte_len] int
-    torch::Tensor target_byte_lens, // [T1] int
-    torch::Tensor teacher_dists,    // [N_total, 256] float
-    torch::Tensor teacher_offsets,  // [T1] int
-    torch::Tensor actual_bytes,     // [N_total] int
-    int N_total,
-    float lam,
-    float alpha
-) {
-    const int T1 = logits.size(0);
-    const int V = logits.size(1);
-    TORCH_CHECK(V % 2 == 0, "Vocab size must be even for half2 vectorization");
-    const int max_byte_len = target_byte_seqs.size(1);
-    const int max_extra = (max_byte_len > 3) ? (max_byte_len - 3) : 0;
-
-    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(logits.device());
-    auto grad_logits = torch::zeros({T1, V}, opts_f32);
-    auto loss_srkl = torch::empty({N_total}, opts_f32);
-    auto loss_ce = torch::empty({N_total}, opts_f32);
-    auto loss_tce = torch::empty({N_total}, opts_f32);
-
-    // d3+ grad_unnorm storage
-    auto grad_extra = (max_extra > 0)
-        ? torch::empty({T1, max_extra, 256}, opts_f32)
-        : torch::empty({0}, opts_f32);
-
-    // Shared: d0_warp[8*256] + d1[256] + d2[256] + reduce[16] + teacher[256] + extra[256] + tile_maxima[num_tiles]
-    int num_tiles = (V + 511) / 512;
-    const int shared_mem = (8*256 + 256 + 256 + 16 + 256 + 256 + num_tiles) * sizeof(float);
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    fused_train_skew_kl_kernel<<<T1, 256, shared_mem, stream>>>(
-        reinterpret_cast<const __half*>(logits.data_ptr<at::Half>()),
-        first_bytes.data_ptr<int>(),
-        second_bytes.data_ptr<int>(),
-        third_bytes.data_ptr<int>(),
-        byte_lens.data_ptr<int>(),
-        token_byte_seqs.data_ptr<int>(),
-        target_byte_seqs.data_ptr<int>(),
-        target_byte_lens.data_ptr<int>(),
-        teacher_dists.data_ptr<float>(),
-        teacher_offsets.data_ptr<int>(),
-        actual_bytes.data_ptr<int>(),
-        grad_logits.data_ptr<float>(),
-        loss_srkl.data_ptr<float>(),
-        loss_ce.data_ptr<float>(),
-        loss_tce.data_ptr<float>(),
-        grad_extra.data_ptr<float>(),
-        V, max_byte_len, N_total, max_extra,
-        lam, alpha
-    );
-
-    return {grad_logits, loss_srkl, loss_ce, loss_tce};
-}
-"""
-
-_FUSED_TRAIN_SKEW_KL_CPP = """
-std::vector<torch::Tensor> fused_train_skew_kl(
+std::vector<torch::Tensor> fused_train_hellinger(
     torch::Tensor logits,
     torch::Tensor first_bytes,
     torch::Tensor second_bytes,
@@ -588,28 +522,91 @@ std::vector<torch::Tensor> fused_train_skew_kl(
     torch::Tensor teacher_offsets,
     torch::Tensor actual_bytes,
     int N_total,
-    float lam,
+    float alpha
+) {
+    const int T1 = logits.size(0);
+    const int V = logits.size(1);
+    TORCH_CHECK(V % 2 == 0, "Vocab size must be even for half2 vectorization");
+    const int max_byte_len = target_byte_seqs.size(1);
+    const int max_extra = (max_byte_len > 3) ? (max_byte_len - 3) : 0;
+
+    auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(logits.device());
+    auto grad_logits = torch::zeros({T1, V}, opts_f32);
+    auto loss_h2 = torch::empty({N_total}, opts_f32);
+    auto loss_ce = torch::empty({N_total}, opts_f32);
+    auto loss_tce = torch::empty({N_total}, opts_f32);
+    auto teacher_entropy_out = torch::empty({N_total}, opts_f32);
+
+    auto grad_extra = (max_extra > 0)
+        ? torch::empty({T1, max_extra, 256}, opts_f32)
+        : torch::empty({0}, opts_f32);
+
+    // Shared: d0_warp[8*256] + d1[256] + d2[256] + reduce[16] + teacher[256] + extra[256] + tile_maxima[num_tiles]
+    int num_tiles = (V + 511) / 512;
+    const int shared_mem = (8*256 + 256 + 256 + 16 + 256 + 256 + num_tiles) * sizeof(float);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    fused_train_hellinger_kernel<<<T1, 256, shared_mem, stream>>>(
+        reinterpret_cast<const __half*>(logits.data_ptr<at::Half>()),
+        first_bytes.data_ptr<int>(),
+        second_bytes.data_ptr<int>(),
+        third_bytes.data_ptr<int>(),
+        byte_lens.data_ptr<int>(),
+        token_byte_seqs.data_ptr<int>(),
+        target_byte_seqs.data_ptr<int>(),
+        target_byte_lens.data_ptr<int>(),
+        teacher_dists.data_ptr<float>(),
+        teacher_offsets.data_ptr<int>(),
+        actual_bytes.data_ptr<int>(),
+        grad_logits.data_ptr<float>(),
+        loss_h2.data_ptr<float>(),
+        loss_ce.data_ptr<float>(),
+        loss_tce.data_ptr<float>(),
+        teacher_entropy_out.data_ptr<float>(),
+        grad_extra.data_ptr<float>(),
+        V, max_byte_len, N_total, max_extra,
+        alpha
+    );
+
+    return {grad_logits, loss_h2, loss_ce, loss_tce, teacher_entropy_out};
+}
+"""
+
+_FUSED_TRAIN_HELLINGER_CPP = """
+std::vector<torch::Tensor> fused_train_hellinger(
+    torch::Tensor logits,
+    torch::Tensor first_bytes,
+    torch::Tensor second_bytes,
+    torch::Tensor third_bytes,
+    torch::Tensor byte_lens,
+    torch::Tensor token_byte_seqs,
+    torch::Tensor target_byte_seqs,
+    torch::Tensor target_byte_lens,
+    torch::Tensor teacher_dists,
+    torch::Tensor teacher_offsets,
+    torch::Tensor actual_bytes,
+    int N_total,
     float alpha
 );
 """
 
 
-def get_fused_train_skew_kl_kernel():
+def get_fused_train_hellinger_kernel():
     if not _cuda_available:
         return None
     return _compile_kernel_with_header(
-        "fused_train_skew_kl",
-        _FUSED_TRAIN_SKEW_KL_CPP,
-        _FUSED_TRAIN_SKEW_KL_CUDA,
-        ["fused_train_skew_kl"],
+        "fused_train_hellinger",
+        _FUSED_TRAIN_HELLINGER_CPP,
+        _FUSED_TRAIN_HELLINGER_CUDA,
+        ["fused_train_hellinger"],
     )
 
 
 
-def fused_train_forward_backward_skew_kl(logits, token_ids, byte_vocab, teacher_dists_flat,
-                                          actual_bytes_flat, teacher_offsets,
-                                          target_byte_lens, alpha, lam=0.1):
-    kernel = get_fused_train_skew_kl_kernel()
+def fused_train_forward_backward_hellinger(logits, token_ids, byte_vocab, teacher_dists_flat,
+                                            actual_bytes_flat, teacher_offsets,
+                                            target_byte_lens, alpha, entropy_weighting=False):
+    kernel = get_fused_train_hellinger_kernel()
     if kernel is None:
         return None, None
 
@@ -618,10 +615,10 @@ def fused_train_forward_backward_skew_kl(logits, token_ids, byte_vocab, teacher_
 
     next_tokens = token_ids[1:]
     next_byte_lens = byte_vocab.token_byte_lens[next_tokens]
-    next_byte_seqs = byte_vocab.token_byte_seqs[next_tokens]  # [T1, max_byte_len]
+    next_byte_seqs = byte_vocab.token_byte_seqs[next_tokens]
     N_total = int(teacher_offsets[-1].item()) + int(target_byte_lens[-1].item())
 
-    results = kernel.fused_train_skew_kl(
+    results = kernel.fused_train_hellinger(
         logits[:T1].half().contiguous(),
         byte_vocab.first_bytes_i32.contiguous(),
         byte_vocab.second_bytes_i32.contiguous(),
@@ -633,13 +630,31 @@ def fused_train_forward_backward_skew_kl(logits, token_ids, byte_vocab, teacher_
         teacher_dists_flat.float().contiguous(),
         teacher_offsets.int().contiguous(),
         actual_bytes_flat.int().contiguous(),
-        N_total, lam, alpha,
+        N_total, alpha,
     )
 
-    grad_logits, loss_srkl, loss_ce, loss_tce = results
+    grad_logits, loss_h2, loss_ce, loss_tce, teacher_entropy = results
 
-    kl_loss = loss_srkl.mean()
-    ce_loss = loss_ce.mean()
+    if entropy_weighting:
+        ew = teacher_entropy / 5.545177
+        ew_sum = ew.sum().clamp(min=1e-8)
+
+        kl_loss = (loss_h2 * ew).sum() / ew_sum
+        ce_loss = (loss_ce * ew).sum() / ew_sum
+
+        token_indices = torch.repeat_interleave(
+            torch.arange(T1, device=ew.device),
+            target_byte_lens
+        )
+        ew_per_token = torch.zeros(T1, device=ew.device).scatter_add_(0, token_indices, ew)
+        ew_per_token = ew_per_token / target_byte_lens.float().clamp(min=1)
+        ew_token_sum = ew_per_token.sum().clamp(min=1e-8)
+        grad_scale = ew_per_token * T1 / ew_token_sum
+        grad_logits = grad_logits * grad_scale.unsqueeze(1)
+    else:
+        kl_loss = loss_h2.mean()
+        ce_loss = loss_ce.mean()
+
     total_loss = kl_loss + alpha * ce_loss
 
     return grad_logits, {
@@ -649,5 +664,3 @@ def fused_train_forward_backward_skew_kl(logits, token_ids, byte_vocab, teacher_
         "kl_div": kl_loss.detach(),
         "teacher CE loss": loss_tce.mean().detach(),
     }
-
-

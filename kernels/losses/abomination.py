@@ -272,6 +272,7 @@ __device__ void process_depth_abomination_pass1(
     int dist_idx, const int* actual_bytes,
     float* fwd_kl_out, float* rev_kl_out, float* ce_out, float* tce_out,
     float* bins_global_out, float* Z_out,
+    float* teacher_entropy_out,
     int tid
 ) {
     const float eps = 1e-8f;
@@ -293,6 +294,18 @@ __device__ void process_depth_abomination_pass1(
     float fkl_sum = blockReduceSum(fkl_b);
     __syncthreads();
     float rkl_sum = blockReduceSum(rkl_b);
+    __syncthreads();
+
+    float ent_b = 0.0f;
+    if (tid < 256) {
+        float T = teacher_row[tid];
+        ent_b = (T > 1e-8f) ? -T * logf(T + 1e-8f) : 0.0f;
+    }
+    float ent_sum = blockReduceSum(ent_b);
+    if (tid == 0) {
+        teacher_entropy_out[dist_idx] = ent_sum;
+    }
+    __syncthreads();
 
     int actual_b = actual_bytes[dist_idx];
     if (tid == 0) {
@@ -402,6 +415,7 @@ void fused_train_abomination_pass1_kernel(
     float* __restrict__ Z_out,
     float* __restrict__ softmax_max_out,
     float* __restrict__ softmax_sum_out,
+    float* __restrict__ teacher_entropy_out,
     int V, int max_byte_len, int N_total
 ) {
     const int t = blockIdx.x;
@@ -515,18 +529,18 @@ void fused_train_abomination_pass1_kernel(
     // ============ PASS 3: Forward metrics per depth ============
     process_depth_abomination_pass1(d0_bins, Z0, teacher_dists + (long long)my_offset * 256,
         teacher_row, reduce_buf, my_offset, actual_bytes,
-        fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, tid);
+        fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, teacher_entropy_out, tid);
 
     if (my_num_depths >= 2) {
         process_depth_abomination_pass1(d1_bins, Z1, teacher_dists + ((long long)my_offset + 1) * 256,
             teacher_row, reduce_buf, my_offset + 1, actual_bytes,
-            fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, tid);
+            fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, teacher_entropy_out, tid);
     }
 
     if (my_num_depths >= 3) {
         process_depth_abomination_pass1(d2_bins, Z2, teacher_dists + ((long long)my_offset + 2) * 256,
             teacher_row, reduce_buf, my_offset + 2, actual_bytes,
-            fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, tid);
+            fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, teacher_entropy_out, tid);
     }
 
     for (int dep = 3; dep < my_num_depths; dep++) {
@@ -558,7 +572,7 @@ void fused_train_abomination_pass1_kernel(
 
         process_depth_abomination_pass1(extra_bins, Zx, teacher_dists + ((long long)my_offset + dep) * 256,
             teacher_row, reduce_buf, my_offset + dep, actual_bytes,
-            fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, tid);
+            fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, teacher_entropy_out, tid);
     }
 }
 
@@ -761,6 +775,7 @@ std::vector<torch::Tensor> fused_train_abomination_pass1(
     auto Z_out = torch::empty({N_total}, opts_f32);
     auto softmax_max_out = torch::empty({T1}, opts_f32);
     auto softmax_sum_out = torch::empty({T1}, opts_f32);
+    auto teacher_entropy_out = torch::empty({N_total}, opts_f32);
 
     TORCH_CHECK(V % 2 == 0, "V must be even for half2 vectorized loads");
     const int shared_mem = (8*256 + 256 + 256 + 16 + 256 + 256) * sizeof(float);
@@ -786,10 +801,11 @@ std::vector<torch::Tensor> fused_train_abomination_pass1(
         Z_out.data_ptr<float>(),
         softmax_max_out.data_ptr<float>(),
         softmax_sum_out.data_ptr<float>(),
+        teacher_entropy_out.data_ptr<float>(),
         V, max_byte_len, N_total
     );
 
-    return {fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, softmax_max_out, softmax_sum_out};
+    return {fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, softmax_max_out, softmax_sum_out, teacher_entropy_out};
 }
 
 std::vector<torch::Tensor> fused_train_abomination_pass2(
@@ -927,7 +943,7 @@ def get_fused_train_abomination_kernel():
 
 def fused_train_forward_backward_abomination(logits, token_ids, byte_vocab, teacher_dists_flat,
                                               actual_bytes_flat, teacher_offsets,
-                                              target_byte_lens, alpha):
+                                              target_byte_lens, alpha, entropy_weighting=False):
     kernel = get_fused_train_abomination_kernel()
     if kernel is None:
         return None, None
@@ -956,7 +972,7 @@ def fused_train_forward_backward_abomination(logits, token_ids, byte_vocab, teac
     pass1_results = kernel.fused_train_abomination_pass1(
         logits_h, fb, sb, tb, bl, tbs, nbs, nbl, td, to_, ab, N_total,
     )
-    fwd_kl, rev_kl, ce, tce, bins, Z_vals, softmax_max, softmax_sum = pass1_results
+    fwd_kl, rev_kl, ce, tce, bins, Z_vals, softmax_max, softmax_sum, teacher_entropy = pass1_results
 
     eps = 1e-8
     fwd_kl_mean = fwd_kl.mean().clamp(min=eps).item()
@@ -973,8 +989,28 @@ def fused_train_forward_backward_abomination(logits, token_ids, byte_vocab, teac
     )
     grad_logits, weighted_fwd_per, weighted_rev_per = pass2_results
 
-    weighted_fwd = weighted_fwd_per.mean()
-    weighted_rev = weighted_rev_per.mean()
+    if entropy_weighting:
+        ew = teacher_entropy / 5.545177  # normalize by log(256)
+
+        ew_sum = ew.sum().clamp(min=1e-8)
+        weighted_fwd = (weighted_fwd_per * ew).sum() / ew_sum
+        weighted_rev = (weighted_rev_per * ew).sum() / ew_sum
+
+        # Per-token average entropy weight for logit grad scaling
+        token_indices = torch.repeat_interleave(
+            torch.arange(T1, device=ew.device),
+            target_byte_lens
+        )
+        ew_per_token = torch.zeros(T1, device=ew.device).scatter_add_(0, token_indices, ew)
+        ew_per_token = ew_per_token / target_byte_lens.float().clamp(min=1)
+
+        ew_token_sum = ew_per_token.sum().clamp(min=1e-8)
+        grad_scale = ew_per_token * T1 / ew_token_sum
+        grad_logits = grad_logits * grad_scale.unsqueeze(1)
+    else:
+        weighted_fwd = weighted_fwd_per.mean()
+        weighted_rev = weighted_rev_per.mean()
+
     total_loss = (weighted_fwd + weighted_rev) / 2
 
     return grad_logits, {

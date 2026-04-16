@@ -92,10 +92,31 @@ def _build_custom_device_map(model_path, num_gpu0_layers, max_memory):
     return device_map
 
 
-def resolve_strategy(training_strategy: str, multi_gpu: bool) -> str:
-    if training_strategy not in ("ddp", "fsdp2", "naive_layer_split"):
-        raise ValueError(f"Unknown training_strategy: {training_strategy!r}. Must be 'ddp', 'fsdp2', or 'naive_layer_split'.")
-    return training_strategy
+def _patch_device_hooks(model):
+    """Patch Accelerate's AlignDevicesHook to set CUDA device before forward.
+
+    When HF device_map spreads layers across GPUs, Accelerate moves tensors to the
+    right device but never calls torch.cuda.set_device(). Triton kernels (Liger)
+    launch on torch.cuda.current_device(), so they crash if it doesn't match.
+    This patches each hooked module's pre_forward to fix the CUDA device context.
+    """
+    for module in model.modules():
+        hook = getattr(module, "_hf_hook", None)
+        if hook is None or not hasattr(hook, "execution_device"):
+            continue
+        exec_dev = hook.execution_device
+        if exec_dev is None or str(exec_dev) == "cpu":
+            continue
+
+        original_pre_forward = hook.pre_forward
+
+        def make_patched(orig, dev):
+            def patched_pre_forward(module, *args, **kwargs):
+                torch.cuda.set_device(dev)
+                return orig(module, *args, **kwargs)
+            return patched_pre_forward
+
+        hook.pre_forward = make_patched(original_pre_forward, exec_dev)
 
 
 class StudentModel:
@@ -105,7 +126,7 @@ class StudentModel:
         self.paths = paths
         self.model_path = student_config.model_path
         self.model_name = Path(student_config.model_path).name
-        self.context_len = student_config.context_len or config.context_len
+        self.context_len = student_config.context_len
         self.model = None
         self.tokenizer = None
         self.byte_vocab = None
@@ -130,8 +151,8 @@ class StudentModel:
 
         self._log(f"  Preparing tokenizer and byte vocab index for {self.model_name}...")
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        if c.chat_template:
-            self.tokenizer.chat_template = c.chat_template
+        if self.student_config.chat_template:
+            self.tokenizer.chat_template = self.student_config.chat_template
         self.byte_vocab = ByteVocabIndex(self.tokenizer, device=f"cuda:{rank}")
 
         save_roles = set(c.save_roles)
@@ -159,7 +180,7 @@ class StudentModel:
 
         self._log(f"  Loading model: {self.model_name}...")
         self._load_model(rank)
-        self.model = wrap_distributed(self.model, self._resolve_strategy(), self.config.training_precision, rank, world_size)
+        self.model = wrap_distributed(self.model, self.config.training_strategy, self.config.training_precision, rank, world_size)
 
         if c.torch_compile:
             self._log("  Compiling model with torch.compile...")
@@ -169,7 +190,6 @@ class StudentModel:
             base_model = self.model.module if hasattr(self.model, "module") else self.model
             for layer in get_transformer_layers(base_model):
                 layer.compile(backend=c.torch_compile_backend, mode=c.torch_compile_mode)
-            self._compile_warmup(rank)
 
         dataset_steps = len(train_convos)
         total_steps = dataset_steps * c.num_epochs
@@ -177,7 +197,7 @@ class StudentModel:
         grad_accum_steps = total_steps // eff_batch_size
         warmup_steps = math.ceil(c.num_warmup_steps / eff_batch_size)
 
-        self.optimizer = set_optimizer(self.model, c.lr, c.adam_betas, c.optimizer, c.adam_decay, total_steps=grad_accum_steps, training_strategy=self._resolve_strategy(), warmup_steps=warmup_steps)
+        self.optimizer = set_optimizer(self.model, c.lr, c.adam_betas, c.optimizer, c.adam_decay, total_steps=grad_accum_steps, training_strategy=self.config.training_strategy, warmup_steps=warmup_steps)
         if c.optimizer.lower() == "schedulefree":
             self.lr_scheduler = None
         else:
@@ -190,7 +210,7 @@ class StudentModel:
         if checkpoint_dir:
             resume_state = load_training_state(
                 checkpoint_dir, self.model, self.optimizer, self.lr_scheduler,
-                self._resolve_strategy(), rank, world_size
+                self.config.training_strategy, rank, world_size
             )
             self._log(f"  Restored training state: epoch={resume_state.epoch}, num_trained={resume_state.num_trained}")
 
@@ -202,8 +222,16 @@ class StudentModel:
 
         train_available = data_manager.get_dataset_ids()
         val_available = val_data_manager.get_dataset_ids()
+        train_before = len(train_convos)
+        val_before = len(val_convos)
         train_convos = [convo for convo in train_convos if convo.origin_convo_id in train_available]
         val_convos = [convo for convo in val_convos if convo.origin_convo_id in val_available]
+        train_dropped = train_before - len(train_convos)
+        val_dropped = val_before - len(val_convos)
+        if train_dropped > 0:
+            print(f"[WARN] Dropped {train_dropped}/{train_before} training convos not found in teacher dataset '{train_target}'")
+        if val_dropped > 0:
+            print(f"[WARN] Dropped {val_dropped}/{val_before} validation convos not found in teacher dataset '{train_target}'")
 
         if self.world_size > 1:
             local_count = torch.tensor([len(train_convos)], dtype=torch.long, device=f"cuda:{self.rank}")
@@ -271,7 +299,7 @@ class StudentModel:
                 bnb_4bit_quant_type="nf4" if c.training_precision == "4bit" else None,
             )
 
-        strategy = self._resolve_strategy()
+        strategy = c.training_strategy
         attn_impl = sc.attn_implementation
 
         if c.liger_kernel:
@@ -309,6 +337,9 @@ class StudentModel:
             if strategy != "fsdp2":
                 self.model = self.model.to(f"cuda:{rank}")
 
+        if c.liger_kernel and strategy == "naive_layer_split" and c.multi_gpu:
+            _patch_device_hooks(self.model)
+
         self.model.train()
         if c.grad_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -316,26 +347,6 @@ class StudentModel:
         for name, param in self.model.named_parameters():
             if any(fl in name for fl in sc.freeze_layers):
                 param.requires_grad = False
-
-    def _resolve_strategy(self):
-        return resolve_strategy(self.config.training_strategy, self.config.multi_gpu)
-
-    def _compile_warmup(self, rank):
-        """Trigger torch.compile tracing with two seq_lens to activate automatic_dynamic_shapes during warmup."""
-        device = f"cuda:{rank}"
-        bs = self.config.batch_size
-        for seq_len in [128, 256]:
-            seq_len = min(self.context_len, seq_len)
-            dummy = torch.randint(0, 32000, (bs, seq_len), device=device)
-            self.model.eval()
-            with torch.no_grad():
-                self.model(dummy, use_cache=False)
-            self.model.train()
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = self.model(dummy, use_cache=False)
-            out.logits.sum().backward()
-            self.model.zero_grad(set_to_none=True)
-        torch.cuda.empty_cache()
 
     def _run_training(self, train_convos, val_convos, data_manager, val_data_manager, resume_state=None):
         c = self.config
@@ -531,6 +542,10 @@ class StudentModel:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 logits_all = self.model(tokens_t, use_cache=False).logits
 
+            if logits_all.device != tokens_t.device:
+                logits_all = logits_all.to(tokens_t.device)
+            torch.cuda.set_device(self.rank)
+
             for i, convo in enumerate(batch_convos):
                 td = teacher_batch[i][:batch.padding[i]] if batch.padding[i] > 0 else teacher_batch[i]
                 loss_dict = self._compute_sample_loss(logits_all[i].float(), tokens_t[i], convo, td, training)
@@ -542,15 +557,16 @@ class StudentModel:
     def _compute_sample_loss(self, logits, token_ids, convo, teacher_dists, training):
         actual_bytes_t = torch.from_numpy(convo.actual_bytes).to(logits.device)
 
-        T = self.config.training_temperature
+        T = self.student_config.training_temperature
         if T != 1.0:
             logits = logits / T
 
         loss_dict = None
-        if training and not self.config.entropy_weighting:
+        if training:
             loss_dict = _try_fused_train(
                 logits, token_ids, convo, teacher_dists, actual_bytes_t,
                 self.byte_vocab, self.config.alpha, self.config.loss_type,
+                entropy_weighting=self.config.entropy_weighting,
             )
 
         if loss_dict is None:
@@ -638,11 +654,11 @@ class StudentModel:
 
     def _save_model(self, step):
         folder = os.path.join(self.paths.student_trained, f"{self.model_name}_step_{step}")
-        save_model(self.model, self.tokenizer, folder, self._resolve_strategy(), self.rank, self.world_size)
+        save_model(self.model, self.tokenizer, folder, self.config.training_strategy, self.rank, self.world_size)
 
     def _save_training_state(self, step, metadata):
         folder = os.path.join(self.paths.student_states, f"{self.model_name}_training_state_step_{step}")
-        save_training_state(self.model, self.tokenizer, self.optimizer, self.lr_scheduler, folder, self._resolve_strategy(), self.rank, self.world_size, metadata)
+        save_training_state(self.model, self.tokenizer, self.optimizer, self.lr_scheduler, folder, self.config.training_strategy, self.rank, self.world_size, metadata)
 
     def _setup_logger(self, resume_state=None):
         c = self.config
@@ -653,7 +669,7 @@ class StudentModel:
             "lr": c.lr, "epochs": c.num_epochs, "batch_size": c.batch_size,
             "grad_accum": c.grad_accum_batches, "precision": c.training_precision,
             "optimizer": c.optimizer, "scheduler": c.lr_scheduler,
-            "collection_temperature": c.collection_temperature, "alpha": c.alpha,
+            "alpha": c.alpha,
         }
         try:
             wandb_kwargs = dict(

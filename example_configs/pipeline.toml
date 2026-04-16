@@ -1,0 +1,161 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Pipeline Config — ALL parameters with defaults and explanations
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy this file to config.toml in the project root and adjust to your setup.
+
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+
+# Directory for all cache data (preprocessed datasets, HDF5s, checkpoints).
+cache_folder = "cache"
+
+# Training dataset in JSONL format (one conversation per line).
+# Auto-detects: OpenAI messages, ShareGPT, Alpaca instruct, or raw text.
+dataset_path = "path/to/train.jsonl"
+
+# Validation dataset in the same format as above.
+validation_dataset_path = "path/to/val.jsonl"
+
+# Directory of teacher TOML configs, or path to a single teacher config.
+teacher_configs_path = "teacher_configs"
+
+# Path to the student model TOML config file.
+student_config_path = "student_configs/your_student.toml"
+
+
+# ── General ──────────────────────────────────────────────────────────────────
+
+# Conversation roles to collect distributions for. Usually just "assistant".
+save_roles = ["assistant"]
+
+# Skip interactive yes/no prompts during sync (deletions, renames).
+# Warnings are still printed regardless.
+auto_approve = false
+
+
+# ── Collection ───────────────────────────────────────────────────────────────
+
+# Token chunk size for byte marginalization. Lower = less VRAM, slightly slower.
+marg_chunk_inference = 256      # during teacher inference
+marg_chunk_training = 256       # during student training
+
+
+# ── Training ─────────────────────────────────────────────────────────────────
+
+num_epochs = 1                  # number of training epochs
+num_warmup_steps = 50           # LR warmup steps
+batch_size = 4                  # per-device batch size
+grad_accum_batches = 2          # effective batch = batch_size * grad_accum_batches
+grad_checkpointing = true       # trade compute for VRAM (almost always worth it)
+max_grad_norm = 1.0             # gradient clipping norm (0 = disabled)
+
+# torch.compile — faster training after first compilation. Leave false initially.
+torch_compile = false
+torch_compile_mode = "default"              # "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs"
+torch_compile_backend = "inductor"          # "inductor" | "cudagraphs" | "aot_eager" | "eager"
+
+# Liger Kernel: fused Triton ops (RMSNorm, RoPE, SwiGLU).
+# Requires liger-kernel + triton. Cannot be combined with torch_compile.
+liger_kernel = false
+
+lr = 4e-6                       # learning rate
+adam_betas = [0.9, 0.999]       # Adam beta1, beta2
+adam_decay = 0.01               # Adam weight decay
+
+# WSD scheduler: start decaying LR to 0 at this fraction of total steps.
+# 0.9 = decay during the last 10% of training.
+lr_decay_start = 0.9
+
+# Composite loss weighting factor (used by abomination and skew_kl losses).
+alpha = 0.5
+
+# Loss function: "abomination" | "skew_kl" | "akl" | "wasserstein" | "jsd" | "hellinger" | "forward_kl" | "reverse_kl"
+loss_type = "abomination"
+
+# Scale per-position loss by teacher distribution entropy.
+# Downweights sparse positions from tokenizer boundary mismatches.
+entropy_weighting = false
+
+# LR scheduler name.
+lr_scheduler = "wsd"
+
+# Optimizer: "adamw" | "adamw8bit" | "adamw32bit" | "paged_adamw" | "paged_adamw8bit"
+#            | "paged_adamw32bit" | "sgd" | "rmsprop" | "rmsprop8bit" | "rmsprop32bit"
+#            | "adagrad" | "apollo" | "apollomini" | "schedulefree" | "muon"
+#            | "adamw_torch"
+optimizer = "apollomini"
+
+# Sample ordering: "shuffle" | "random" | "sorted"
+data_order = "random"
+
+# Training precision: "bf16" | "fp16" | "fp32" | "4bit" | "8bit"
+training_precision = "bf16"
+
+# Which teacher(s) to train on.
+#   "all"           — single teacher trains directly, multiple merges with per-teacher weights
+#   "teacher_name"  — use a specific teacher only
+#   ["t1", "t2"]    — merge a subset of teachers
+train_on = "all"
+
+# Multi-GPU training strategy: "ddp" | "fsdp2" | "naive_layer_split" | "naive"
+# "naive" is just a simplification of "naive_layer_split"
+training_strategy = "ddp"
+
+# Random seed for reproducible data shuffling.
+seed = 42
+
+
+# ── Validation & Saving ─────────────────────────────────────────────────────
+
+# How often to validate (in epochs). 0.1 = every 10% of an epoch.
+validate_every_n_epochs = 0.1
+
+# Metric for selecting "best" checkpoint: "train_loss" | "ce" | "kl"
+best_metric = "train_loss"
+
+# How often to save the student model (in epochs).
+save_student_every_n_epochs = 1.0
+
+# Save model checkpoint when a new best validation score is reached.
+save_best_model = true
+
+# Also save full training state (optimizer, scheduler) on best validation.
+save_best_state = false
+
+# Keep only the N most recent epoch checkpoints. Older ones are DELETED.
+# Remove this line to keep all checkpoints.
+keep_last_n_checkpoints = 2
+
+
+# ── Multi-GPU / Device ──────────────────────────────────────────────────────
+
+# Device placement: "auto" | "balanced" | "custom"
+# Use "custom" with num_gpu0_layers for manual layer placement.
+device_map = "balanced"
+
+# Number of layers on GPU 0 (which also holds embeddings/head).
+# Only used when device_map = "custom".
+# num_gpu0_layers = 9
+
+# Enable multi-GPU training (DDP/FSDP/naive).
+multi_gpu = false
+
+
+# ── Weights & Biases ────────────────────────────────────────────────────────
+# Wandb is used for logging all training and validation metrics
+# Comment is appended at the start of the training run name
+# follows the structure of "{wandb_comment} {model_name} lr({lr}) {timestamp}"
+# or "{model_name} lr({lr}) {timestamp}" if no comment
+wandb_comment = ""
+wandb_project = "LLM Distillation"
+
+
+# ── Per-device VRAM limits ──────────────────────────────────────────────────
+# Keys are GPU indices (0, 1, ...) or "cpu".
+# Leave ~2GB headroom for PyTorch overhead.
+# Uncomment and adjust if you need to cap memory.
+
+# [max_memory]
+# 0 = "22GB"
+# 1 = "22GB"
+# cpu = "60GB"

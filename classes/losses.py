@@ -234,10 +234,134 @@ def _akl_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor
     }
 
 
+def _wasserstein_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor, alpha: float, entropy_weights: Tensor | None = None) -> dict[str, Tensor]:
+    eps = 1e-8
+    cdf_s = student_dists.cumsum(dim=-1)
+    cdf_t = teacher_dists.cumsum(dim=-1)
+    diff = cdf_s - cdf_t
+    w1 = (diff[:, :-1] ** 2 + eps).sqrt().sum(-1)
+
+    kl_loss = _weighted_mean(w1, entropy_weights)
+
+    idx = actual_bytes.long()
+    arange = torch.arange(len(idx), device=student_dists.device)
+    student_ce = -(student_dists[arange, idx] + eps).log()
+    teacher_ce = -(teacher_dists[arange, idx] + eps).log()
+
+    loss = kl_loss + alpha * _weighted_mean(student_ce, entropy_weights)
+
+    return {
+        "train_loss": loss,
+        "custom loss": loss,
+        "CE loss": student_ce.mean(),
+        "kl_div": w1.mean(),
+        "teacher CE loss": teacher_ce.mean(),
+    }
+
+
+def _jsd_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor, alpha: float, entropy_weights: Tensor | None = None) -> dict[str, Tensor]:
+    eps = 1e-8
+    m = 0.5 * (student_dists + teacher_dists)
+    m_log = (m + eps).log()
+
+    t_term = torch.where(teacher_dists > eps, teacher_dists * ((teacher_dists + eps).log() - m_log), torch.zeros_like(teacher_dists))
+    s_term = torch.where(student_dists > eps, student_dists * ((student_dists + eps).log() - m_log), torch.zeros_like(student_dists))
+    jsd = (0.5 * t_term + 0.5 * s_term).sum(-1)
+
+    kl_loss = _weighted_mean(jsd, entropy_weights)
+
+    idx = actual_bytes.long()
+    arange = torch.arange(len(idx), device=student_dists.device)
+    student_ce = -(student_dists[arange, idx] + eps).log()
+    teacher_ce = -(teacher_dists[arange, idx] + eps).log()
+
+    loss = kl_loss + alpha * _weighted_mean(student_ce, entropy_weights)
+
+    return {
+        "train_loss": loss,
+        "custom loss": loss,
+        "CE loss": student_ce.mean(),
+        "kl_div": jsd.mean(),
+        "teacher CE loss": teacher_ce.mean(),
+    }
+
+
+def _hellinger_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor, alpha: float, entropy_weights: Tensor | None = None) -> dict[str, Tensor]:
+    eps = 1e-8
+    bc = (student_dists * teacher_dists).clamp(min=0).sqrt().sum(-1)
+    h2 = 1.0 - bc
+
+    kl_loss = _weighted_mean(h2, entropy_weights)
+
+    idx = actual_bytes.long()
+    arange = torch.arange(len(idx), device=student_dists.device)
+    student_ce = -(student_dists[arange, idx] + eps).log()
+    teacher_ce = -(teacher_dists[arange, idx] + eps).log()
+
+    loss = kl_loss + alpha * _weighted_mean(student_ce, entropy_weights)
+
+    return {
+        "train_loss": loss,
+        "custom loss": loss,
+        "CE loss": student_ce.mean(),
+        "kl_div": h2.mean(),
+        "teacher CE loss": teacher_ce.mean(),
+    }
+
+
+def _forward_kl_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor, alpha: float, entropy_weights: Tensor | None = None) -> dict[str, Tensor]:
+    eps = 1e-8
+    fkl = (teacher_dists * ((teacher_dists + eps).log() - (student_dists + eps).log())).sum(-1)
+
+    kl_loss = _weighted_mean(fkl, entropy_weights)
+
+    idx = actual_bytes.long()
+    arange = torch.arange(len(idx), device=student_dists.device)
+    student_ce = -(student_dists[arange, idx] + eps).log()
+    teacher_ce = -(teacher_dists[arange, idx] + eps).log()
+
+    loss = kl_loss + alpha * _weighted_mean(student_ce, entropy_weights)
+
+    return {
+        "train_loss": loss,
+        "custom loss": loss,
+        "CE loss": student_ce.mean(),
+        "kl_div": fkl.mean(),
+        "teacher CE loss": teacher_ce.mean(),
+    }
+
+
+def _reverse_kl_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor, alpha: float, entropy_weights: Tensor | None = None) -> dict[str, Tensor]:
+    eps = 1e-8
+    rkl = (student_dists * ((student_dists + eps).log() - (teacher_dists + eps).log())).sum(-1)
+
+    kl_loss = _weighted_mean(rkl, entropy_weights)
+
+    idx = actual_bytes.long()
+    arange = torch.arange(len(idx), device=student_dists.device)
+    student_ce = -(student_dists[arange, idx] + eps).log()
+    teacher_ce = -(teacher_dists[arange, idx] + eps).log()
+
+    loss = kl_loss + alpha * _weighted_mean(student_ce, entropy_weights)
+
+    return {
+        "train_loss": loss,
+        "custom loss": loss,
+        "CE loss": student_ce.mean(),
+        "kl_div": rkl.mean(),
+        "teacher CE loss": teacher_ce.mean(),
+    }
+
+
 _LOSS_FUNCTIONS = {
     "abomination": _abomination_loss,
     "skew_kl": _skew_kl_loss,
     "akl": _akl_loss,
+    "wasserstein": _wasserstein_loss,
+    "jsd": _jsd_loss,
+    "hellinger": _hellinger_loss,
+    "forward_kl": _forward_kl_loss,
+    "reverse_kl": _reverse_kl_loss,
 }
 
 from utils.kernel_utils import _FusedLossGrad
@@ -247,11 +371,17 @@ try:
         fused_skew_kl_forward_backward,
         fused_abomination_forward_backward,
         fused_akl_forward_backward,
+        fused_wasserstein_forward_backward,
+        fused_jsd_forward_backward,
+        fused_hellinger_forward_backward,
     )
     _FUSED_LOSS_FUNCTIONS = {
         "skew_kl": fused_skew_kl_forward_backward,
         "abomination": fused_abomination_forward_backward,
         "akl": fused_akl_forward_backward,
+        "wasserstein": fused_wasserstein_forward_backward,
+        "jsd": fused_jsd_forward_backward,
+        "hellinger": fused_hellinger_forward_backward,
     }
 except (ImportError, Exception):
     _FUSED_LOSS_FUNCTIONS = {}

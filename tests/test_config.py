@@ -10,7 +10,6 @@ def _base_config(**overrides):
         "validation_dataset_path": "test_data/ultrachat_20_val.jsonl",
         "teacher_configs_path": "teacher_configs",
         "student_config_path": "student_configs/tinyllama_1.1b.toml",
-        "context_len": 512,
         "num_epochs": 1,
         "batch_size": 2,
         "lr": 1e-4,
@@ -22,13 +21,12 @@ def _base_config(**overrides):
 
 def test_valid_config_parses():
     cfg = PipelineConfig(**_base_config())
-    assert cfg.context_len == 512
     assert cfg.batch_size == 2
 
 
 def test_missing_required_field():
     d = _base_config()
-    del d["context_len"]
+    del d["lr"]
     with pytest.raises(ValidationError):
         PipelineConfig(**d)
 
@@ -40,12 +38,12 @@ def test_extra_field_rejected():
 
 def test_negative_context_len():
     with pytest.raises(ValidationError):
-        PipelineConfig(**_base_config(context_len=-1))
+        StudentConfig(model_path="x", freeze_layers=[], save_final_training_state=False, context_len=-1)
 
 
 def test_zero_temperature():
     with pytest.raises(ValidationError):
-        PipelineConfig(**_base_config(collection_temperature=0))
+        TeacherConfig(model_path="some/model", temperature=0)
 
 
 def test_invalid_loss_type():
@@ -75,7 +73,7 @@ def test_custom_device_map_needs_gpu0_layers():
 
 
 def test_teacher_config_valid():
-    tc = TeacherConfig(model_path="some/model", backend_type="vllm")
+    tc = TeacherConfig(model_path="some/model", backend_type="vllm", context_len=2048)
     assert tc.model_path == "some/model"
     assert tc.backend_type == "vllm"
 
@@ -85,11 +83,17 @@ def test_teacher_config_missing_model_path():
         TeacherConfig(backend_type="vllm")
 
 
+def test_teacher_collectable_requires_context_len():
+    with pytest.raises(ValidationError):
+        TeacherConfig(model_path="some/model", backend_type="vllm")
+
+
 def test_student_config_valid():
     sc = StudentConfig(
         model_path="some/student",
         freeze_layers=["embed"],
         save_final_training_state=False,
+        context_len=2048,
     )
     assert sc.model_path == "some/student"
     assert sc.freeze_layers == ["embed"]

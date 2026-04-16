@@ -1,0 +1,62 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Teacher Config — ALL parameters with defaults and explanations
+# ─────────────────────────────────────────────────────────────────────────────
+# Place teacher configs in the directory pointed to by `teacher_configs_path`.
+# The filename (without .toml) becomes the teacher name used throughout the pipeline.
+#
+# A teacher config can be:
+#   1. Full (with backend section) — used for both collection and training
+#   2. Metadata-only (no backend) — references pre-collected HDF5 data only
+#
+# For metadata-only configs, only merge_weight matters. model_path is optional.
+
+
+# ── Model ────────────────────────────────────────────────────────────────────
+
+# Path to the teacher model. Can be a HuggingFace model ID or local path.
+# ExLlamaV2/V3 models can use the "name:version" format for quantized models.
+# Required when a backend section is present. Optional for metadata-only configs.
+model_path = "Qwen/Qwen3-8B"
+
+# Context length (tokens) for collection. Required when a backend is present.
+context_len = 2048
+
+# Temperature for teacher logits during distribution collection.
+# Higher = softer distribution = more probability mass visible to student.
+# Defaults to 1.0 if not set.
+# temperature = 1.0
+
+# Weight for this teacher when merging multiple teachers' distributions.
+# Higher = more influence. Teachers are normalized by sum of weights.
+merge_weight = 1.0
+
+# Jinja2 chat template override for this teacher's tokenizer.
+# Only needed if the model's built-in template is wrong or missing.
+# chat_template = "{% for message in messages %}..."
+
+
+# ── Backend ──────────────────────────────────────────────────────────────────
+# The backend section name determines the inference engine.
+# Supported backends: [exllamav2], [exllamav3]
+# Remove the entire backend section for metadata-only teacher configs.
+#
+# All parameters below are passed directly to the backend constructor.
+# Both exllamav2 and exllamav3 accept the same parameters.
+
+[exllamav2]
+
+# Per-GPU VRAM to reserve (in GB) for non-model use (KV cache, activations, etc).
+# List with one entry per GPU. Example: [2.5, 0.5] for a 2-GPU setup.
+reserve_vram = [2.5]
+
+# Number of sequences processed in parallel per inference worker.
+batch_size = 4
+
+# Maximum input sequence length per forward pass chunk.
+seq_chunk_len = 2048
+
+# Number of inference worker processes. Each loads a full model copy.
+num_inference_workers = 1
+
+# If true, spawns one worker per GPU (overrides num_inference_workers).
+one_worker_per_gpu = false

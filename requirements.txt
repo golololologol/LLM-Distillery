@@ -3,6 +3,8 @@ numpy
 transformers
 pydantic
 h5py
+hdf5plugin
+zstandard
 tqdm
 wandb
 joblib

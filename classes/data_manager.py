@@ -3,6 +3,7 @@ from multiprocessing import shared_memory
 from multiprocessing import get_context
 import multiprocessing
 import numpy as np
+import hdf5plugin
 import traceback
 import queue
 import time
@@ -11,65 +12,9 @@ import gc
 import os
 
 
-def _compress_distributions(data):
-    """Per row: [count:u16][indices:u8[count]][values:f16[count]]"""
-    data = np.asarray(data, dtype=np.float32)
-    num_rows = data.shape[0]
-    offsets = np.empty(num_rows, dtype=np.uint64)
-    parts = []
-    byte_pos = 0
-
-    for i in range(num_rows):
-        row = data[i]
-        nonzero = row > 0
-        nonzero_count = int(nonzero.sum())
-        offsets[i] = byte_pos
-
-        indices = np.where(nonzero)[0].astype(np.uint8)
-        values = row[nonzero].astype(np.float16)
-        packed_row = nonzero_count.to_bytes(2, 'little') + indices.tobytes() + values.tobytes()
-
-        parts.append(packed_row)
-        byte_pos += len(packed_row)
-
-    return b''.join(parts), offsets
-
-
-def _decompress_distributions(packed_data, offsets, convo_len):
-    buf = np.frombuffer(packed_data, dtype=np.uint8)
-    offsets = offsets.astype(np.int64)
-    result = np.zeros((convo_len, 256), dtype=np.float32)
-
-    counts = buf[offsets].astype(np.uint16) | (buf[offsets + 1].astype(np.uint16) << 8)
-    has_entries = counts > 0
-    if not has_entries.any():
-        return result
-
-    active_rows = np.where(has_entries)[0]
-    active_counts = counts[has_entries].astype(np.int64)
-    active_offsets = offsets[has_entries] + 2  # skip the 2-byte count header
-    total_entries = int(active_counts.sum())
-
-    # Build flat element positions: which byte in the buffer holds each index and value
-    count_cumsum = np.empty(len(active_rows) + 1, dtype=np.int64)
-    count_cumsum[0] = 0
-    np.cumsum(active_counts, out=count_cumsum[1:])
-
-    element_offset = np.arange(total_entries, dtype=np.int64) - np.repeat(count_cumsum[:-1], active_counts)
-    index_positions = np.repeat(active_offsets, active_counts) + element_offset
-    value_positions = np.repeat(active_offsets + active_counts, active_counts) + element_offset * 2
-
-    all_indices = buf[index_positions]
-    raw_f16 = buf[value_positions].astype(np.uint16) | (buf[value_positions + 1].astype(np.uint16) << 8)
-    all_values = raw_f16.view(np.float16).astype(np.float32)
-
-    result[np.repeat(active_rows, active_counts), all_indices] = all_values
-    return result
-
-
 class H5DataManager:
     def __init__(self, dataset_path, max_queue_size=12, teacher_name: str = "", read_only: bool = False, auto_approve: bool = False):
-        self.file_path = os.path.join(dataset_path, "distributions.hdf5")
+        self.file_path = os.path.join(dataset_path, f"{teacher_name}.hdf5")
         self.queue = multiprocessing.Queue(max_queue_size)
         self.result_queue = multiprocessing.Queue(max_queue_size)
         self.closing = multiprocessing.Event()
@@ -161,14 +106,8 @@ class H5DataManager:
                         self.result_queue.put(self._get_attr(hdf_file, data))
                     case 'set_dataset_attr':
                         self._set_attr(hdf_file, data[0], data[1])
-                    case 'get_teacher_attr':
-                        self.result_queue.put(self._get_teacher_attr(hdf_file, data))
-                    case 'set_teacher_attr':
-                        self._set_teacher_attr(hdf_file, data)
                     case 'has_data':
                         self.result_queue.put(self._has_data(hdf_file))
-                    case 'merge_teachers':
-                        self._merge_teachers(hdf_file, data)
                     case '_flush':
                         data.send(True)
                         data.close()
@@ -192,26 +131,10 @@ class H5DataManager:
         
         
     def _group_key(self, convo_id: int) -> str:
-        if self.teacher_name:
-            return f'{self.teacher_name}/convo_{convo_id}'
         return f'convo_{convo_id}'
 
     def _iter_group(self, hdf_file: h5py.File):
-        if self.teacher_name:
-            if self.teacher_name in hdf_file:
-                return hdf_file[self.teacher_name]
-            return {}
         return hdf_file
-        
-        
-    def _get_teacher_attr(self, hdf_file: h5py.File, arg):
-        if self.teacher_name in hdf_file:
-            return hdf_file[self.teacher_name].attrs.get(arg, None)
-
-    def _set_teacher_attr(self, hdf_file: h5py.File, data):
-        attr_name, value = data
-        group = hdf_file.require_group(self.teacher_name)
-        group.attrs[attr_name] = value
 
 
     def _has_data(self, hdf_file: h5py.File):
@@ -280,22 +203,18 @@ class H5DataManager:
         if cropped is not None:
             group.attrs['cropped'] = cropped
 
-        packed_bytes, offsets = _compress_distributions(data)
-        for key in ['distributions_data', 'distributions_offsets']:
+        zstd = hdf5plugin.Zstd(clevel=1)
+        for key in ['dense_distributions']:
             if key in group:
                 del group[key]
-        group.create_dataset('distributions_data', data=np.frombuffer(packed_bytes, dtype=np.uint8), compression='gzip', compression_opts=1)
-        group.create_dataset('distributions_offsets', data=offsets, compression='gzip', compression_opts=1)
+        group.create_dataset('dense_distributions', data=data.astype(np.float16), **zstd)
         group.attrs['convo_len'] = data.shape[0]
     
     
     def _load_group_distributions(self, group):
-        if 'distributions_data' not in group:
+        if 'dense_distributions' not in group:
             return None
-        packed_data = bytes(group['distributions_data'][:])
-        offsets = np.array(group['distributions_offsets'][:])
-        convo_len = int(group.attrs['convo_len'])
-        return _decompress_distributions(packed_data, offsets, convo_len)
+        return np.array(group['dense_distributions'][:], dtype=np.float32)
 
 
     def _load_id(self, hdf_file: h5py.File, convo_id: int) -> np.ndarray:
@@ -369,50 +288,6 @@ class H5DataManager:
         self.shared_batches = []
 
 
-    def _merge_teachers(self, hdf_file: h5py.File, teacher_weights: dict[str, float]):
-        teacher_names = list(teacher_weights.keys())
-
-        first_teacher = teacher_names[0]
-        if first_teacher not in hdf_file:
-            return
-
-        convo_ids = [int(convo.split('_')[1]) for convo in hdf_file[first_teacher]]
-
-        if '_merged' in hdf_file:
-            del hdf_file['_merged']
-        merged = hdf_file.create_group('_merged')
-
-        for id in convo_ids:
-            teacher_convos = []
-            max_len = 0
-            
-            for teacher in teacher_names:
-                teacher_convo_id = f'{teacher}/convo_{id}'
-                if teacher_convo_id in hdf_file:
-                    distr = self._load_group_distributions(hdf_file[teacher_convo_id])
-                    if distr is not None:
-                        teacher_convos.append((distr, distr.shape[0], teacher_weights[teacher]))
-                        max_len = max(max_len, distr.shape[0])
-
-            if not teacher_convos:
-                continue
-
-            merged_distr = np.zeros((max_len, 256), dtype=np.float32)
-            total_weights = np.zeros(max_len, dtype=np.float32)
-            for distr, length, weight in teacher_convos:
-                merged_distr[:length] += weight * distr
-                total_weights[:length] += weight
-            has_data = total_weights > 0
-            merged_distr[has_data] /= total_weights[has_data, np.newaxis]
-
-            sha = hdf_file[f'{teacher_names[0]}/convo_{id}'].attrs.get('content_sha', '')
-            merged_convo = merged.create_group(f'convo_{id}')
-            packed_bytes, offsets = _compress_distributions(merged_distr)
-            merged_convo.create_dataset('distributions_data', data=np.frombuffer(packed_bytes, dtype=np.uint8), compression='gzip', compression_opts=1)
-            merged_convo.create_dataset('distributions_offsets', data=offsets, compression='gzip', compression_opts=1)
-            merged_convo.attrs['content_sha'] = sha
-            merged_convo.attrs['convo_len'] = merged_distr.shape[0]
-
     def _rename_ids(self, hdf_file: h5py.File, ids_to_reindex: dict[int, int]):
         for old_id, new_id in ids_to_reindex.items():
             hdf_file.move(self._group_key(old_id), self._group_key(new_id) + '_moved')
@@ -466,11 +341,10 @@ class H5DataManager:
         if not ids:
             return
         
-        label = f"{self.teacher_name} " if self.teacher_name else ""
         if reason:
-            msg = f"{reason}\nThis will delete {len(ids)} samples from the {label}h5 dataset."
+            msg = f"{reason}\nThis will delete {len(ids)} samples."
         else:
-            msg = f"The script called for deletion of {len(ids)} samples from the {label}h5 dataset."
+            msg = f"Deleting {len(ids)} samples."
         
         if self.auto_approve:
             print(f"WARNING: {msg} (auto-approved)")
@@ -486,13 +360,12 @@ class H5DataManager:
         if not ids_to_reindex:
             return
         
-        label = f"{self.teacher_name} " if self.teacher_name else ""
-        msg = f"The script called for renaming of {len(ids_to_reindex)} samples in the {label}h5 dataset.\nThis means that the dataset's samples will be moved to new IDs to be in sync with your current text dataset."
+        msg = f"Renaming {len(ids_to_reindex)} samples to sync IDs with text dataset."
         
         if self.auto_approve:
             print(f"WARNING: {msg} (auto-approved)")
         else:
-            response = input(f"{msg}\nAre you sure you want to proceed? (y/n): ")
+            response = input(f"{msg}\nProceed? (y/n): ")
             if response.lower() not in ['y', 'yes', 'ye', '1', 'true', 't']:
                 raise ValueError("User cancelled operation.")
         
@@ -520,13 +393,6 @@ class H5DataManager:
     def set_dataset_attr(self, attr: str, value):
         self.queue.put(('set_dataset_attr', (attr, value)))
 
-    def set_teacher_attr(self, attr: str, value):
-        self.queue.put(('set_teacher_attr', (attr, value)))
-
-    def get_teacher_attr(self, attr: str):
-        self.queue.put(('get_teacher_attr', attr))
-        return self.result_queue.get()
-
     def get_dataset_attr(self, attr: str):
         self.queue.put(('get_dataset_attr', attr))
         return self.result_queue.get()
@@ -536,10 +402,6 @@ class H5DataManager:
         self._flush_and_wait()
         return self.result_queue.get()
     
-    def merge_teachers(self, teacher_weights: dict[str, float]):
-        self.queue.put(('merge_teachers', teacher_weights))
-        self._flush_and_wait()
-
     def close(self):
         try:
             if not self.loading_process.is_alive():

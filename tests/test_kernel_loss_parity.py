@@ -3,6 +3,7 @@ import torch
 from conftest import requires_gpu
 from classes.losses import (
     _skew_kl_loss, _akl_loss, _abomination_loss,
+    _wasserstein_loss, _jsd_loss, _hellinger_loss,
     calculate_divergence, _FUSED_LOSS_FUNCTIONS,
 )
 
@@ -99,6 +100,96 @@ def test_abomination_parity(N):
 
 @requires_gpu
 @pytest.mark.slow
+@pytest.mark.parametrize("N", [100, 500])
+def test_hellinger_parity(N):
+    from kernels import fused_hellinger_forward_backward
+
+    torch.manual_seed(42)
+    device = "cuda"
+    student = torch.softmax(torch.randn(N, 256, device=device), dim=-1).requires_grad_(True)
+    teacher = torch.softmax(torch.randn(N, 256, device=device), dim=-1)
+    actual = torch.randint(0, 256, (N,), device=device, dtype=torch.uint8)
+
+    ref = _hellinger_loss(student, teacher, actual, alpha=0.5)
+    ref["train_loss"].backward()
+    ref_grad = student.grad.clone()
+    student.grad = None
+
+    grad_cuda, cuda_dict = fused_hellinger_forward_backward(student.detach(), teacher, actual, alpha=0.5)
+    if grad_cuda is None:
+        pytest.skip("Kernel compilation failed")
+
+    loss_diff = abs(ref["train_loss"].item() - cuda_dict["train_loss"].item())
+    assert loss_diff < 1e-3, f"loss diff {loss_diff}"
+
+    cos = torch.nn.functional.cosine_similarity(
+        grad_cuda.flatten().unsqueeze(0), ref_grad.flatten().unsqueeze(0)
+    )
+    assert cos.item() > 0.999, f"cosine sim {cos.item()}"
+
+
+@requires_gpu
+@pytest.mark.slow
+@pytest.mark.parametrize("N", [100, 500])
+def test_jsd_parity(N):
+    from kernels import fused_jsd_forward_backward
+
+    torch.manual_seed(42)
+    device = "cuda"
+    student = torch.softmax(torch.randn(N, 256, device=device), dim=-1).requires_grad_(True)
+    teacher = torch.softmax(torch.randn(N, 256, device=device), dim=-1)
+    actual = torch.randint(0, 256, (N,), device=device, dtype=torch.uint8)
+
+    ref = _jsd_loss(student, teacher, actual, alpha=0.5)
+    ref["train_loss"].backward()
+    ref_grad = student.grad.clone()
+    student.grad = None
+
+    grad_cuda, cuda_dict = fused_jsd_forward_backward(student.detach(), teacher, actual, alpha=0.5)
+    if grad_cuda is None:
+        pytest.skip("Kernel compilation failed")
+
+    loss_diff = abs(ref["train_loss"].item() - cuda_dict["train_loss"].item())
+    assert loss_diff < 1e-3, f"loss diff {loss_diff}"
+
+    cos = torch.nn.functional.cosine_similarity(
+        grad_cuda.flatten().unsqueeze(0), ref_grad.flatten().unsqueeze(0)
+    )
+    assert cos.item() > 0.999, f"cosine sim {cos.item()}"
+
+
+@requires_gpu
+@pytest.mark.slow
+@pytest.mark.parametrize("N", [100, 500])
+def test_wasserstein_parity(N):
+    from kernels import fused_wasserstein_forward_backward
+
+    torch.manual_seed(42)
+    device = "cuda"
+    student = torch.softmax(torch.randn(N, 256, device=device), dim=-1).requires_grad_(True)
+    teacher = torch.softmax(torch.randn(N, 256, device=device), dim=-1)
+    actual = torch.randint(0, 256, (N,), device=device, dtype=torch.uint8)
+
+    ref = _wasserstein_loss(student, teacher, actual, alpha=0.5)
+    ref["train_loss"].backward()
+    ref_grad = student.grad.clone()
+    student.grad = None
+
+    grad_cuda, cuda_dict = fused_wasserstein_forward_backward(student.detach(), teacher, actual, alpha=0.5)
+    if grad_cuda is None:
+        pytest.skip("Kernel compilation failed")
+
+    loss_diff = abs(ref["train_loss"].item() - cuda_dict["train_loss"].item())
+    assert loss_diff < 1e-3, f"loss diff {loss_diff}"
+
+    cos = torch.nn.functional.cosine_similarity(
+        grad_cuda.flatten().unsqueeze(0), ref_grad.flatten().unsqueeze(0)
+    )
+    assert cos.item() > 0.999, f"cosine sim {cos.item()}"
+
+
+@requires_gpu
+@pytest.mark.slow
 def test_calculate_divergence_falls_back():
     device = "cuda"
     student = torch.softmax(torch.randn(50, 256, device=device), dim=-1).requires_grad_(True)
@@ -118,7 +209,7 @@ def test_calculate_divergence_falls_back():
 
 @requires_gpu
 @pytest.mark.slow
-@pytest.mark.parametrize("loss_type", ["skew_kl", "akl", "abomination"])
+@pytest.mark.parametrize("loss_type", ["skew_kl", "akl", "abomination", "wasserstein", "jsd", "hellinger", "forward_kl", "reverse_kl"])
 def test_calculate_divergence_autograd(loss_type):
     device = "cuda"
     student = torch.softmax(torch.randn(50, 256, device=device), dim=-1).requires_grad_(True)

@@ -135,5 +135,4 @@ def sync_dataset(samples: list[dict], save_roles: set[str], hdf5_shas: dict[int,
         if old_id != new_id:
             to_reindex[old_id] = new_id
 
-    print(f"Sync: {len(to_collect)} to collect, {len(to_delete)} to delete, {len(to_reindex)} to rename")
     return SyncResult(to_collect=to_collect, to_delete=to_delete, to_reindex=to_reindex)

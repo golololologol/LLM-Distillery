@@ -1,17 +1,18 @@
 import pytest
 import torch
 import math
-from classes.losses import _abomination_loss, _skew_kl_loss, _akl_loss
+from classes.losses import _abomination_loss, _skew_kl_loss, _akl_loss, _wasserstein_loss, _jsd_loss, _hellinger_loss, _forward_kl_loss, _reverse_kl_loss
 
-ALL_LOSSES = [_abomination_loss, _skew_kl_loss, _akl_loss]
-ALL_LOSS_IDS = ["abomination", "skew_kl", "akl"]
+ALL_LOSSES = [_abomination_loss, _skew_kl_loss, _akl_loss, _wasserstein_loss, _jsd_loss, _hellinger_loss, _forward_kl_loss, _reverse_kl_loss]
+ALL_LOSS_IDS = ["abomination", "skew_kl", "akl", "wasserstein", "jsd", "hellinger", "forward_kl", "reverse_kl"]
 
-LOSSES_WITH_KL = ALL_LOSSES  # all return "kl_div"
-KL_IDS = ALL_LOSS_IDS
+# Wasserstein uses smoothed W1 (sqrt(diff²+eps)) so identical dists give small nonzero value
+LOSSES_WITH_KL = [_abomination_loss, _skew_kl_loss, _akl_loss, _jsd_loss, _hellinger_loss, _forward_kl_loss, _reverse_kl_loss]
+KL_IDS = ["abomination", "skew_kl", "akl", "jsd", "hellinger", "forward_kl", "reverse_kl"]
 
 # These have train_loss = kl + alpha * CE (akl uses adaptive weighting so kl_div != train_loss)
-ADDITIVE_LOSSES = [_skew_kl_loss]
-ADDITIVE_IDS = ["skew_kl"]
+ADDITIVE_LOSSES = [_skew_kl_loss, _wasserstein_loss, _jsd_loss, _hellinger_loss, _forward_kl_loss, _reverse_kl_loss]
+ADDITIVE_IDS = ["skew_kl", "wasserstein", "jsd", "hellinger", "forward_kl", "reverse_kl"]
 
 
 @pytest.fixture

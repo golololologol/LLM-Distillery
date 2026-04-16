@@ -100,9 +100,12 @@ python collect_and_finetune.py --lr 1e-5 --batch_size 8
 ```
 cache_folder/
 ├── dataset/
-│   ├── distributions.hdf5      # Training distributions
+│   ├── teacher_name.hdf5       # Per-teacher training distributions
+│   ├── another_teacher.hdf5
+│   ├── _merged.hdf5            # Auto-generated when training on multiple teachers
 │   └── validation/
-│       └── distributions.hdf5  # Validation distributions
+│       ├── teacher_name.hdf5   # Per-teacher validation distributions
+│       └── another_teacher.hdf5
 └── student/
     ├── trained/                 # Model checkpoints
     ├── states/                  # Training state checkpoints

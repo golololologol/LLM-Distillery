@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Student Config — ALL parameters with defaults and explanations
+# ─────────────────────────────────────────────────────────────────────────────
+# Pointed to by `student_config_path` in the pipeline config.
+# Only one student config is used per pipeline run.
+
+
+# ── Model ────────────────────────────────────────────────────────────────────
+
+# HuggingFace model ID or local path to the student model.
+model_path = "Qwen/Qwen3-0.6B"
+
+# Context length (tokens) for training. Required.
+context_len = 2048
+
+# Attention implementation: "eager" | "flash_attention_2" | "sdpa"
+# flash_attention_2 requires the flash-attn package.
+attn_implementation = "eager"
+
+# Jinja2 chat template override for the student tokenizer.
+# Only needed if the model's built-in template is wrong or missing.
+# Useful for models like TinyLlama that lack a default chat template.
+# chat_template = "{% for message in messages %}..."
+
+
+# Temperature for student logits during training.
+# Mismatching teacher vs student temperature means the student sees
+# a different distribution shape than what it optimizes against.
+training_temperature = 1.0
+
+
+# ── Training state ──────────────────────────────────────────────────────────
+
+# Layer name patterns to freeze during training (no gradients).
+# Empty list = train all layers. Patterns match against parameter names.
+# Examples: ["model.embed_tokens", "model.layers.0", "lm_head"]
+freeze_layers = []
+
+# Save optimizer + scheduler state after the final epoch.
+save_final_training_state = false
+
+# Save training state every N epochs (for resuming interrupted runs).
+# Comment out to disable periodic state saves.
+# save_training_state_every_n_epochs = 1.0
+
+# Resume training from a saved state directory.
+# Point to the directory containing optimizer/scheduler state files.
+# resume_from = "cache/training_state_epoch_3"

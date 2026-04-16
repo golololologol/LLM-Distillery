@@ -9,10 +9,13 @@ torch.manual_seed(42)
 
 from transformers import AutoTokenizer
 from classes.byte_vocab import ByteVocabIndex
-from classes.losses import _skew_kl_loss, _akl_loss, _abomination_loss
+from classes.losses import _skew_kl_loss, _akl_loss, _abomination_loss, _wasserstein_loss, _jsd_loss, _hellinger_loss
 from kernels import fused_train_forward_backward
 
-LOSS_FNS = {"skew_kl": _skew_kl_loss, "akl": _akl_loss, "abomination": _abomination_loss}
+LOSS_FNS = {
+    "skew_kl": _skew_kl_loss, "akl": _akl_loss, "abomination": _abomination_loss,
+    "wasserstein": _wasserstein_loss, "jsd": _jsd_loss, "hellinger": _hellinger_loss,
+}
 
 
 def make_data(bv, T1):

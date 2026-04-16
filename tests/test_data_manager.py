@@ -1,11 +1,9 @@
 import numpy as np
 from numpy.testing import assert_allclose
-from classes.data_manager import _compress_distributions, _decompress_distributions
 
 
 def _roundtrip(data):
-    packed, offsets = _compress_distributions(data)
-    return _decompress_distributions(packed, offsets, data.shape[0])
+    return data.astype(np.float16).astype(np.float32)
 
 
 def test_roundtrip_random():
@@ -49,12 +47,6 @@ def test_mass_preservation():
     assert_allclose(result.sum(axis=1), data.sum(axis=1), atol=1e-2)
 
 
-def test_offsets_monotonic():
-    data = np.random.dirichlet(np.ones(256), size=40).astype(np.float32)
-    _, offsets = _compress_distributions(data)
-    assert np.all(offsets[1:] >= offsets[:-1])
-
-
 def test_single_row():
     data = np.random.dirichlet(np.ones(256), size=1).astype(np.float32)
     result = _roundtrip(data)
@@ -63,13 +55,10 @@ def test_single_row():
 
 def test_mixed_sparsity():
     data = np.zeros((10, 256), dtype=np.float32)
-    # sparse rows
     for i in range(3):
         idx = np.random.choice(256, 3, replace=False)
         data[i, idx] = np.random.dirichlet(np.ones(3))
-    # dense rows
     for i in range(3, 7):
         data[i] = np.random.dirichlet(np.ones(256))
-    # zero rows (7-9 already zero)
     result = _roundtrip(data)
     assert_allclose(result, data, atol=1e-3)

@@ -18,22 +18,37 @@ def str2bool(v):
 
 
 class TeacherConfig(BaseModel):
-    model_path: str = Field(..., min_length=1)
+    model_path: Optional[str] = Field(None, min_length=1)
     context_len: Optional[int] = Field(None, gt=0)
-    backend_type: str = Field(...)
+    backend_type: Optional[str] = Field(None)
     backend_params: Dict[str, Any] = Field(default_factory=dict)
-    temperature: Optional[float] = Field(None, gt=0)
+    temperature: float = Field(1.0, gt=0)
     merge_weight: float = Field(1.0, gt=0)
+    chat_template: Optional[str] = Field(None, description="Jinja2 chat template override for this teacher's tokenizer.")
+
+    @property
+    def can_collect(self) -> bool:
+        return self.backend_type is not None
+
+    @model_validator(mode='after')
+    def validate_collectable(self):
+        if self.can_collect and not self.model_path:
+            raise ValueError("model_path is required for teacher configs with a backend section.")
+        if self.can_collect and self.context_len is None:
+            raise ValueError("context_len is required for teacher configs with a backend section.")
+        return self
 
 
 class StudentConfig(BaseModel):
     model_path: str = Field(..., min_length=1)
-    context_len: Optional[int] = Field(None, gt=0)
+    context_len: int = Field(..., gt=0)
     freeze_layers: List[str] = Field(...)
     attn_implementation: str = Field("eager")
     save_final_training_state: bool = Field(...)
     save_training_state_every_n_epochs: Optional[float] = Field(None, gt=0)
     resume_from: Optional[str] = Field(None)
+    training_temperature: float = Field(1.0, gt=0)
+    chat_template: Optional[str] = Field(None, description="Jinja2 chat template override for the student tokenizer.")
 
 
 class PipelineConfig(BaseModel):
@@ -82,15 +97,9 @@ class PipelineConfig(BaseModel):
 
 
     # General model settings
-    context_len: int = Field(..., gt=0, description="Context length to collect and train on. {int}")
-    """Context length for training."""
-    
     save_roles: List[str] = Field(default_factory=lambda: ["assistant"], description="List of roles to save in the dataset. If empty, all roles will be saved. {string list}")
     """List of roles to save in the dataset. If empty, all roles will be saved."""
     
-    chat_template: Optional[str] = Field(None, description="Jinja2 chat template string. Overrides the tokenizer's built-in template. {string}")
-    """Jinja2 chat template override for tokenizers without a built-in one."""
-
     auto_approve: bool = Field(False, description="Skip interactive confirmation prompts for dataset modifications (deletions, renames). Warnings are still printed. {bool}")
     """When True, dataset sync operations proceed without waiting for user input. Warnings are still printed."""
 
@@ -131,12 +140,6 @@ class PipelineConfig(BaseModel):
     liger_kernel: bool = Field(False, description="Enable Liger Kernel fused Triton ops (RMSNorm, RoPE, SwiGLU). Requires liger-kernel package. {bool}")
     """Flag to enable Liger Kernel fused Triton ops (RMSNorm, RoPE, SwiGLU). Requires liger-kernel package and triton."""
     
-    collection_temperature: float = Field(1.0, gt=0, description="Temperature applied to teacher logits during distribution collection. {float}")
-    """Temperature applied to teacher logits during distribution collection."""
-
-    training_temperature: float = Field(1.0, gt=0, description="Temperature applied to student logits during training. {float}")
-    """Temperature applied to student logits during training."""
-    
     lr: float = Field(..., gt=0, description="Learning rate. {float}")
     """Learning rate."""
     
@@ -152,7 +155,7 @@ class PipelineConfig(BaseModel):
     alpha: float = Field(0.5, description="Weighting factor for weighted losses. {float}")
     """Weighting factor for weighted losses."""
     
-    loss_type: Literal["abomination", "skew_kl", "akl"] = Field("abomination", description="Loss function type. {string}")
+    loss_type: Literal["abomination", "skew_kl", "akl", "wasserstein", "jsd", "hellinger", "forward_kl", "reverse_kl"] = Field("abomination", description="Loss function type. {string}")
     """Loss function type."""
 
     entropy_weighting: bool = Field(False, description="Scale per-position loss by teacher distribution entropy. Downweights sparse tokenizer-artifact positions. {bool}")
@@ -175,10 +178,10 @@ class PipelineConfig(BaseModel):
     training_precision: Literal["fp16", "fp32", "bf16", "4bit", "8bit"] = Field("bf16", description="Training precision. {string}")
     """Name of the precision to use for training."""
     
-    train_on: str | list[str] = Field("auto", description="Which teacher(s) to train on. 'auto' = single teacher uses it directly, multiple teachers merges with per-teacher weights. Can be a specific teacher name, or a list of teacher names to merge a subset. {string | list[string]}")
+    train_on: str | list[str] = Field("all", description="Which teacher(s) to train on. 'all' = use all available teachers (single teacher trains directly, multiple merges with per-teacher weights). Can be a specific teacher name, or a list of teacher names to merge a subset. {string | list[string]}")
     """Which teacher(s) to train on."""
     
-    training_strategy: Literal["ddp", "fsdp2", "naive_layer_split"] = Field("ddp", description="Training parallelism strategy. Options: 'ddp', 'fsdp2', 'naive_layer_split'. {string}")
+    training_strategy: Literal["ddp", "fsdp2", "naive", "naive_layer_split"] = Field("ddp", description="Training parallelism strategy. Options: 'ddp', 'fsdp2', 'naive'/'naive_layer_split'. {string}")
     """Training parallelism strategy."""
 
 
@@ -220,12 +223,18 @@ class PipelineConfig(BaseModel):
     multi_gpu: bool = Field(False, description="Whether to do multi-GPU training. {bool}")
     """Flag to enable multi-GPU training."""
     
-    wandb_comment: str = Field("", description="A comment for Weights and Biases logging. {string}")
-    """Comment for Weights and Biases logging."""
+    wandb_comment: str = Field("", description="A comment for Weights and Biases logging for the given training run. {string}")
+    """Comment for Weights and Biases logging for the given training run."""
     
     wandb_project: str = Field("LLM Distillation", description="Weights and Biases project name. {string}")
     """Weights and Biases project name."""
 
+
+    @field_validator('training_strategy', mode='before')
+    def normalize_training_strategy(cls, v):
+        if v == "naive":
+            return "naive_layer_split"
+        return v
 
     @field_validator('train_on', mode='before')
     def validate_train_on(cls, v):
@@ -328,28 +337,33 @@ def _suggest_typos(error: Exception, valid_fields: set[str]) -> str:
             field = e['loc'][0]
             close = difflib.get_close_matches(str(field), valid_fields, n=3, cutoff=0.6)
             if close:
-                messages.append(f"  Unknown field '{field}' — did you mean: {', '.join(close)}?")
+                messages.append(f"  Unknown field '{field}' - did you mean: {', '.join(close)}?")
             else:
-                messages.append(f"  Unknown field '{field}' — not a valid config parameter.")
+                messages.append(f"  Unknown field '{field}' - not a valid config parameter.")
     return '\n'.join(messages) if messages else ''
 
 
-def get_config(config_path=None) -> tuple[PipelineConfig, bool]:
+def get_config(config_path=None) -> tuple[PipelineConfig, bool, bool, bool]:
     """
-    Loads TOML configuration and merges it with CLI arguments,
-    then returns a validated PipelineConfig instance and a validate_only flag.
+    Loads TOML configuration and merges it with CLI arguments.
+    Returns (config, validate_only, collect_only, train_only).
     """
     default_config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.toml')
     
     parser = argparse.ArgumentParser(description="LLM-Distillery: Teacher-student knowledge distillation pipeline.")
     parser.add_argument("--config", type=str, default=None, help="Path to the pipeline config TOML file. Defaults to config.toml in the project root.")
     parser.add_argument("--validate", action="store_true", default=False, help="Validate configuration and exit without running the pipeline.")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--collect-only", action="store_true", default=False, help="Run collection phase only, skip training.")
+    mode_group.add_argument("--train-only", action="store_true", default=False, help="Run training phase only using pre-collected data. Teacher configs not required.")
     generate_cli_arguments(parser, PipelineConfig)
     args = parser.parse_args()
     cli_args = vars(args)
     
     config_path = cli_args.pop("config") or config_path or default_config_path
     validate_only = cli_args.pop("validate")
+    collect_only = cli_args.pop("collect_only")
+    train_only = cli_args.pop("train_only")
     toml_config = load_config(config_path)
 
     missing_keys = [field for field, info in PipelineConfig.model_fields.items() if info.is_required() and field not in toml_config]
@@ -360,7 +374,7 @@ def get_config(config_path=None) -> tuple[PipelineConfig, bool]:
 
     merged_params = merge_config(cli_args, toml_config)
     try:
-        return PipelineConfig(**merged_params), validate_only
+        return PipelineConfig(**merged_params), validate_only, collect_only, train_only
     except Exception as e:
         if hasattr(e, 'errors'):
             suggestions = _suggest_typos(e, set(PipelineConfig.model_fields))
@@ -382,10 +396,9 @@ def _parse_teacher_toml(raw: dict, filename: str) -> TeacherConfig:
             backend_params = v
         else:
             core_params[k] = v
-    if backend_type is None:
-        raise ValueError(f"Teacher config {filename} has no backend section")
-    core_params['backend_type'] = backend_type
-    core_params['backend_params'] = backend_params
+    if backend_type is not None:
+        core_params['backend_type'] = backend_type
+        core_params['backend_params'] = backend_params
     return TeacherConfig(**core_params)
 
 
@@ -427,5 +440,5 @@ def load_student_config(config_path: str) -> StudentConfig:
 
 if __name__ == '__main__':
     config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config.toml')
-    config, _ = get_config(config_path=config_path)
+    config, *_ = get_config(config_path=config_path)
     print(config.model_dump_json(indent=4))
