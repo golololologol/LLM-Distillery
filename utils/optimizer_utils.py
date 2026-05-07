@@ -1,18 +1,54 @@
 from torch.optim.lr_scheduler import LRScheduler
 from torch.optim import Muon
 from transformers import get_scheduler
-from apollo_torch import APOLLOAdamW
-from typing import Any, Tuple
+from typing import Any, Protocol, Tuple, cast
 import schedulefree
 import torch
 import math
 import re
 import os
 
-# shut the the hell up bnb with its `bin ..bitsandbytes\libbitsandbytes_cuda121.dll`
-import contextlib
-with contextlib.redirect_stdout(open(os.devnull, 'w')):
-    import bitsandbytes as bnb
+
+_BNB_OPTIMIZERS = {
+    "adamw": "AdamW",
+    "adamw8bit": "AdamW8bit",
+    "adamw32bit": "AdamW32bit",
+    "paged_adamw": "PagedAdam",
+    "paged_adamw8bit": "PagedAdamW8bit",
+    "paged_adamw32bit": "PagedAdamW32bit",
+    "sgd": "SGD",
+    "rmsprop": "RMSprop",
+    "rmsprop8bit": "RMSprop8bit",
+    "rmsprop32bit": "RMSprop32bit",
+    "adagrad": "Adagrad",
+}
+
+
+class _ApolloAdamWConstructor(Protocol):
+    def __call__(
+        self,
+        params: Any,
+        *,
+        lr: float,
+        betas: Tuple[float, float],
+        weight_decay: float,
+        scale_front: bool,
+        no_deprecation_warning: bool,
+    ) -> torch.optim.Optimizer: ...
+
+
+def _bnb_optimizer_class(name: str):
+    import contextlib
+
+    with open(os.devnull, 'w') as devnull, contextlib.redirect_stdout(devnull):
+        import bitsandbytes as bnb
+    return getattr(cast(Any, bnb.optim), _BNB_OPTIMIZERS[name])
+
+
+def _apollo_adamw_class() -> _ApolloAdamWConstructor:
+    from apollo_torch import APOLLOAdamW
+
+    return cast(_ApolloAdamWConstructor, APOLLOAdamW)
 
 
 class WarmupStableDecayLR(LRScheduler):
@@ -119,9 +155,10 @@ def setup_low_rank_optimizer(model, optimizer_name: str, target_modules: list[st
     target_params = []
     target_params_names = []
     for module_name, module in model.named_modules():
-        target_module_exists, is_regex = check_target_module_exists(
+        target_check = check_target_module_exists(
             target_modules, module_name, return_is_regex=True
         )
+        target_module_exists, is_regex = target_check if isinstance(target_check, tuple) else (target_check, False)
 
         if not isinstance(module, torch.nn.Linear):
             if target_module_exists and not is_regex:
@@ -155,7 +192,7 @@ class CombinedOptimizer(torch.optim.Optimizer):
         for opt in optimizers:
             self.param_groups.extend(opt.param_groups)
         self.defaults = {}
-        self.state = {}
+        self.state = cast(Any, {})
 
     def step(self, closure=None):
         for opt in self.optimizers:
@@ -179,29 +216,19 @@ def set_optimizer(model: Any, lr: float, betas: Tuple[float, float], optimizer_n
     
     optimizer_mapping = {
         "adamw_torch": torch.optim.AdamW,
-        "adamw": bnb.optim.AdamW,
-        "adamw8bit": bnb.optim.AdamW8bit,
-        "adamw32bit": bnb.optim.AdamW32bit, 
-        "paged_adamw": bnb.optim.PagedAdam,
-        "paged_adamw8bit": bnb.optim.PagedAdamW8bit,
-        "paged_adamw32bit": bnb.optim.PagedAdamW32bit,
-        "sgd": bnb.optim.SGD,
-        "rmsprop": bnb.optim.RMSprop,
-        "rmsprop8bit": bnb.optim.RMSprop8bit,
-        "rmsprop32bit": bnb.optim.RMSprop32bit,
-        "adagrad": bnb.optim.Adagrad,
-        "apollo": APOLLOAdamW,
-        "apollomini": APOLLOAdamW,
+        "apollo": None,
+        "apollomini": None,
         "schedulefree": schedulefree.AdamWScheduleFree,
         "muon": None,
     }
+    optimizer_mapping.update({name: None for name in _BNB_OPTIMIZERS})
 
     fsdp_upgrades = {
-        "adamw": ("adamw32bit", bnb.optim.AdamW32bit),
-        "adamw8bit": ("adamw32bit", bnb.optim.AdamW32bit),
-        "paged_adamw8bit": ("paged_adamw32bit", bnb.optim.PagedAdamW32bit),
-        "rmsprop": ("rmsprop32bit", bnb.optim.RMSprop32bit),
-        "rmsprop8bit": ("rmsprop32bit", bnb.optim.RMSprop32bit),
+        "adamw": "adamw32bit",
+        "adamw8bit": "adamw32bit",
+        "paged_adamw8bit": "paged_adamw32bit",
+        "rmsprop": "rmsprop32bit",
+        "rmsprop8bit": "rmsprop32bit",
     }
     
     if optimizer_name not in optimizer_mapping:
@@ -211,10 +238,9 @@ def set_optimizer(model: Any, lr: float, betas: Tuple[float, float], optimizer_n
         )
 
     if is_fsdp and optimizer_name in fsdp_upgrades:
-        new_name, new_cls = fsdp_upgrades[optimizer_name]
+        new_name = fsdp_upgrades[optimizer_name]
         print(f"  Warning: Switching {optimizer_name} -> {new_name} for FSDP compatibility (8-bit optimizer states not supported)")
         optimizer_name = new_name
-        optimizer_mapping[optimizer_name] = new_cls
 
     match optimizer_name:
         case "adamw_torch":
@@ -224,16 +250,16 @@ def set_optimizer(model: Any, lr: float, betas: Tuple[float, float], optimizer_n
             return schedulefree.AdamWScheduleFree(model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay, warmup_steps=warmup_steps)
 
         case "adamw" | "adamw8bit" | "adamw32bit" | "paged_adamw" | "paged_adamw8bit" | "paged_adamw32bit":
-            return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay, eps=1e-8)
+            return _bnb_optimizer_class(optimizer_name)(model.parameters(), lr=lr, betas=betas, weight_decay=weight_decay, eps=1e-8)
         
         case "sgd":
-            return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov)
+            return _bnb_optimizer_class(optimizer_name)(model.parameters(), lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov)
         
         case "rmsprop" | "rmsprop8bit" | "rmsprop32bit":
-            return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, weight_decay=weight_decay, alpha=0.9, eps=1e-10, centered=True)
+            return _bnb_optimizer_class(optimizer_name)(model.parameters(), lr=lr, weight_decay=weight_decay, alpha=0.9, eps=1e-10, centered=True)
         
         case "adagrad":
-            return optimizer_mapping[optimizer_name](model.parameters(), lr=lr, weight_decay=weight_decay)
+            return _bnb_optimizer_class(optimizer_name)(model.parameters(), lr=lr, weight_decay=weight_decay)
         
         case "apollo":
             args = {
@@ -245,7 +271,7 @@ def set_optimizer(model: Any, lr: float, betas: Tuple[float, float], optimizer_n
                 'proj_type': 'std'
             }
             param_groups = setup_low_rank_optimizer(model, optimizer_name, target_modules="all-linear", **args)
-            return optimizer_mapping[optimizer_name](param_groups, lr=lr, betas=betas, weight_decay=weight_decay, scale_front=True, no_deprecation_warning=True)
+            return _apollo_adamw_class()(param_groups, lr=lr, betas=betas, weight_decay=weight_decay, scale_front=True, no_deprecation_warning=True)
                 
         case "apollomini":
             args = {
@@ -257,7 +283,7 @@ def set_optimizer(model: Any, lr: float, betas: Tuple[float, float], optimizer_n
                 'proj_type': 'std'
             }
             param_groups = setup_low_rank_optimizer(model, optimizer_name, target_modules="all-linear", **args)
-            return optimizer_mapping[optimizer_name](param_groups, lr=lr, betas=betas, weight_decay=weight_decay, scale_front=True, no_deprecation_warning=True)
+            return _apollo_adamw_class()(param_groups, lr=lr, betas=betas, weight_decay=weight_decay, scale_front=True, no_deprecation_warning=True)
 
         case "muon":
             muon_params = [p for p in model.parameters() if p.ndim >= 2]

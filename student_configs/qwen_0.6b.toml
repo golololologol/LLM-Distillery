@@ -3,3 +3,5 @@ freeze_layers = []
 attn_implementation = "eager"
 save_final_training_state = false
 context_len = 2048
+supports_reasoning = true
+supports_tool_calls = false

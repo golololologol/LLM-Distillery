@@ -126,13 +126,13 @@ class Losses:
 
 def _abomination_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor, alpha: float, entropy_weights: Tensor | None = None) -> dict[str, Tensor]:
     eps = 1e-8
-    s = student_dists + eps
-    t = teacher_dists + eps
-    s_log = s.log()
-    t_log = t.log()
+    student = student_dists + eps
+    teacher = teacher_dists + eps
+    student_log = student.log()
+    teacher_log = teacher.log()
 
-    fwd_kl = (t * (t_log - s_log)).sum(-1)
-    rev_kl = (s * (s_log - t_log)).sum(-1)
+    fwd_kl = (teacher * (teacher_log - student_log)).sum(-1)
+    rev_kl = (student * (student_log - teacher_log)).sum(-1)
 
     idx = actual_bytes.long()
     arange = torch.arange(len(idx), device=student_dists.device)
@@ -164,14 +164,14 @@ def _abomination_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes
 
 def _skew_kl_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor, alpha: float, entropy_weights: Tensor | None = None) -> dict[str, Tensor]:
     eps = 1e-8
-    lam = 0.1  # DistiLLM: lambda=0.1 recommended
+    skew_lambda = 0.1  # DistiLLM: lambda=0.1 recommended
 
     # SRKL: KL(S || (1-lam)*T + lam*S) - canonical DistiLLM formulation
-    mix = (1.0 - lam) * teacher_dists + lam * student_dists
-    s = student_dists + eps
-    s_log = s.log()
-    mix_log = (mix + eps).log()
-    srkl = (s * (s_log - mix_log)).sum(-1)
+    mixture = (1.0 - skew_lambda) * teacher_dists + skew_lambda * student_dists
+    student = student_dists + eps
+    student_log = student.log()
+    mix_log = (mixture + eps).log()
+    srkl = (student * (student_log - mix_log)).sum(-1)
 
     kl_loss = _weighted_mean(srkl, entropy_weights)
 
@@ -194,13 +194,13 @@ def _skew_kl_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Te
 
 def _akl_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor, alpha: float, entropy_weights: Tensor | None = None) -> dict[str, Tensor]:
     eps = 1e-8
-    s = student_dists + eps
-    t = teacher_dists + eps
-    s_log = s.log()
-    t_log = t.log()
+    student = student_dists + eps
+    teacher = teacher_dists + eps
+    student_log = student.log()
+    teacher_log = teacher.log()
 
-    fkl = (t * (t_log - s_log)).sum(-1)
-    rkl = (s * (s_log - t_log)).sum(-1)
+    fkl = (teacher * (teacher_log - student_log)).sum(-1)
+    rkl = (student * (student_log - teacher_log)).sum(-1)
 
     sorted_t, sort_idx = teacher_dists.sort(dim=-1, descending=True)
     cumsum = sorted_t.cumsum(dim=-1)
@@ -213,8 +213,8 @@ def _akl_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor
     head_gap = (gap * head_mask).sum(-1)
     tail_gap = (gap * ~head_mask).sum(-1)
 
-    w = (tail_gap / (head_gap + tail_gap + eps)).detach()
-    kl_loss = _weighted_mean((1 - w) * fkl + w * rkl, entropy_weights)
+    adaptive_weight = (tail_gap / (head_gap + tail_gap + eps)).detach()
+    kl_loss = _weighted_mean((1 - adaptive_weight) * fkl + adaptive_weight * rkl, entropy_weights)
 
     idx = actual_bytes.long()
     arange = torch.arange(len(idx), device=student_dists.device)
@@ -230,7 +230,7 @@ def _akl_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor
         "kl_div": fkl.mean(),
         "reverse kl_div": rkl.mean(),
         "teacher CE loss": teacher_ce.mean(),
-        "adaptive_weight": w.mean(),
+        "adaptive_weight": adaptive_weight.mean(),
     }
 
 
@@ -261,11 +261,11 @@ def _wasserstein_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes
 
 def _jsd_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor, alpha: float, entropy_weights: Tensor | None = None) -> dict[str, Tensor]:
     eps = 1e-8
-    m = 0.5 * (student_dists + teacher_dists)
-    m_log = (m + eps).log()
+    jsd_midpoint = 0.5 * (student_dists + teacher_dists)
+    jsd_midpoint_log = (jsd_midpoint + eps).log()
 
-    t_term = torch.where(teacher_dists > eps, teacher_dists * ((teacher_dists + eps).log() - m_log), torch.zeros_like(teacher_dists))
-    s_term = torch.where(student_dists > eps, student_dists * ((student_dists + eps).log() - m_log), torch.zeros_like(student_dists))
+    t_term = torch.where(teacher_dists > eps, teacher_dists * ((teacher_dists + eps).log() - jsd_midpoint_log), torch.zeros_like(teacher_dists))
+    s_term = torch.where(student_dists > eps, student_dists * ((student_dists + eps).log() - jsd_midpoint_log), torch.zeros_like(student_dists))
     jsd = (0.5 * t_term + 0.5 * s_term).sum(-1)
 
     kl_loss = _weighted_mean(jsd, entropy_weights)
@@ -288,8 +288,8 @@ def _jsd_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor
 
 def _hellinger_loss(student_dists: Tensor, teacher_dists: Tensor, actual_bytes: Tensor, alpha: float, entropy_weights: Tensor | None = None) -> dict[str, Tensor]:
     eps = 1e-8
-    bc = (student_dists * teacher_dists).clamp(min=0).sqrt().sum(-1)
-    h2 = 1.0 - bc
+    bc_coef = (student_dists * teacher_dists).clamp(min=0).sqrt().sum(-1)
+    h2 = 1.0 - bc_coef
 
     kl_loss = _weighted_mean(h2, entropy_weights)
 

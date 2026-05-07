@@ -46,10 +46,10 @@ class ByteVocabIndex:
         # Depth 1: tokens with byte_len >= 2, sorted by first byte
         d1_tokens = (self.token_byte_lens >= 2).nonzero(as_tuple=True)[0]
         d1_first_bytes = self.token_byte_seqs[d1_tokens, 0].long()
-        d1_sorted_fb, d1_order = d1_first_bytes.sort()
+        d1_sorted_first_bytes, d1_order = d1_first_bytes.sort()
         self.d1_sort_idx = d1_tokens[d1_order]
         self.d1_boundaries = torch.searchsorted(
-            d1_sorted_fb, torch.arange(257, device=device, dtype=torch.long))
+            d1_sorted_first_bytes, torch.arange(257, device=device, dtype=torch.long))
         self.d1_target_bytes = self.token_byte_seqs[self.d1_sort_idx, 1]
 
         # Padded d1 data for fast bulk processing
@@ -59,34 +59,34 @@ class ByteVocabIndex:
         sorted_counts, _ = active_counts.sort(descending=True)
 
         # Find natural gap: largest relative jump in sorted token counts
-        k_pad = sorted_counts[0].item()  # default: no outliers
+        pad_width = int(sorted_counts[0].item())  # default: no outliers
         for i in range(len(sorted_counts) - 1):
             ratio = sorted_counts[i].item() / max(sorted_counts[i + 1].item(), 1)
             if ratio > 3.0:
-                k_pad = sorted_counts[i + 1].item()
+                pad_width = int(sorted_counts[i + 1].item())
                 break
 
-        self.d1_outlier_bytes = active_bytes[active_counts > k_pad]  # byte values with K > k_pad
-        bulk_bytes = active_bytes[active_counts <= k_pad]
+        self.d1_outlier_bytes = active_bytes[active_counts > pad_width]
+        bulk_bytes = active_bytes[active_counts <= pad_width]
 
         # Build padded arrays for bulk bytes: [num_bulk_bytes, k_pad]
         # Map byte value -> index in padded arrays (-1 = invalid/unused)
         self.d1_byte_to_bulk_idx = torch.full((256,), -1, dtype=torch.long, device=device)
         self.d1_byte_to_bulk_idx[bulk_bytes] = torch.arange(len(bulk_bytes), device=device)
 
-        self.d1_padded_tok_ids = torch.zeros(len(bulk_bytes), k_pad, dtype=torch.long, device=device)
-        self.d1_padded_target_bytes = torch.zeros(len(bulk_bytes), k_pad, dtype=torch.long, device=device)
+        self.d1_padded_tok_ids = torch.zeros(len(bulk_bytes), pad_width, dtype=torch.long, device=device)
+        self.d1_padded_target_bytes = torch.zeros(len(bulk_bytes), pad_width, dtype=torch.long, device=device)
         self.d1_padded_valid_lens = torch.zeros(len(bulk_bytes), dtype=torch.long, device=device)
 
-        for i, b in enumerate(bulk_bytes):
-            lo = self.d1_boundaries[b].item()
-            hi = self.d1_boundaries[b + 1].item()
+        for i, byte_value in enumerate(bulk_bytes):
+            lo = self.d1_boundaries[byte_value].item()
+            hi = self.d1_boundaries[byte_value + 1].item()
             n = hi - lo
             self.d1_padded_tok_ids[i, :n] = self.d1_sort_idx[lo:hi]
             self.d1_padded_target_bytes[i, :n] = self.d1_target_bytes[lo:hi].long()
             self.d1_padded_valid_lens[i] = n
 
-        self.d1_k_pad = k_pad
+        self.d1_k_pad = pad_width
 
         # Depth 2: tokens with byte_len >= 3, sorted by (b0*256+b1)
         d2_tokens = (self.token_byte_lens >= 3).nonzero(as_tuple=True)[0]
@@ -103,7 +103,7 @@ class ByteVocabIndex:
             depth_token_ids = mask.nonzero(as_tuple=True)[0]
             if len(depth_token_ids) == 0:
                 break
-            key_depth = min(depth, 7)
+            key_depth = min(depth, 6)
             keys = self.token_byte_seqs[depth_token_ids, 0].long()
             for byte_idx in range(1, key_depth):
                 keys = keys * 256 + self.token_byte_seqs[depth_token_ids, byte_idx]
@@ -120,7 +120,7 @@ class ByteVocabIndex:
             all_bytes = []
             for depth in sorted(depth_data.keys()):
                 stored_ids, stored_keys, stored_bytes = depth_data[depth]
-                all_keys.append(depth * (256 ** 7) + stored_keys)
+                all_keys.append(depth * (256 ** 6) + stored_keys)
                 all_ids.append(stored_ids)
                 all_bytes.append(stored_bytes)
             self.all_sorted_keys = torch.cat(all_keys)
@@ -153,6 +153,129 @@ class ByteVocabIndex:
         self._byte_matrix_d0 = None
         self._device = device
 
+        # Event-channel state (plan v8 §4). Populated by ``attach_specials``;
+        # otherwise the byte path behaves exactly like v7.
+        self.event_vocab = None
+        self.resolved_specials = None
+        self.event_supported_mask: int = 0
+        self._event_token_ids: torch.Tensor = torch.empty(0, dtype=torch.long, device=device)
+        # Per-slot ``[|E|, max_ids]`` padded id table for vectorised
+        # marginalise_events. ``_event_slot_lens`` holds the unpadded count.
+        self._event_slot_ids: torch.Tensor | None = None
+        self._event_slot_lens: torch.Tensor | None = None
+        # Boolean ``[V]`` mask: True for ids that contribute to E_NONE.
+        self._event_content_mask: torch.Tensor | None = None
+
+    def attach_specials(self, event_vocab, resolved_specials) -> None:
+        """Attach an event vocabulary + resolved specials map (plan v8 §4).
+
+        Once attached, the byte channel renormalises over content tokens only
+        (special-token logits are masked to -inf before softmax) and
+        :meth:`marginalise_events` becomes available.
+        """
+        self.event_vocab = event_vocab
+        self.resolved_specials = resolved_specials
+        self.event_supported_mask = int(getattr(resolved_specials, "supported_mask", 0))
+
+        all_ids = sorted(resolved_specials.all_event_token_ids()) if resolved_specials else []
+        # Drop any ids that fell outside the (possibly padded) vocab.
+        all_ids = [i for i in all_ids if 0 <= i < self.vocab_size]
+        self._event_token_ids = torch.tensor(all_ids, dtype=torch.long, device=self._device)
+
+        E = event_vocab.size
+        per_slot: list[list[int]] = [[] for _ in range(E)]
+        for slot_idx, ids in resolved_specials.items():
+            per_slot[int(slot_idx)] = [int(t) for t in ids if 0 <= int(t) < self.vocab_size]
+        max_len = max((len(ids) for ids in per_slot), default=0)
+        if max_len == 0:
+            # Nothing to do; behave like a no-op attach.
+            self._event_slot_ids = torch.zeros(E, 1, dtype=torch.long, device=self._device)
+            self._event_slot_lens = torch.zeros(E, dtype=torch.long, device=self._device)
+        else:
+            slot_pad = torch.zeros(E, max_len, dtype=torch.long, device=self._device)
+            slot_lens = torch.zeros(E, dtype=torch.long, device=self._device)
+            for s, ids in enumerate(per_slot):
+                if ids:
+                    slot_pad[s, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=self._device)
+                    slot_lens[s] = len(ids)
+            self._event_slot_ids = slot_pad
+            self._event_slot_lens = slot_lens
+
+        # Content mask: tokens *not* listed under any event slot.
+        used = torch.zeros(self.vocab_size, dtype=torch.bool, device=self._device)
+        if self._event_token_ids.numel() > 0:
+            used[self._event_token_ids] = True
+        self._event_content_mask = ~used
+
+    def _mask_event_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Set logits at every event-flagged token id to -inf.
+
+        After softmax, those positions carry zero probability mass; the byte
+        marginalisation that follows therefore excludes special-token mass and
+        is equivalent to the plan's ``content_mass``-renormalised conditional.
+        """
+        if self._event_token_ids is None or self._event_token_ids.numel() == 0:
+            return logits
+        # Allow ``logits`` shaped ``[T, V]`` or ``[B, T, V]``.
+        ids = self._event_token_ids
+        if ids.max().item() >= logits.shape[-1]:
+            ids = ids[ids < logits.shape[-1]]
+            if ids.numel() == 0:
+                return logits
+        masked = logits.clone()
+        neg_inf = torch.finfo(masked.dtype).min if masked.dtype.is_floating_point else -2_000_000_000
+        masked.index_fill_(-1, ids.to(masked.device), neg_inf)
+        return masked
+
+    @torch.inference_mode()
+    def marginalise_events(self, logits: torch.Tensor, positions) -> torch.Tensor:
+        """Project softmax(logits) at the given token positions into ``|E|``-vectors.
+
+        Returns a ``[len(positions), |E|]`` tensor on the same device as
+        ``logits``. ``positions`` may be a list / tuple / 1D tensor.
+        """
+        return self._marginalise_events_core(logits, positions, requires_grad=False)
+
+    def marginalise_events_train(self, logits: torch.Tensor, positions) -> torch.Tensor:
+        """Differentiable variant of :meth:`marginalise_events` (used for student loss)."""
+        return self._marginalise_events_core(logits, positions, requires_grad=True)
+
+    def _marginalise_events_core(self, logits, positions, requires_grad: bool):
+        if self.event_vocab is None or self._event_slot_ids is None or self._event_slot_lens is None or self._event_content_mask is None:
+            raise RuntimeError("ByteVocabIndex.marginalise_events called before attach_specials")
+        E = self.event_vocab.size
+        device = logits.device
+        if not torch.is_tensor(positions):
+            pos = torch.as_tensor(list(positions), dtype=torch.long, device=device)
+        else:
+            pos = positions.to(device=device, dtype=torch.long)
+        if pos.numel() == 0:
+            return logits.new_zeros(0, E)
+
+        if requires_grad:
+            sub = logits[pos]
+            probs = torch.softmax(sub.float(), dim=-1)
+        else:
+            with torch.no_grad():
+                sub = logits[pos]
+                probs = torch.softmax(sub.float(), dim=-1)
+        probs = probs[..., :self.vocab_size]
+
+        slot_ids = self._event_slot_ids.to(device)        # [E, K]
+        slot_lens = self._event_slot_lens.to(device)      # [E]
+        K = slot_ids.shape[1]
+        valid = (torch.arange(K, device=device).unsqueeze(0) < slot_lens.unsqueeze(1)).to(probs.dtype)
+        # Gather: [N, E, K]
+        gathered = probs[:, slot_ids]  # advanced indexing -> [N, E, K]
+        gathered = gathered * valid
+        out = gathered.sum(dim=-1)
+        # E_NONE = content mass (everything not flagged as a special).
+        content_mask = self._event_content_mask.to(device)
+        out_none = (probs * content_mask).sum(dim=-1)
+        out = out.clone()
+        out[..., 0] = out_none
+        return out
+
     @property
     def byte_matrix_d0(self):
         if self._byte_matrix_d0 is None:
@@ -171,7 +294,7 @@ class ByteVocabIndex:
             return None
         chunk_size = len(chunk_byte_lens)
         extra_depths = (chunk_byte_lens - 3).clamp(min=0).long()
-        total_queries = extra_depths.sum().item()
+        total_queries = int(extra_depths.sum().item())
         if total_queries == 0:
             return None
 
@@ -180,20 +303,20 @@ class ByteVocabIndex:
         depth_offsets = torch.arange(total_queries, device=device) - torch.repeat_interleave(cum - extra_depths, extra_depths)
         depths = depth_offsets + 3
 
-        key_depth = depths.clamp(max=7)
-        prefix_bytes = chunk_byte_seqs[query_local_idx, :7].long()
-        valid_mask = torch.arange(7, device=device).unsqueeze(0) < key_depth.unsqueeze(1)
+        key_depth = depths.clamp(max=6)
+        prefix_bytes = chunk_byte_seqs[query_local_idx, :6].long()
+        valid_mask = torch.arange(6, device=device).unsqueeze(0) < key_depth.unsqueeze(1)
         prefix_bytes = prefix_bytes * valid_mask
         key = prefix_bytes[:, 0]
-        for i in range(1, 7):
+        for i in range(1, 6):
             active = key_depth > i
             key = torch.where(active, key * 256 + prefix_bytes[:, i], key)
-        composite_key = depths * (256 ** 7) + key
+        composite_key = depths * (256 ** 6) + key
 
         lo = torch.searchsorted(self.all_sorted_keys, composite_key)
         hi = torch.searchsorted(self.all_sorted_keys, composite_key, right=True)
         match_counts = hi - lo
-        total_matches = match_counts.sum().item()
+        total_matches = int(match_counts.sum().item())
         if total_matches == 0:
             return None
 
@@ -203,11 +326,11 @@ class ByteVocabIndex:
         tok_ids_flat = self.all_sorted_ids[flat_idx]
 
         query_depths = depths[query_idx]
-        needs_prefix_check = (query_depths > 7)
+        needs_prefix_check = (query_depths > 6)
         if needs_prefix_check.any():
             prefix_valid = torch.ones(total_matches, dtype=torch.bool, device=device)
             max_check = min(int(query_depths.max().item()), self.token_byte_seqs.shape[1])
-            for check_depth in range(7, max_check):
+            for check_depth in range(6, max_check):
                 check = needs_prefix_check & (query_depths > check_depth)
                 if not check.any():
                     break
@@ -239,15 +362,15 @@ class ByteVocabIndex:
             bo[1:] = nbl[:-1].cumsum(0)
 
         active_mask = torch.zeros(T1, dtype=torch.bool, device=device)
-        for rs, re in content_byte_ranges:
-            active_mask |= (bo < re - offset) & (bo + nbl > rs - offset)
+        for start, end in content_byte_ranges:
+            active_mask |= (bo < end - offset) & (bo + nbl > start - offset)
         active_idx = active_mask.nonzero(as_tuple=True)[0]
 
         if len(active_idx) == 0:
             return active_idx, None, None
 
         active_byte_lens = nbl[active_idx].long()
-        N_total = active_byte_lens.sum().item()
+        N_total = int(active_byte_lens.sum().item())
 
         dense_offsets = torch.zeros(len(active_idx), device=device, dtype=torch.long)
         if len(active_idx) > 1:
@@ -258,8 +381,8 @@ class ByteVocabIndex:
         global_byte_pos = expanded_starts + local_offsets
 
         content_mask = torch.zeros(N_total, dtype=torch.bool, device=device)
-        for rs, re in content_byte_ranges:
-            content_mask |= (global_byte_pos >= rs) & (global_byte_pos < re)
+        for start, end in content_byte_ranges:
+            content_mask |= (global_byte_pos >= start) & (global_byte_pos < end)
 
         return active_idx, active_byte_lens, content_mask
 
@@ -294,7 +417,7 @@ class ByteVocabIndex:
                 if not mask.any():
                     continue
                 local_pos = d1_positions[mask]
-                num_positions = len(local_pos)
+                num_positions = int(len(local_pos))
                 bucket_start = self.d1_boundaries[byte_val].item()
                 bucket_end = self.d1_boundaries[byte_val + 1].item()
                 num_tokens = bucket_end - bucket_start
@@ -302,7 +425,7 @@ class ByteVocabIndex:
                     continue
                 tok_ids = self.d1_sort_idx[bucket_start:bucket_end]
                 target_b = self.d1_target_bytes[bucket_start:bucket_end].long()
-                gather_batch_size = max(1, MAX_GATHER // num_tokens)
+                gather_batch_size = int(max(1, MAX_GATHER // num_tokens))
                 byte_dist = torch.zeros(num_positions, 256, dtype=compute_dtype, device=device)
                 for s in range(0, num_positions, gather_batch_size):
                     se = min(s + gather_batch_size, num_positions)
@@ -411,7 +534,7 @@ class ByteVocabIndex:
 
         byte_offsets = torch.zeros(T1, dtype=torch.long, device=device)
         byte_offsets[1:] = next_byte_lens[:-1].long().cumsum(dim=0)
-        max_total = (byte_offsets[-1] + next_byte_lens[-1]).item()
+        max_total = int((byte_offsets[-1] + next_byte_lens[-1]).item())
 
         output = torch.zeros(max_total, 256, dtype=torch.float16, device=device)
 
@@ -434,7 +557,7 @@ class ByteVocabIndex:
 
             del chunk_probs
 
-        total = (byte_offsets[-1] + next_byte_lens[-1]).item()
+        total = int((byte_offsets[-1] + next_byte_lens[-1]).item())
         result = output[:total]
         return result
 
@@ -450,7 +573,7 @@ class ByteVocabIndex:
 
         byte_offsets = torch.zeros(T1, dtype=torch.long, device=device)
         byte_offsets[1:] = next_byte_lens[:-1].long().cumsum(dim=0)
-        total_dists = (byte_offsets[-1] + next_byte_lens[-1]).item()
+        total_dists = int((byte_offsets[-1] + next_byte_lens[-1]).item())
 
         output = torch.zeros(total_dists, 256, dtype=torch.float16, device=device)
 
@@ -458,6 +581,8 @@ class ByteVocabIndex:
         target_byte_lens_i32 = next_byte_lens.int().contiguous()
 
         kernel = get_inference_kernel()
+        if kernel is None:
+            raise RuntimeError("CUDA inference kernel is not available")
         for chunk_start in range(0, T1, T_CHUNK):
             chunk_end = min(chunk_start + T_CHUNK, T1)
             kernel.fused_inference_byte_marginalize(
@@ -478,6 +603,7 @@ class ByteVocabIndex:
 
     def marginalize(self, logits, token_ids, T_CHUNK=None):
         logits = self._adjust_logits_to_vocab(logits)
+        logits = self._mask_event_logits(logits)
         if get_inference_kernel() is not None:
             if logits.dtype != torch.float16:
                 logits = logits.half()
@@ -487,9 +613,10 @@ class ByteVocabIndex:
     @torch.compiler.disable()
     def marginalize_train(self, logits, token_ids, T_CHUNK=256):
         logits = self._adjust_logits_to_vocab(logits)
+        logits = self._mask_event_logits(logits)
         return ByteMarginalizeFn.apply(logits, token_ids, self, T_CHUNK)
 
-    def marginalize_content(self, logits, token_ids, content_byte_ranges, length=None, T_CHUNK=256, training=False):
+    def marginalize_content(self, logits, token_ids, content_byte_ranges, length=None, T_CHUNK=256, training=False) -> torch.Tensor:
         marg_fn = self.marginalize_train if training else self.marginalize
         if length is None:
             length = logits.shape[0]
@@ -498,7 +625,10 @@ class ByteVocabIndex:
         token_ids = token_ids.to(device)
 
         if not content_byte_ranges or T1 <= 0:
-            return marg_fn(logits[:length], token_ids[:length], T_CHUNK=T_CHUNK)
+            dists_all = marg_fn(logits[:length], token_ids[:length], T_CHUNK=T_CHUNK)
+            if dists_all is None:
+                raise RuntimeError("byte marginalization returned no distributions")
+            return dists_all
 
         active_idx, active_byte_lens, content_mask = self._compute_content_positions(
             token_ids, content_byte_ranges, length, device
@@ -507,6 +637,8 @@ class ByteVocabIndex:
         if len(active_idx) == 0:
             empty = logits.new_zeros(0, 256)
             return empty + logits.sum() * 0  # maintain autograd graph
+        if content_mask is None:
+            raise RuntimeError("content mask missing for active content positions")
 
         if len(active_idx) == T1:
             dists = marg_fn(logits[:length], token_ids[:length], T_CHUNK=T_CHUNK)
@@ -521,7 +653,49 @@ class ByteVocabIndex:
                 chunk_results.append(marg_fn(chunk_logits, chunk_tids, T_CHUNK=chunk_size))
             dists = torch.cat(chunk_results)
 
+        if dists is None:
+            raise RuntimeError("byte marginalization returned no distributions")
         return dists[content_mask]
+
+
+    def marginalise_dual(
+        self,
+        logits,
+        token_ids,
+        content_byte_ranges,
+        anchor_token_positions,
+        length=None,
+        T_CHUNK=256,
+    ):
+        """v8 plan §8: produce both channels in one call.
+
+        Returns ``(byte_dist, event_dist)`` where:
+          - ``byte_dist`` is the existing ``[N_bytes, 256]`` content marginal
+            (with special-token logits already masked out by
+            ``marginalize`` when :meth:`attach_specials` is active).
+          - ``event_dist`` is ``[N_anchors, |E|]`` projected at the given
+            anchor token positions; empty when no anchors are supplied or
+            ``attach_specials`` was never called.
+        """
+        byte_dist = self.marginalize_content(
+            logits, token_ids, content_byte_ranges, length=length,
+            T_CHUNK=T_CHUNK, training=False,
+        )
+        if (
+            self.event_vocab is None
+            or not anchor_token_positions
+            or self._event_slot_ids is None
+        ):
+            event_dist = logits.new_zeros(0, self.event_vocab.size if self.event_vocab is not None else 0)
+            return byte_dist, event_dist
+        # Anchor positions are absolute token indices; the event-marginalise
+        # path expects the position into the same logits tensor.
+        L = logits.shape[0] if length is None else length
+        clipped = [int(p) for p in anchor_token_positions if 0 <= int(p) < L]
+        if not clipped:
+            return byte_dist, logits.new_zeros(0, self.event_vocab.size)
+        ev = self.marginalise_events(logits, clipped)
+        return byte_dist, ev
 
 
 class ByteMarginalizeFn(torch.autograd.Function):
@@ -698,7 +872,7 @@ class ByteMarginalizeFn(torch.autograd.Function):
                 lo = torch.searchsorted(byte_vocab.d2_sorted_keys, byte_pair_keys)
                 hi = torch.searchsorted(byte_vocab.d2_sorted_keys, byte_pair_keys, right=True)
                 match_counts = hi - lo
-                total_matches = match_counts.sum().item()
+                total_matches = int(match_counts.sum().item())
 
                 if total_matches > 0:
                     match_cumsum = match_counts.cumsum(0)

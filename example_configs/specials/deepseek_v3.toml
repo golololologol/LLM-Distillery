@@ -1,0 +1,11 @@
+# DeepSeek V3 / R1 family.
+# Plan v8 §3. Uses block + per-call envelopes plus a name<->args separator.
+[specials]
+E_END_TURN              = ["<｜end▁of▁sentence｜>"]
+E_BEGIN_REASONING       = ["<think>"]
+E_END_REASONING         = ["</think>"]
+E_BEGIN_TOOL_CALL_BLOCK = ["<｜tool▁calls▁begin｜>"]
+E_END_TOOL_CALL_BLOCK   = ["<｜tool▁calls▁end｜>"]
+E_BEGIN_TOOL_CALL       = ["<｜tool▁call▁begin｜>"]
+E_END_TOOL_CALL         = ["<｜tool▁call▁end｜>"]
+E_TOOL_NAME_BOUNDARY    = ["<｜tool▁sep｜>"]

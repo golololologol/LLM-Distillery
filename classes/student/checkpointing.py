@@ -162,8 +162,8 @@ def resolve_checkpoint_dir(resume_from, states_dir, model_name):
         if not dirs:
             raise FileNotFoundError(f"No checkpoints found matching {pattern}")
         def _extract_step(path):
-            m = re.search(r"_step_(\d+)$", path)
-            return int(m.group(1)) if m else -1
+            match = re.search(r"_step_(\d+)$", path)
+            return int(match.group(1)) if match else -1
         return max(dirs, key=_extract_step)
     elif resume_from == "best":
         best_dir = os.path.join(states_dir, f"{model_name}_training_state_step_best")
@@ -192,8 +192,8 @@ def rotate_checkpoints(base_dir, pattern_prefix, keep_last_n):
     pattern = os.path.join(base_dir, pattern_prefix + "*")
     dirs = [d for d in glob.glob(pattern) if os.path.isdir(d) and not d.endswith(".tmp") and not d.endswith(".old")]
     def _extract_step(path):
-        m = re.search(r"_step_(\d+)$", path)
-        return int(m.group(1)) if m else -1
+        match = re.search(r"_step_(\d+)$", path)
+        return int(match.group(1)) if match else -1
     dirs = [d for d in dirs if _extract_step(d) >= 0]
     if len(dirs) <= keep_last_n:
         return

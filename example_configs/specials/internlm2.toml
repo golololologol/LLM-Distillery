@@ -1,0 +1,5 @@
+# InternLM 2 / 2.5 family.
+[specials]
+E_END_TURN          = ["<|im_end|>", "</s>"]
+E_BEGIN_TOOL_CALL   = ["<|action_start|>"]
+E_END_TOOL_CALL     = ["<|action_end|>"]

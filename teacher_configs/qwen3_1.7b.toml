@@ -2,6 +2,9 @@ model_path = "matatonic/Qwen3-1.7B-8.0bpw-h8-exl2"
 context_len = 2048
 temperature = 2
 merge_weight = 1.0
+supports_reasoning = true
+supports_tool_calls = false
+inherit_specials = "qwen_chatml"
 
 [exllamav2]
 reserve_vram = [1.0]

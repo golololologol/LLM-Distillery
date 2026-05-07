@@ -1,12 +1,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Teacher Config — ALL parameters with defaults and explanations
+# Teacher Config - ALL parameters with defaults and explanations
 # ─────────────────────────────────────────────────────────────────────────────
 # Place teacher configs in the directory pointed to by `teacher_configs_path`.
 # The filename (without .toml) becomes the teacher name used throughout the pipeline.
 #
 # A teacher config can be:
-#   1. Full (with backend section) — used for both collection and training
-#   2. Metadata-only (no backend) — references pre-collected HDF5 data only
+#   1. Full (with backend section) - used for both collection and training
+#   2. Metadata-only (no backend) - references pre-collected HDF5 data only
 #
 # For metadata-only configs, only merge_weight matters. model_path is optional.
 
@@ -30,9 +30,22 @@ context_len = 2048
 # Higher = more influence. Teachers are normalized by sum of weights.
 merge_weight = 1.0
 
-# Jinja2 chat template override for this teacher's tokenizer.
-# Only needed if the model's built-in template is wrong or missing.
+# Does this model emit separate reasoning (<think>...</think>) segments? Set to false for non-reasoning templates.
+supports_reasoning = true
+
+# Does this model emit tool-call blocks via its chat template? Set to false if the template ignores tool_calls.
+supports_tool_calls = true
+
+# Optional: inline Jinja2 chat template override (if the model's built-in one is wrong/missing).
 # chat_template = "{% for message in messages %}..."
+
+# Optional: path to a file containing the Jinja2 chat template (alternative to inline).
+# chat_template_path = "path/to/template.jinja"
+
+# Optional: pass-through kwargs forwarded to tokenizer.apply_chat_template().
+# Example for Qwen3 reasoning toggle:
+# [render_options]
+# enable_thinking = true
 
 
 # ── Backend ──────────────────────────────────────────────────────────────────
@@ -60,3 +73,23 @@ num_inference_workers = 1
 
 # If true, spawns one worker per GPU (overrides num_inference_workers).
 one_worker_per_gpu = false
+
+
+# ── Segments ─────────────────────────────────────────────────────────────────
+# Control which parts of assistant messages are collected.
+# Supported types: content, reasoning, tool_call
+# Handling options for teachers: "active" | "context" | "disabled"
+#   active   - score and store distributions for this segment type
+#   context  - render in prompt but don't score
+#   disabled - strip entirely from rendered text
+#
+# Content is always active by default. No [segments] section = content-only.
+
+# [segments.reasoning]
+# handling = "active"    # score and store distributions
+
+# [segments.tool_call]
+# handling = "context"   # render in prompt but don't score
+
+# [segments.reasoning]
+# handling = "disabled"  # strip from rendered prompt entirely

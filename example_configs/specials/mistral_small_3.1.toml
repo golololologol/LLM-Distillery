@@ -1,0 +1,10 @@
+# Mistral-Small 3.1 (Tekken v7 tokenizer, vocab_size=131072).
+# Chat template: <s>[SYSTEM_PROMPT]...[/SYSTEM_PROMPT][INST]...[/INST]content</s>
+# Tool calls are emitted as JSON after a bare [TOOL_CALLS] token in the
+# assistant content, but the shipped chat_template.json does not render
+# structured tool_calls — supports_tool_calls is therefore false in the
+# teacher config and E_BEGIN_TOOL_CALL is listed here for completeness only.
+# No reasoning tokens exist in this model variant.
+[specials]
+E_END_TURN        = ["</s>"]
+E_BEGIN_TOOL_CALL = ["[TOOL_CALLS]"]

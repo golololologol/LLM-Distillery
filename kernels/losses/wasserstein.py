@@ -1,5 +1,14 @@
 import torch
+from typing import Protocol, cast
 from kernels.compiler import _compile_kernel, _compile_kernel_with_header, _cuda_available
+
+
+class _WassersteinKernel(Protocol):
+    def fused_wasserstein(self, *args: object) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+
+class _FusedTrainWassersteinKernel(Protocol):
+    def fused_train_wasserstein(self, *args: object) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
 
 _TRAINING_WASSERSTEIN_CUDA = r"""
@@ -19,75 +28,75 @@ __global__ void fused_wasserstein_kernel(
     float alpha
 ) {
     const int pos = blockIdx.x;
-    const int b = threadIdx.x;
-    if (pos >= N || b >= 256) return;
+    const int byte_idx = threadIdx.x;
+    if (pos >= N || byte_idx >= 256) return;
 
     const float eps = 1e-8f;
     const float inv_N = 1.0f / (float)N;
     const int base = pos * 256;
 
-    float S = student[base + b];
-    float T_val = teacher[base + b];
+    float S = student[base + byte_idx];
+    float T_val = teacher[base + byte_idx];
 
     // === Phase 1: Compute CDFs via Hillis-Steele inclusive prefix sum ===
     __shared__ float shared_scan[256];
 
     // CDF of student
-    shared_scan[b] = S;
+    shared_scan[byte_idx] = S;
     __syncthreads();
     for (int offset = 1; offset < 256; offset <<= 1) {
-        float tmp = (b >= offset) ? shared_scan[b - offset] : 0.0f;
+        float tmp = (byte_idx >= offset) ? shared_scan[byte_idx - offset] : 0.0f;
         __syncthreads();
-        shared_scan[b] += tmp;
+        shared_scan[byte_idx] += tmp;
         __syncthreads();
     }
-    float cdf_s = shared_scan[b];
+    float student_cdf = shared_scan[byte_idx];
 
     // CDF of teacher (reuse shared_scan)
-    shared_scan[b] = T_val;
+    shared_scan[byte_idx] = T_val;
     __syncthreads();
     for (int offset = 1; offset < 256; offset <<= 1) {
-        float tmp = (b >= offset) ? shared_scan[b - offset] : 0.0f;
+        float tmp = (byte_idx >= offset) ? shared_scan[byte_idx - offset] : 0.0f;
         __syncthreads();
-        shared_scan[b] += tmp;
+        shared_scan[byte_idx] += tmp;
         __syncthreads();
     }
-    float cdf_t = shared_scan[b];
+    float teacher_cdf = shared_scan[byte_idx];
 
     // === Phase 2: W1 loss ===
-    float diff = cdf_s - cdf_t;
-    float w1_b = (b < 255) ? sqrtf(diff * diff + 1e-8f) : 0.0f;
-    float w1_sum = blockReduceSum(w1_b);
+    float diff = student_cdf - teacher_cdf;
+    float w1_contrib = (byte_idx < 255) ? sqrtf(diff * diff + 1e-8f) : 0.0f;
+    float w1_sum = blockReduceSum(w1_contrib);
 
     int actual_b = actual_bytes[pos];
 
-    if (b == 0) {
+    if (byte_idx == 0) {
         out_w1[pos] = w1_sum;
         out_ce[pos] = -logf(student[base + actual_b] + eps);
         out_tce[pos] = -logf(teacher[base + actual_b] + eps);
     }
 
     // === Phase 3: Gradient via reverse (suffix) scan ===
-    float sign_b = (b < 255) ? diff / sqrtf(diff * diff + 1e-8f) : 0.0f;
+    float sign_b = (byte_idx < 255) ? diff / sqrtf(diff * diff + 1e-8f) : 0.0f;
 
     // Reverse inclusive suffix sum: write in reverse order, prefix sum, read back
-    shared_scan[255 - b] = sign_b;
+    shared_scan[255 - byte_idx] = sign_b;
     __syncthreads();
     for (int offset = 1; offset < 256; offset <<= 1) {
-        float tmp = ((255 - b) >= offset) ? shared_scan[(255 - b) - offset] : 0.0f;
+        float tmp = ((255 - byte_idx) >= offset) ? shared_scan[(255 - byte_idx) - offset] : 0.0f;
         __syncthreads();
-        shared_scan[255 - b] += tmp;
+        shared_scan[255 - byte_idx] += tmp;
         __syncthreads();
     }
-    float suffix_sum = shared_scan[255 - b];
+    float suffix_sum = shared_scan[255 - byte_idx];
 
     float grad_b = inv_N * suffix_sum;
 
-    if (b == actual_b) {
+    if (byte_idx == actual_b) {
         grad_b += alpha * inv_N * (-1.0f / (S + eps));
     }
 
-    grad_student[base + b] = grad_b;
+    grad_student[base + byte_idx] = grad_b;
 }
 
 std::vector<torch::Tensor> fused_wasserstein(
@@ -129,15 +138,16 @@ std::vector<torch::Tensor> fused_wasserstein(
 """
 
 
-def get_wasserstein_kernel():
+def get_wasserstein_kernel() -> _WassersteinKernel | None:
     if not _cuda_available:
         return None
-    return _compile_kernel_with_header(
+    kernel = _compile_kernel_with_header(
         "fused_wasserstein",
         _TRAINING_WASSERSTEIN_CPP,
         _TRAINING_WASSERSTEIN_CUDA,
         ["fused_wasserstein"],
     )
+    return None if kernel is None else cast(_WassersteinKernel, kernel)
 
 
 
@@ -191,11 +201,24 @@ __device__ void process_depth_wasserstein(
     float* bins, float Z,
     const float* teacher_src, float* teacher_row, float* reduce_buf,
     int dist_idx, const int* actual_bytes,
+    const uint8_t* byte_mask,
     float* loss_per_dist, float* ce_per_dist, float* tce_per_dist,
     float* teacher_entropy_out,
     float inv_N, float alpha, int tid
 ) {
     const float eps = 1e-8f;
+
+    if (byte_mask[dist_idx] == 0) {
+        if (tid == 0) {
+            loss_per_dist[dist_idx] = 0.0f;
+            ce_per_dist[dist_idx] = 0.0f;
+            tce_per_dist[dist_idx] = 0.0f;
+            teacher_entropy_out[dist_idx] = 0.0f;
+        }
+        if (tid < 256) bins[tid] = 0.0f;
+        __syncthreads();
+        return;
+    }
 
     // Normalize bins and load teacher
     if (tid < 256) {
@@ -299,6 +322,7 @@ void fused_train_wasserstein_kernel(
     const float* __restrict__ teacher_dists,
     const int* __restrict__ teacher_offsets,
     const int* __restrict__ actual_bytes,
+    const uint8_t* __restrict__ byte_mask,
     float* __restrict__ grad_logits,
     float* __restrict__ loss_per_dist,
     float* __restrict__ ce_per_dist,
@@ -306,7 +330,7 @@ void fused_train_wasserstein_kernel(
     float* __restrict__ teacher_entropy_out,
     float* __restrict__ grad_unnorm_extra,
     int V, int max_byte_len, int N_total, int max_extra,
-    float alpha
+    float alpha, int n_active
 ) {
     const int t = blockIdx.x;
     const int tid = threadIdx.x;
@@ -439,23 +463,23 @@ void fused_train_wasserstein_kernel(
     __syncthreads(); Z2 = reduce_buf[0]; __syncthreads();
 
     // ============ PASS 3: Loss + backward per depth ============
-    const float inv_N = 1.0f / (float)N_total;
+    const float inv_N = 1.0f / (float)n_active;
 
     process_depth_wasserstein(d0_bins, Z0, teacher_dists + (long long)my_offset * 256,
-        teacher_row, reduce_buf, my_offset, actual_bytes,
+        teacher_row, reduce_buf, my_offset, actual_bytes, byte_mask,
         loss_per_dist, ce_per_dist, tce_per_dist,
         teacher_entropy_out, inv_N, alpha, tid);
 
     if (my_num_depths >= 2) {
         process_depth_wasserstein(d1_bins, Z1, teacher_dists + ((long long)my_offset + 1) * 256,
-            teacher_row, reduce_buf, my_offset + 1, actual_bytes,
+            teacher_row, reduce_buf, my_offset + 1, actual_bytes, byte_mask,
             loss_per_dist, ce_per_dist, tce_per_dist,
             teacher_entropy_out, inv_N, alpha, tid);
     }
 
     if (my_num_depths >= 3) {
         process_depth_wasserstein(d2_bins, Z2, teacher_dists + ((long long)my_offset + 2) * 256,
-            teacher_row, reduce_buf, my_offset + 2, actual_bytes,
+            teacher_row, reduce_buf, my_offset + 2, actual_bytes, byte_mask,
             loss_per_dist, ce_per_dist, tce_per_dist,
             teacher_entropy_out, inv_N, alpha, tid);
     }
@@ -488,7 +512,7 @@ void fused_train_wasserstein_kernel(
         __syncthreads(); Zx = reduce_buf[0]; __syncthreads();
 
         process_depth_wasserstein(extra_bins, Zx, teacher_dists + ((long long)my_offset + dep) * 256,
-            teacher_row, reduce_buf, my_offset + dep, actual_bytes,
+            teacher_row, reduce_buf, my_offset + dep, actual_bytes, byte_mask,
             loss_per_dist, ce_per_dist, tce_per_dist,
             teacher_entropy_out, inv_N, alpha, tid);
 
@@ -579,7 +603,9 @@ std::vector<torch::Tensor> fused_train_wasserstein(
     torch::Tensor teacher_dists,
     torch::Tensor teacher_offsets,
     torch::Tensor actual_bytes,
+    torch::Tensor byte_mask,
     int N_total,
+    int n_active,
     float alpha
 ) {
     const int T1 = logits.size(0);
@@ -615,6 +641,7 @@ std::vector<torch::Tensor> fused_train_wasserstein(
         teacher_dists.data_ptr<float>(),
         teacher_offsets.data_ptr<int>(),
         actual_bytes.data_ptr<int>(),
+        byte_mask.data_ptr<uint8_t>(),
         grad_logits.data_ptr<float>(),
         loss_w1.data_ptr<float>(),
         loss_ce.data_ptr<float>(),
@@ -622,7 +649,7 @@ std::vector<torch::Tensor> fused_train_wasserstein(
         teacher_entropy_out.data_ptr<float>(),
         grad_extra.data_ptr<float>(),
         V, max_byte_len, N_total, max_extra,
-        alpha
+        alpha, n_active
     );
 
     return {grad_logits, loss_w1, loss_ce, loss_tce, teacher_entropy_out};
@@ -642,27 +669,31 @@ std::vector<torch::Tensor> fused_train_wasserstein(
     torch::Tensor teacher_dists,
     torch::Tensor teacher_offsets,
     torch::Tensor actual_bytes,
+    torch::Tensor byte_mask,
     int N_total,
+    int n_active,
     float alpha
 );
 """
 
 
-def get_fused_train_wasserstein_kernel():
+def get_fused_train_wasserstein_kernel() -> _FusedTrainWassersteinKernel | None:
     if not _cuda_available:
         return None
-    return _compile_kernel_with_header(
+    kernel = _compile_kernel_with_header(
         "fused_train_wasserstein",
         _FUSED_TRAIN_WASSERSTEIN_CPP,
         _FUSED_TRAIN_WASSERSTEIN_CUDA,
         ["fused_train_wasserstein"],
     )
+    return None if kernel is None else cast(_FusedTrainWassersteinKernel, kernel)
 
 
 
 def fused_train_forward_backward_wasserstein(logits, token_ids, byte_vocab, teacher_dists_flat,
                                               actual_bytes_flat, teacher_offsets,
-                                              target_byte_lens, alpha, entropy_weighting=False):
+                                              target_byte_lens, alpha, entropy_weighting=False,
+                                              byte_mask=None):
     kernel = get_fused_train_wasserstein_kernel()
     if kernel is None:
         return None, None
@@ -674,6 +705,15 @@ def fused_train_forward_backward_wasserstein(logits, token_ids, byte_vocab, teac
     next_byte_lens = byte_vocab.token_byte_lens[next_tokens]
     next_byte_seqs = byte_vocab.token_byte_seqs[next_tokens]
     N_total = int(teacher_offsets[-1].item()) + int(target_byte_lens[-1].item())
+
+    if byte_mask is None:
+        byte_mask = torch.ones(N_total, dtype=torch.uint8, device=logits.device)
+        n_active = N_total
+    else:
+        byte_mask = byte_mask.to(torch.uint8).contiguous()
+        n_active = int(byte_mask.sum().item())
+    if n_active == 0:
+        return None, None
 
     results = kernel.fused_train_wasserstein(
         logits[:T1].half().contiguous(),
@@ -687,7 +727,8 @@ def fused_train_forward_backward_wasserstein(logits, token_ids, byte_vocab, teac
         teacher_dists_flat.float().contiguous(),
         teacher_offsets.int().contiguous(),
         actual_bytes_flat.int().contiguous(),
-        N_total, alpha,
+        byte_mask,
+        N_total, n_active, alpha,
     )
 
     grad_logits, loss_w1, loss_ce, loss_tce, teacher_entropy = results
@@ -709,8 +750,8 @@ def fused_train_forward_backward_wasserstein(logits, token_ids, byte_vocab, teac
         grad_scale = ew_per_token * T1 / ew_token_sum
         grad_logits = grad_logits * grad_scale.unsqueeze(1)
     else:
-        kl_loss = loss_w1.mean()
-        ce_loss = loss_ce.mean()
+        kl_loss = loss_w1.sum() / n_active
+        ce_loss = loss_ce.sum() / n_active
 
     total_loss = kl_loss + alpha * ce_loss
 
@@ -719,5 +760,5 @@ def fused_train_forward_backward_wasserstein(logits, token_ids, byte_vocab, teac
         "custom loss": total_loss,
         "CE loss": ce_loss.detach(),
         "kl_div": kl_loss.detach(),
-        "teacher CE loss": loss_tce.mean().detach(),
+        "teacher CE loss": (loss_tce.sum() / n_active).detach(),
     }

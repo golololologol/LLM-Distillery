@@ -1,0 +1,7 @@
+# Hermes / NousResearch chatml derivatives (Hermes 2/3, OpenHermes, Nous-Capybara).
+[specials]
+E_END_TURN          = ["<|im_end|>"]
+E_BEGIN_REASONING   = ["<think>"]
+E_END_REASONING     = ["</think>"]
+E_BEGIN_TOOL_CALL   = ["<tool_call>"]
+E_END_TOOL_CALL     = ["</tool_call>"]

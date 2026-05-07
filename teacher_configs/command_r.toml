@@ -1,0 +1,16 @@
+# Cohere Command R (08-2024) - exl3 6.0bpw
+# Uses <|END_OF_TURN_TOKEN|> as EOS. No reasoning or tool-call tokens.
+model_path = "E:/modelki/c4ai-command-r-08-2024-exl3_6.0bpw"
+context_len = 4096
+temperature = 2
+merge_weight = 1.0
+supports_reasoning = false
+supports_tool_calls = false
+inherit_specials = "command_r"
+
+[exllamav3]
+reserve_vram = [2.5, 2.5, 2.5, 2.5]
+batch_size = 4
+seq_chunk_len = 2048
+num_inference_workers = 1
+one_worker_per_gpu = false

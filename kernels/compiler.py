@@ -3,6 +3,7 @@ import glob
 import platform
 import shutil
 import subprocess
+from typing import Any, Sequence
 import torch
 from torch.utils.cpp_extension import load_inline
 
@@ -44,7 +45,7 @@ def _is_kernel_cached(name):
         return False
 
 
-_compiled_kernels = {}
+_compiled_kernels: dict[str, Any | None] = {}
 
 
 _COMMON_CUDA_HEADER = r"""
@@ -111,7 +112,7 @@ static __device__ __forceinline__ void blockReduceOnlineSoftmax(float* reduce_bu
 """
 
 
-def _compile_kernel_with_header(name, cpp_source, cuda_source, functions):
+def _compile_kernel_with_header(name: str, cpp_source: str, cuda_source: str, functions: Sequence[str]) -> Any | None:
     return _compile_kernel(name, cpp_source, _COMMON_CUDA_HEADER + cuda_source, functions)
 
 
@@ -121,7 +122,7 @@ def _get_platform_flags():
     return [], ["-O3"]
 
 
-def _compile_kernel(name, cpp_source, cuda_source, functions):
+def _compile_kernel(name: str, cpp_source: str, cuda_source: str, functions: Sequence[str]) -> Any | None:
     if name in _compiled_kernels:
         return _compiled_kernels[name]
 

@@ -1,19 +1,22 @@
 from utils.optimizer_utils import set_optimizer, set_lr_scheduler
-from classes.preprocessing import preprocess_samples
+from classes.preprocessing import ModelParticipant
+from classes.dataset_processing import DatasetProcessor
 from classes.byte_vocab import ByteVocabIndex
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM
 from torch.nn.parallel import DistributedDataParallel as DDP
 from classes.data_manager import H5DataManager
 from transformers import BitsAndBytesConfig
-from utils.dataset_utils import read_jsonl
 from classes.args import PipelineConfig, StudentConfig
+from classes.model_runtime import build_teacher_participants, build_tokenizer_formatter
 from classes.data_classes import TrainingState
-from classes.losses import Losses, calculate_divergence
-from utils.kernel_utils import _try_fused_train
+from classes.losses import Losses
+from classes.event_channel import EventChannelSpec
+from classes.student.loss_computer import SampleLossComputer
 from classes.student.checkpointing import save_model, save_training_state, load_training_state, resolve_checkpoint_dir, cleanup_incomplete_checkpoints, rotate_checkpoints
 from classes.student.distributed import setup_distributed, wrap_distributed, get_transformer_layers
 from classes.paths import Paths
 from pathlib import Path
+from typing import Any, cast
 from tqdm import tqdm
 import torch.distributed as dist
 import numpy as np
@@ -26,6 +29,8 @@ import logging
 import sys
 import os
 import gc
+import json
+import h5py
 
 # Suppress noisy transformers/torch warnings
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -119,6 +124,71 @@ def _patch_device_hooks(model):
         hook.pre_forward = make_patched(original_pre_forward, exec_dev)
 
 
+def _load_manifests(hdf5_path: str) -> dict[int, dict]:
+    """Return per-convo manifest dict:
+        {convo_id: {
+            'segments': [...],
+            'events': [...] | None,
+            'events_arr': np.ndarray | None,    # [N_events, |E|] fp16
+            'event_alphabet': tuple[str,...] | None,
+            'supported_mask': int,
+            'specials_hash': str | None,
+        }}
+    """
+    manifests: dict[int, dict] = {}
+    with h5py.File(hdf5_path, 'r') as f:
+        layout = f.attrs.get('layout_version')
+        if layout is None or int(layout) < 4:
+            raise RuntimeError(
+                f"cache at {hdf5_path} has layout_version={layout}; expected layout_version>=4"
+            )
+        global_alphabet = None
+        ea = f.attrs.get('event_alphabet')
+        if ea is not None:
+            from utils.merging_utils import _decode_event_alphabet
+            global_alphabet = _decode_event_alphabet(ea)
+        from classes.data_manager import H5DataManager
+        for key in f.keys():
+            if not key.startswith('convo_'):
+                continue
+            convo_id = H5DataManager._decode_group_key(key)
+            if convo_id is None:
+                continue
+            grp = cast(h5py.Group, f[key])
+            entry: dict = {
+                'segments': [],
+                'events': None,
+                'events_arr': None,
+                'event_alphabet': global_alphabet,
+                'supported_mask': 0,
+                'specials_hash': None,
+            }
+            raw = grp.attrs.get('segment_manifest')
+            if raw:
+                entry['segments'] = json.loads(raw)
+            ev_raw = grp.attrs.get('event_manifest')
+            if ev_raw:
+                entry['events'] = json.loads(ev_raw)
+            if 'event_distributions' in grp:
+                event_ds = cast(h5py.Dataset, grp['event_distributions'])
+                entry['events_arr'] = np.array(event_ds[:], dtype=np.float16)
+            ev_a = grp.attrs.get('event_alphabet')
+            if ev_a is not None:
+                try:
+                    if isinstance(ev_a, (bytes, str)):
+                        entry['event_alphabet'] = tuple(json.loads(ev_a))
+                    else:
+                        entry['event_alphabet'] = tuple(str(x) for x in ev_a)
+                except Exception:
+                    pass
+            entry['supported_mask'] = int(grp.attrs.get('supported_mask', 0))
+            sh = grp.attrs.get('specials_hash')
+            if sh is not None:
+                entry['specials_hash'] = str(sh)
+            manifests[convo_id] = entry
+    return manifests
+
+
 class StudentModel:
     def __init__(self, config: PipelineConfig, student_config: StudentConfig, paths: Paths):
         self.config = config
@@ -127,17 +197,17 @@ class StudentModel:
         self.model_path = student_config.model_path
         self.model_name = Path(student_config.model_path).name
         self.context_len = student_config.context_len
-        self.model = None
+        self.model: Any = None
         self.tokenizer = None
         self.byte_vocab = None
-        self.optimizer = None
+        self.optimizer: Any = None
         self.lr_scheduler = None
-        self.logger = None
+        self.logger: Any = None
+        self.loss_computer = None
         self.rank = 0
         self.world_size = 1
 
     def _log(self, msg):
-        if self.rank == 0:
             print(msg)
 
     def _barrier(self):
@@ -147,21 +217,77 @@ class StudentModel:
     def train(self, train_target, rank, world_size):
         self.rank = rank
         self.world_size = world_size
-        c = self.config
 
         self._log(f"  Preparing tokenizer and byte vocab index for {self.model_name}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
-        if self.student_config.chat_template:
-            self.tokenizer.chat_template = self.student_config.chat_template
+        self.tokenizer, formatter = build_tokenizer_formatter(self.model_path, self.student_config)
         self.byte_vocab = ByteVocabIndex(self.tokenizer, device=f"cuda:{rank}")
 
-        save_roles = set(c.save_roles)
+        # Attach event vocabulary + student specials to the byte vocab. This
+        # both (a) routes special-token mass out of the byte channel during
+        # training (plan §4 conditional-on-content byte distribution) and
+        # (b) enables student-side event marginalisation at anchor positions.
+        self._event_vocab = None
+        self._event_spec = None
+        self._event_remap_idx = {}
+        self._event_keep_mask = None
+        student_specials = self.student_config.effective_specials() or None
+        if student_specials:
+            from classes.event_losses import build_remap_indices
+            from classes.event_vocab import validate_remap
+            ext = tuple(getattr(self.config, "event_extensions", []) or [])
+            self._event_spec = EventChannelSpec.from_tokenizer(self.tokenizer, student_specials, ext)
+            self._event_vocab = self._event_spec.vocab
+            # Mutate byte_vocab to route special-token mass into event slots.
+            self.byte_vocab.attach_specials(self._event_spec.vocab, self._event_spec.resolved)
+            validate_remap(self._event_vocab, self.student_config.event_remap or {})
+            self._event_remap_idx, self._event_keep_mask = build_remap_indices(self._event_vocab, self.student_config.event_remap or {})
+        self.loss_computer = SampleLossComputer(
+            self.config, self.student_config, self.byte_vocab,
+            event_vocab=self._event_vocab,
+            event_remap_idx=self._event_remap_idx,
+            event_keep_mask=self._event_keep_mask,
+        )
+
+        save_roles = set(self.config.save_roles)
+        segment_handling = self.student_config.effective_segments()
+        processor = DatasetProcessor(self.config)
+
+        from classes.args import load_teacher_configs
+        from collect_and_finetune import _resolve_model_path
+        try:
+            teacher_configs = load_teacher_configs(self.config.teacher_configs_path)
+        except FileNotFoundError:
+            teacher_configs = []
+        # Only build eligibility for teachers actually being trained on; loading
+        # tokenizers for unused teachers wastes time and can hit network/load
+        # errors for models we have no intention of using.
+        if self.config.train_on != "all":
+            selected = self.config.train_on if isinstance(self.config.train_on, list) else [self.config.train_on]
+            selected_set = set(selected)
+            teacher_configs = [(n, c) for n, c in teacher_configs if n in selected_set]
+        eligibility_participants = build_teacher_participants(teacher_configs, _resolve_model_path)
+        eligibility_participants.append(ModelParticipant(
+            name="__student__", formatter=formatter,
+            context_len=self.context_len, role="student",
+            segment_handling=segment_handling,
+        ))
+
+        def filter_eligible(samples):
+            eligibilities = processor.compute_eligibility(samples, eligibility_participants)
+            kept = [s for s, e in zip(samples, eligibilities) if e.student_ok and e.eligible_teachers]
+            dropped = len(samples) - len(kept)
+            if dropped:
+                self._log(f"  Eligibility filter: dropped {dropped} samples (student incompatible or no eligible teacher).")
+            return kept
+
         self._log("  Preprocessing training data...")
-        train_samples = read_jsonl(c.dataset_path)
-        train_convos = preprocess_samples(train_samples[rank::world_size], self.tokenizer, self.context_len, save_roles)
+        train_samples = processor.load_samples(self.config.dataset_path)
+        train_samples = filter_eligible(train_samples)
+        train_convos = processor.preprocess(train_samples[rank::world_size], formatter, self.context_len, segment_handling=segment_handling)
         self._log("  Preprocessing validation data...")
-        val_samples = read_jsonl(c.validation_dataset_path)
-        val_convos = preprocess_samples(val_samples, self.tokenizer, self.context_len, save_roles)
+        val_samples = processor.load_samples(self.config.validation_dataset_path)
+        val_samples = filter_eligible(val_samples)
+        val_convos = processor.preprocess(val_samples, formatter, self.context_len, segment_handling=segment_handling)
         val_convos.sort(key=lambda cv: cv.length, reverse=True)
 
         resume_state = None
@@ -182,30 +308,30 @@ class StudentModel:
         self._load_model(rank)
         self.model = wrap_distributed(self.model, self.config.training_strategy, self.config.training_precision, rank, world_size)
 
-        if c.torch_compile:
+        if self.config.torch_compile:
             self._log("  Compiling model with torch.compile...")
             logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
             torch._dynamo.config.allow_unspec_int_on_nn_module = True
             # Per-layer compilation avoids layer_idx recompilation (5-8x faster compile)
             base_model = self.model.module if hasattr(self.model, "module") else self.model
             for layer in get_transformer_layers(base_model):
-                layer.compile(backend=c.torch_compile_backend, mode=c.torch_compile_mode)
+                layer.compile(backend=self.config.torch_compile_backend, mode=self.config.torch_compile_mode)
 
         dataset_steps = len(train_convos)
-        total_steps = dataset_steps * c.num_epochs
-        eff_batch_size = c.batch_size * c.grad_accum_batches
+        total_steps = dataset_steps * self.config.num_epochs
+        eff_batch_size = self.config.batch_size * self.config.grad_accum_batches
         grad_accum_steps = total_steps // eff_batch_size
-        warmup_steps = math.ceil(c.num_warmup_steps / eff_batch_size)
+        warmup_steps = math.ceil(self.config.num_warmup_steps / eff_batch_size)
 
-        self.optimizer = set_optimizer(self.model, c.lr, c.adam_betas, c.optimizer, c.adam_decay, total_steps=grad_accum_steps, training_strategy=self.config.training_strategy, warmup_steps=warmup_steps)
-        if c.optimizer.lower() == "schedulefree":
+        self.optimizer = set_optimizer(self.model, self.config.lr, self.config.adam_betas, self.config.optimizer, self.config.adam_decay, total_steps=grad_accum_steps, training_strategy=self.config.training_strategy, warmup_steps=warmup_steps)
+        if self.config.optimizer.lower() == "schedulefree":
             self.lr_scheduler = None
         else:
             self.lr_scheduler = set_lr_scheduler(
-                self.optimizer, c.lr_scheduler, warmup_steps,
-                grad_accum_steps, dataset_steps, c.lr_decay_start, c.lr, 1e-9
+                self.optimizer, self.config.lr_scheduler, warmup_steps,
+                grad_accum_steps, dataset_steps, self.config.lr_decay_start, self.config.lr, 1e-9
             )
-        self._log(f"  Optimizer: {c.optimizer}, Scheduler: {c.lr_scheduler}, LR: {c.lr}")
+        self._log(f"  Optimizer: {self.config.optimizer}, Scheduler: {self.config.lr_scheduler}, LR: {self.config.lr}")
 
         if checkpoint_dir:
             resume_state = load_training_state(
@@ -219,6 +345,9 @@ class StudentModel:
 
         data_manager = H5DataManager(self.paths.dataset, teacher_name=train_target, read_only=True)
         val_data_manager = H5DataManager(self.paths.dataset_validation, teacher_name=train_target, read_only=True)
+
+        self._teacher_manifests = _load_manifests(data_manager.file_path)
+        self._val_teacher_manifests = _load_manifests(val_data_manager.file_path)
 
         train_available = data_manager.get_dataset_ids()
         val_available = val_data_manager.get_dataset_ids()
@@ -283,26 +412,24 @@ class StudentModel:
         gc.collect()
 
     def _load_model(self, rank):
-        c = self.config
-        sc = self.student_config
 
         precision_map = {"fp16": torch.float16, "fp32": torch.float32, "bf16": torch.bfloat16, "4bit": torch.float16, "8bit": torch.float16}
-        dtype = precision_map.get(c.training_precision, torch.float16)
+        dtype = precision_map.get(self.config.training_precision, torch.float16)
 
         bnb_config = None
-        if c.training_precision in ("4bit", "8bit"):
+        if self.config.training_precision in ("4bit", "8bit"):
             bnb_config = BitsAndBytesConfig(
-                load_in_4bit=(c.training_precision == "4bit"),
-                load_in_8bit=(c.training_precision == "8bit"),
-                bnb_4bit_compute_dtype=dtype if c.training_precision == "4bit" else None,
-                bnb_4bit_use_double_quant=(c.training_precision == "4bit"),
-                bnb_4bit_quant_type="nf4" if c.training_precision == "4bit" else None,
+                load_in_4bit=(self.config.training_precision == "4bit"),
+                load_in_8bit=(self.config.training_precision == "8bit"),
+                bnb_4bit_compute_dtype=dtype if self.config.training_precision == "4bit" else None,
+                bnb_4bit_use_double_quant=(self.config.training_precision == "4bit"),
+                bnb_4bit_quant_type="nf4",
             )
 
-        strategy = c.training_strategy
-        attn_impl = sc.attn_implementation
+        strategy = self.config.training_strategy
+        attn_impl = self.student_config.attn_implementation
 
-        if c.liger_kernel:
+        if self.config.liger_kernel:
             try:
                 from liger_kernel.transformers import AutoLigerKernelForCausalLM
                 ModelClass = AutoLigerKernelForCausalLM
@@ -315,17 +442,17 @@ class StudentModel:
             liger_kwargs = {}
 
         if strategy == "naive_layer_split":
-            if not c.multi_gpu:
+            if not self.config.multi_gpu:
                 device_map = {"": f"cuda:{rank}"}
-            elif c.device_map == "custom":
+            elif self.config.device_map == "custom":
                 device_map = _build_custom_device_map(self.model_path, self.config.num_gpu0_layers, self.config.max_memory_hf)
             else:
-                device_map = c.device_map
+                device_map = self.config.device_map
             self.model = ModelClass.from_pretrained(
                 self.model_path, device_map=device_map,
                 dtype=dtype if not bnb_config else None,
                 quantization_config=bnb_config, attn_implementation=attn_impl,
-                max_memory=c.max_memory_hf if c.max_memory else None,
+                max_memory=self.config.max_memory_hf if self.config.max_memory else None,
                 **liger_kwargs,
             )
         else:
@@ -337,20 +464,19 @@ class StudentModel:
             if strategy != "fsdp2":
                 self.model = self.model.to(f"cuda:{rank}")
 
-        if c.liger_kernel and strategy == "naive_layer_split" and c.multi_gpu:
+        if self.config.liger_kernel and strategy == "naive_layer_split" and self.config.multi_gpu:
             _patch_device_hooks(self.model)
 
         self.model.train()
-        if c.grad_checkpointing:
+        if self.config.grad_checkpointing:
             self.model.gradient_checkpointing_enable()
 
         for name, param in self.model.named_parameters():
-            if any(fl in name for fl in sc.freeze_layers):
+            if any(fl in name for fl in self.student_config.freeze_layers):
                 param.requires_grad = False
 
     def _run_training(self, train_convos, val_convos, data_manager, val_data_manager, resume_state=None):
-        c = self.config
-        eff_batch_size = c.batch_size * c.grad_accum_batches
+        eff_batch_size = self.config.batch_size * self.config.grad_accum_batches
 
         val_batches, val_id_batches = self._construct_batches(val_convos)
         val_data_manager.read_only_mode(val_id_batches)
@@ -366,8 +492,8 @@ class StudentModel:
         else:
             num_trained = 0
             next_accum = eff_batch_size
-            next_val = int(c.validate_every_n_epochs * len(train_convos))
-            next_save = int(c.save_student_every_n_epochs * len(train_convos))
+            next_val = int(self.config.validate_every_n_epochs * len(train_convos))
+            next_save = int(self.config.save_student_every_n_epochs * len(train_convos))
             start_epoch = 0
             best_val_loss = None
             self._validate(val_batches, val_data_manager, num_trained, pbar=None)
@@ -376,14 +502,13 @@ class StudentModel:
         if hasattr(self.optimizer, 'train'):
             self.optimizer.train()
 
-        pbar = tqdm(total=len(train_convos) * c.num_epochs - num_trained, desc="Training", disable=(self.rank != 0), leave=False, smoothing=0.06)
+        pbar = tqdm(total=len(train_convos) * self.config.num_epochs - num_trained, desc="Training", disable=(self.rank != 0), leave=False, smoothing=0.06)
         last_postfix = ""
 
-        sc = self.student_config
-        total_samples = len(train_convos) * c.num_epochs
-        if sc.save_training_state_every_n_epochs:
+        total_samples = len(train_convos) * self.config.num_epochs
+        if self.student_config.save_training_state_every_n_epochs:
             epoch_size = len(train_convos)
-            state_save_interval = int(sc.save_training_state_every_n_epochs * epoch_size)
+            state_save_interval = int(self.student_config.save_training_state_every_n_epochs * epoch_size)
             if not resume_state:
                 next_state_save = state_save_interval
         else:
@@ -394,14 +519,14 @@ class StudentModel:
                 next_state_save = None
 
         epoch = start_epoch
-        for epoch in range(start_epoch, c.num_epochs):
-            self._reorder(train_convos, c.data_order, epoch)
+        for epoch in range(start_epoch, self.config.num_epochs):
+            self._reorder(train_convos, self.config.data_order, epoch)
 
             batches, id_batches = self._construct_batches(train_convos)
 
             if resume_state and epoch == start_epoch:
                 samples_this_epoch = resume_state.num_trained - start_epoch * len(train_convos)
-                batches_to_skip = samples_this_epoch // c.batch_size
+                batches_to_skip = samples_this_epoch // self.config.batch_size
                 if batches_to_skip > 0:
                     batches = batches[batches_to_skip:]
                     id_batches = id_batches[batches_to_skip:]
@@ -412,25 +537,27 @@ class StudentModel:
             losses = Losses(self.logger)
 
             for batch_convos in batches:
-                self._forward_batch(batch_convos, data_manager, losses, training=True)
+                self._forward_batch(batch_convos, data_manager, losses, self._teacher_manifests, training=True)
 
                 is_accum_step = num_trained + len(batch_convos) < next_accum
                 if is_accum_step and isinstance(self.model, DDP):
                     with self.model.no_sync():
                         losses.backward(divisor=eff_batch_size)
-                elif is_accum_step and hasattr(self.model, 'set_requires_gradient_sync'):
-                    self.model.set_requires_gradient_sync(False)
-                    losses.backward(divisor=eff_batch_size)
-                    self.model.set_requires_gradient_sync(True)
                 else:
-                    losses.backward(divisor=eff_batch_size)
+                    set_sync = getattr(self.model, 'set_requires_gradient_sync', None)
+                    if is_accum_step and callable(set_sync):
+                        set_sync(False)
+                        losses.backward(divisor=eff_batch_size)
+                        set_sync(True)
+                    else:
+                        losses.backward(divisor=eff_batch_size)
 
                 num_trained += len(batch_convos)
                 pbar.update(len(batch_convos))
 
                 if num_trained >= next_accum:
-                    if c.max_grad_norm > 0:
-                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), c.max_grad_norm)
+                    if self.config.max_grad_norm > 0:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                     else:
                         grad_norm = torch.tensor(0.0)
                     self.optimizer.step()
@@ -531,7 +658,7 @@ class StudentModel:
         next_val += int(c.validate_every_n_epochs * len(train_convos))
         return next_val, best_val_loss
 
-    def _forward_batch(self, batch_convos, data_manager, losses, training=False):
+    def _forward_batch(self, batch_convos, data_manager, losses, manifests, training=False):
         with data_manager.read_next_batch() as batch:
             teacher_batch = torch.from_numpy(batch.data).to(f"cuda:{self.rank}", non_blocking=True).float()
 
@@ -539,7 +666,7 @@ class StudentModel:
             tokens_np = np.array([cv.tokens[:max_len] for cv in batch_convos])
             tokens_t = torch.from_numpy(tokens_np).to(f"cuda:{self.rank}", non_blocking=True)
 
-            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits_all = self.model(tokens_t, use_cache=False).logits
 
             if logits_all.device != tokens_t.device:
@@ -547,64 +674,22 @@ class StudentModel:
             torch.cuda.set_device(self.rank)
 
             for i, convo in enumerate(batch_convos):
-                td = teacher_batch[i][:batch.padding[i]] if batch.padding[i] > 0 else teacher_batch[i]
-                loss_dict = self._compute_sample_loss(logits_all[i].float(), tokens_t[i], convo, td, training)
+                teacher_distributions = teacher_batch[i][:batch.padding[i]] if batch.padding[i] > 0 else teacher_batch[i]
+                manifest = manifests.get(convo.origin_convo_id)
+                if manifest is None:
+                    raise RuntimeError(
+                        f"convo {convo.origin_convo_id} missing segment_manifest"
+                    )
+                if self.loss_computer is None:
+                    raise RuntimeError("SampleLossComputer was not initialised")
+                loss_dict = self.loss_computer.compute(
+                    logits_all[i].float(), tokens_t[i], convo,
+                    teacher_distributions, manifest, training,
+                )
                 if loss_dict is not None:
                     losses.add_losses(loss_dict)
 
             del logits_all, teacher_batch
-
-    def _compute_sample_loss(self, logits, token_ids, convo, teacher_dists, training):
-        actual_bytes_t = torch.from_numpy(convo.actual_bytes).to(logits.device)
-
-        T = self.student_config.training_temperature
-        if T != 1.0:
-            logits = logits / T
-
-        loss_dict = None
-        if training:
-            loss_dict = _try_fused_train(
-                logits, token_ids, convo, teacher_dists, actual_bytes_t,
-                self.byte_vocab, self.config.alpha, self.config.loss_type,
-                entropy_weighting=self.config.entropy_weighting,
-            )
-
-        if loss_dict is None:
-            student_byte_dists = self.byte_vocab.marginalize_content(
-                logits, token_ids, convo.content_byte_ranges,
-                length=convo.length, T_CHUNK=self.config.marg_chunk_training, training=training,
-            ).float()
-
-            n = min(student_byte_dists.shape[0], teacher_dists.shape[0])
-            if n == 0:
-                if training:
-                    return {"train_loss": torch.tensor(0.0, device=logits.device, requires_grad=True)}
-                return None
-            student_byte_dists = student_byte_dists[:n]
-            teacher_dists = teacher_dists[:n]
-            actual_bytes_t = actual_bytes_t[:n]
-
-            entropy_weights = None
-            if self.config.entropy_weighting:
-                eps = 1e-8
-                t = teacher_dists + eps
-                H = -(t * t.log()).sum(-1)
-                entropy_weights = H / 5.545177  # log(256)
-
-            loss_dict = calculate_divergence(student_byte_dists, teacher_dists, actual_bytes_t, self.config.alpha, self.config.loss_type, entropy_weights=entropy_weights)
-
-        if training and torch.isnan(loss_dict["train_loss"]):
-            print(f"[WARN] NaN loss at step, substituting zero loss")
-            zero = torch.tensor(0.0, device=logits.device, requires_grad=True)
-            loss_dict = {k: (zero if k == "train_loss" else torch.tensor(0.0, device=logits.device)) for k in loss_dict}
-
-        if T != 1.0:
-            t_sq = T * T
-            for key in ("train_loss", "custom loss"):
-                if key in loss_dict:
-                    loss_dict[key] = loss_dict[key] * t_sq
-
-        return loss_dict
 
     def _validate(self, val_batches, val_data_manager, step, pbar=None, best_val_loss=None):
         self.model.eval()
@@ -615,7 +700,7 @@ class StudentModel:
         with torch.no_grad():
             iterator = tqdm(val_batches, desc="  Validating", leave=False, smoothing=0.06, disable=(self.rank != 0))
             for batch_convos in iterator:
-                self._forward_batch(batch_convos, val_data_manager, losses)
+                self._forward_batch(batch_convos, val_data_manager, losses, self._val_teacher_manifests)
 
         avg_loss = None
         tracked_metric = None
@@ -672,7 +757,7 @@ class StudentModel:
             "alpha": c.alpha,
         }
         try:
-            wandb_kwargs = dict(
+            wandb_kwargs: dict[str, Any] = dict(
                 project=project, name=name, group=self.model_name,
                 dir=self.paths.cache, config=config_dict,
                 settings=wandb.Settings(quiet=True),

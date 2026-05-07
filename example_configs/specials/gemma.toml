@@ -1,0 +1,4 @@
+# Gemma 2/3 family.
+# Plan v8 §3.
+[specials]
+E_END_TURN          = ["<end_of_turn>"]

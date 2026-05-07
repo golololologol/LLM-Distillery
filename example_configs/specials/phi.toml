@@ -1,0 +1,3 @@
+# Phi 3 / 4 family (chatml-derived).
+[specials]
+E_END_TURN = ["<|end|>", "<|endoftext|>"]

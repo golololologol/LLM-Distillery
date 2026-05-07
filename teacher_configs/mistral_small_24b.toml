@@ -1,0 +1,18 @@
+model_path = "E:/modelki/Mistral-Small-3.1-24B-Instruct-2503-exl3_6.0bpw"
+context_len = 4096
+temperature = 2
+merge_weight = 1.0
+supports_reasoning = false
+supports_tool_calls = false
+inherit_specials = "mistral_small_3.1"
+
+chat_template_path = "E:/modelki/Mistral-Small-3.1-24B-Instruct-2503-exl3_6.0bpw/chat_template.json"
+
+tokenizer_kwargs = { fix_mistral_regex = true }
+
+[exllamav3]
+reserve_vram = [2.5, 0.5]
+batch_size = 1
+seq_chunk_len = 2048
+num_inference_workers = 2
+one_worker_per_gpu = true

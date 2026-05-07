@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Student Config — ALL parameters with defaults and explanations
+# Student Config - ALL parameters with defaults and explanations
 # ─────────────────────────────────────────────────────────────────────────────
 # Pointed to by `student_config_path` in the pipeline config.
 # Only one student config is used per pipeline run.
@@ -13,6 +13,12 @@ model_path = "Qwen/Qwen3-0.6B"
 # Context length (tokens) for training. Required.
 context_len = 2048
 
+# Does this student model's chat template emit reasoning (<think>...) segments?
+supports_reasoning = true
+
+# Does this student model's chat template emit tool-call blocks?
+supports_tool_calls = true
+
 # Attention implementation: "eager" | "flash_attention_2" | "sdpa"
 # flash_attention_2 requires the flash-attn package.
 attn_implementation = "eager"
@@ -21,6 +27,13 @@ attn_implementation = "eager"
 # Only needed if the model's built-in template is wrong or missing.
 # Useful for models like TinyLlama that lack a default chat template.
 # chat_template = "{% for message in messages %}..."
+
+# Alternative: path to a template file.
+# chat_template_path = "path/to/template.jinja"
+
+# Optional pass-through kwargs for apply_chat_template (e.g. enable_thinking).
+# [render_options]
+# enable_thinking = true
 
 
 # Temperature for student logits during training.
@@ -46,3 +59,20 @@ save_final_training_state = false
 # Resume training from a saved state directory.
 # Point to the directory containing optimizer/scheduler state files.
 # resume_from = "cache/training_state_epoch_3"
+
+
+# ── Segments ─────────────────────────────────────────────────────────────────
+# Control which parts of assistant messages are trained on.
+# Supported types: content, reasoning, tool_call
+# Handling options for students: "active" | "context" | "disabled"
+#   active   - compute loss on this segment type
+#   context  - render in prompt but don't compute loss
+#   disabled - strip entirely from rendered text
+#
+# Content is always active by default. No [segments] section = content-only.
+
+# [segments.reasoning]
+# handling = "context"
+
+# [segments.tool_call]
+# handling = "disabled"

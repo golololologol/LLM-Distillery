@@ -51,8 +51,8 @@ void fused_inference_byte_marginalize_kernel(
     __syncthreads();
 
     // ============ Phase 1: Fused online softmax + C=0 frame scatter ============
-    float m = -3.4e38f;
-    float d = 0.0f;
+    float softmax_max = -3.4e38f;
+    float softmax_denom = 0.0f;
     for (int i = tid; i < V2; i += 256) {
         half2 h2 = row_h2[i];
         float val0 = __half2float(h2.x);
@@ -60,12 +60,12 @@ void fused_inference_byte_marginalize_kernel(
         int v0 = 2 * i;
         int v1 = v0 + 1;
 
-        float m_new = fmaxf(m, val0);
-        d = d * __expf(m - m_new) + __expf(val0 - m_new);
-        m = m_new;
-        m_new = fmaxf(m, val1);
-        d = d * __expf(m - m_new) + __expf(val1 - m_new);
-        m = m_new;
+        float m_new = fmaxf(softmax_max, val0);
+        softmax_denom = softmax_denom * __expf(softmax_max - m_new) + __expf(val0 - m_new);
+        softmax_max = m_new;
+        m_new = fmaxf(softmax_max, val1);
+        softmax_denom = softmax_denom * __expf(softmax_max - m_new) + __expf(val1 - m_new);
+        softmax_max = m_new;
 
         float e0 = __expf(fminf(val0, 80.0f));
         float e1 = __expf(fminf(val1, 80.0f));
@@ -88,7 +88,7 @@ void fused_inference_byte_marginalize_kernel(
             }
         }
     }
-    blockReduceOnlineSoftmax(reduce_buf, m, d);
+    blockReduceOnlineSoftmax(reduce_buf, softmax_max, softmax_denom);
     float global_max = reduce_buf[0];
     float global_sum = reduce_buf[8];
     float logsumexp = global_max + logf(global_sum);
@@ -109,8 +109,8 @@ void fused_inference_byte_marginalize_kernel(
     __syncthreads();
 
     // d0: normalize and write
-    float z0_local = (tid < 256) ? d0_warp_bins[tid] : 0.0f;
-    float Z0 = blockReduceSum(z0_local);
+    float norm_d0 = (tid < 256) ? d0_warp_bins[tid] : 0.0f;
+    float Z0 = blockReduceSum(norm_d0);
     if (tid == 0) reduce_buf[0] = fmaxf(Z0, 1e-30f);
     __syncthreads(); Z0 = reduce_buf[0]; __syncthreads();
     if (tid < 256) {
@@ -119,8 +119,8 @@ void fused_inference_byte_marginalize_kernel(
 
     // d1: normalize and write
     if (my_num_depths >= 2) {
-        float z1_local = (tid < 256) ? d1_bins[tid] : 0.0f;
-        float Z1 = blockReduceSum(z1_local);
+        float norm_d1 = (tid < 256) ? d1_bins[tid] : 0.0f;
+        float Z1 = blockReduceSum(norm_d1);
         if (tid == 0) reduce_buf[0] = fmaxf(Z1, 1e-30f);
         __syncthreads(); Z1 = reduce_buf[0]; __syncthreads();
         if (tid < 256) {
@@ -130,8 +130,8 @@ void fused_inference_byte_marginalize_kernel(
 
     // d2: normalize and write
     if (my_num_depths >= 3) {
-        float z2_local = (tid < 256) ? d2_bins[tid] : 0.0f;
-        float Z2 = blockReduceSum(z2_local);
+        float norm_d2 = (tid < 256) ? d2_bins[tid] : 0.0f;
+        float Z2 = blockReduceSum(norm_d2);
         if (tid == 0) reduce_buf[0] = fmaxf(Z2, 1e-30f);
         __syncthreads(); Z2 = reduce_buf[0]; __syncthreads();
         if (tid < 256) {

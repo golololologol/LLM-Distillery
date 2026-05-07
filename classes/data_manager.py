@@ -1,6 +1,7 @@
 from classes.data_classes import Distribution, BatchResult
 from multiprocessing import shared_memory
 from multiprocessing import get_context
+from typing import Any, cast
 import multiprocessing
 import numpy as np
 import hdf5plugin
@@ -8,18 +9,32 @@ import traceback
 import queue
 import time
 import h5py
+import json
 import gc
 import os
+
+
+class DistributionWriteHandle:
+    """Pickle-safe write-only handle passed to inference workers."""
+
+    def __init__(self, queue: Any):
+        self._queue = queue
+
+    def write_batch(self, batch: list[Distribution]) -> None:
+        self._queue.put(('put_batch', batch))
+
+    def cancel_join_thread(self) -> None:
+        self._queue.cancel_join_thread()
 
 
 class H5DataManager:
     def __init__(self, dataset_path, max_queue_size=12, teacher_name: str = "", read_only: bool = False, auto_approve: bool = False):
         self.file_path = os.path.join(dataset_path, f"{teacher_name}.hdf5")
-        self.queue = multiprocessing.Queue(max_queue_size)
-        self.result_queue = multiprocessing.Queue(max_queue_size)
-        self.closing = multiprocessing.Event()
+        self.queue: Any = multiprocessing.Queue(max_queue_size)
+        self.result_queue: Any = multiprocessing.Queue(max_queue_size)
+        self.closing: Any = multiprocessing.Event()
         self.max_queue_size = max_queue_size
-        self.loading_process = get_context("spawn").Process(target=self._loading_process)
+        self.loading_process: Any = get_context("spawn").Process(target=self._loading_process)
         self.shared_batches: list[shared_memory.SharedMemory] = []
         self.teacher_name = teacher_name
         self.read_only = read_only
@@ -84,7 +99,7 @@ class H5DataManager:
                     case 'put_batch':
                         self._process_distributions(hdf_file, data)
                     case 'clear_dataset':
-                        ids_to_clear = [int(group.split('_')[1]) for group in self._iter_group(hdf_file)]
+                        ids_to_clear = [self._decode_group_key(group) for group in self._iter_group_names(hdf_file)]
                         self._clear_dataset(hdf_file, ids_to_clear)
                     case 'clear_queues':
                         self._clear_queues()
@@ -97,7 +112,7 @@ class H5DataManager:
                     case 'rename_ids':
                         self._rename_ids(hdf_file, data)
                     case 'get_available_ids':
-                        self.result_queue.put(set([int(group.split('_')[1]) for group in self._iter_group(hdf_file)]))
+                        self.result_queue.put(set([self._decode_group_key(group) for group in self._iter_group_names(hdf_file)]))
                     case 'get_available_shas':
                         self.result_queue.put(self._get_shas(hdf_file))
                     case 'update_shas':
@@ -127,14 +142,69 @@ class H5DataManager:
         return hdf_file.attrs.get(arg, None)
     
     def _set_attr(self, hdf_file: h5py.File, arg, value):
+        # h5py attrs can't store dicts or heterogeneous/empty containers natively;
+        # encode such values as JSON strings to keep the attribute round-trippable.
+        if isinstance(value, dict):
+            value = json.dumps(value, sort_keys=True)
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            seq = list(value)
+            if len(seq) == 0 or not all(isinstance(x, (str, bytes, int, float, bool, np.integer, np.floating)) for x in seq):
+                value = json.dumps(seq, sort_keys=True, default=str)
         hdf_file.attrs[arg] = value
         
         
-    def _group_key(self, convo_id: int) -> str:
-        return f'convo_{convo_id}'
+    def _group_key(self, convo_id) -> str:
+        # h5py treats '/' as a group hierarchy separator, so any convo_id
+        # containing '/' (e.g. HuggingFace dataset slugs like
+        # "HuggingFaceH4/ultrachat_200k:...") would silently produce nested
+        # groups instead of a single flat entry. Escape '/' (and '\\' to keep
+        # the encoding reversible) before composing the group name.
+        sid = str(convo_id).replace('\\', '\\\\').replace('/', '\\_')
+        return f'convo_{sid}'
+
+    @staticmethod
+    def _decode_group_key(group_name: str):
+        """Inverse of :meth:`_group_key`; returns the original convo_id (int or str)."""
+        if not group_name.startswith('convo_'):
+            return None
+        sid = group_name[len('convo_'):]
+        # Reverse the escapes; '\\_' must be undone before '\\\\' to avoid
+        # double-decoding a literal backslash followed by underscore.
+        out = []
+        i = 0
+        while i < len(sid):
+            if sid[i] == '\\' and i + 1 < len(sid):
+                nxt = sid[i + 1]
+                if nxt == '_':
+                    out.append('/')
+                    i += 2
+                    continue
+                if nxt == '\\':
+                    out.append('\\')
+                    i += 2
+                    continue
+            out.append(sid[i])
+            i += 1
+        decoded = ''.join(out)
+        try:
+            return int(decoded)
+        except ValueError:
+            return decoded
 
     def _iter_group(self, hdf_file: h5py.File):
         return hdf_file
+
+    def _iter_group_names(self, hdf_file: h5py.File) -> list[str]:
+        # Only return real top-level convo groups: must start with 'convo_' AND
+        # carry the 'content_sha' attribute. This filters out any malformed or
+        # legacy nested-parent groups (e.g. files collected before the '/'
+        # escape fix where ids containing '/' produced silent group hierarchies).
+        return [
+            key for key in hdf_file.keys()
+            if isinstance(key, str)
+            and key.startswith('convo_')
+            and 'content_sha' in hdf_file[key].attrs
+        ]
 
 
     def _has_data(self, hdf_file: h5py.File):
@@ -171,44 +241,105 @@ class H5DataManager:
     def _process_distributions(self, hdf_file: h5py.File, batch: list[Distribution]):
         for distribution in batch:
             shd_mem = distribution.from_shd_mem()
-            self._save_data(hdf_file, distribution.distribution, distribution.origin_convo_id, distribution.content_sha, cropped=distribution.cropped)
+            ev_shm = distribution.events_from_shd_mem()
+            if distribution.distribution is None:
+                raise RuntimeError(f"Distribution {distribution.origin_convo_id} has no dense distribution payload")
+            self._save_data(
+                hdf_file, distribution.distribution, distribution.origin_convo_id,
+                distribution.content_sha, cropped=distribution.cropped,
+                segment_manifest=distribution.segment_manifest,
+                events=distribution.events,
+                event_manifest=distribution.event_manifest,
+                event_alphabet=distribution.event_alphabet,
+                supported_mask=distribution.supported_mask,
+                specials_hash=distribution.specials_hash,
+            )
             shd_mem.close()
             shd_mem.unlink()
+            if ev_shm is not None:
+                # release the numpy view first so the buffer is no longer
+                # referenced before unmapping the shared segment.
+                distribution.events = None
+                ev_shm.close()
+                ev_shm.unlink()
         
 
-    def _get_shas(self, hdf_file: h5py.File) -> dict[int, str]:
+    def _get_shas(self, hdf_file: h5py.File) -> dict:
         shas = {}
         teacher_group = self._iter_group(hdf_file)
-        for group in teacher_group:
-            shas[int(group.split('_')[1])] = teacher_group[group].attrs['content_sha']
+        for group in self._iter_group_names(hdf_file):
+            shas[self._decode_group_key(group)] = teacher_group[group].attrs['content_sha']
         return shas
     
     def _update_shas(self, hdf_file: h5py.File, shas: dict[int, str]):
-        for id, sha in shas.items():
-            group_key = self._group_key(id)
+        for convo_id, sha in shas.items():
+            group_key = self._group_key(convo_id)
             if group_key in hdf_file:
                 hdf_file[group_key].attrs['content_sha'] = sha
 
 
-    def _save_data(self, hdf_file: h5py.File, data: np.ndarray, convo_id: int, content_sha: str = None, cropped: bool = None):
+    def _save_data(
+        self,
+        hdf_file: h5py.File,
+        data: np.ndarray,
+        convo_id: int,
+        content_sha: str | None = None,
+        cropped: bool | None = None,
+        segment_manifest=None,
+        events: np.ndarray | None = None,
+        event_manifest: list[dict] | None = None,
+        event_alphabet: tuple[str, ...] | None = None,
+        supported_mask: int = 0,
+        specials_hash: str | None = None,
+    ):
         group_key = self._group_key(convo_id)
 
-        if group_key not in hdf_file:
-            group = hdf_file.create_group(group_key)
-        else:
-            group = hdf_file[group_key]
+        group = cast(h5py.Group, hdf_file.require_group(group_key))
 
         if content_sha is not None:
             group.attrs['content_sha'] = content_sha
         if cropped is not None:
             group.attrs['cropped'] = cropped
+        if segment_manifest is not None:
+            group.attrs['segment_manifest'] = json.dumps(segment_manifest)
 
-        zstd = hdf5plugin.Zstd(clevel=1)
+        zstd = cast(Any, getattr(hdf5plugin, "Zstd"))(clevel=1)
         for key in ['dense_distributions']:
             if key in group:
                 del group[key]
         group.create_dataset('dense_distributions', data=data.astype(np.float16), **zstd)
         group.attrs['convo_len'] = data.shape[0]
+
+        # v8 event channel (plan §7).  Always overwrite when the producer
+        # supplied any event payload so stale rows from a previous run with a
+        # different specials_hash never linger.
+        for key in ('event_distributions',):
+            if key in group:
+                del group[key]
+        if events is not None and events.size > 0:
+            group.create_dataset('event_distributions', data=events.astype(np.float16), **zstd)
+            group.attrs['event_count'] = int(events.shape[0])
+        else:
+            group.attrs['event_count'] = 0
+        if event_manifest is not None:
+            group.attrs['event_manifest'] = json.dumps(event_manifest)
+        if event_alphabet is not None:
+            # Store as a list/ndarray so h5py serialises one string per slot;
+            # JSON-encoding the whole list character-splits on read and breaks
+            # cross-teacher merging (the merger compares alphabets element-wise).
+            group.attrs['event_alphabet'] = list(event_alphabet)
+        if supported_mask:
+            group.attrs['supported_mask'] = int(supported_mask)
+        if specials_hash is not None:
+            group.attrs['specials_hash'] = specials_hash
+            # Mirror at the file level so loaders can reject a mixed cache
+            # without iterating every group.
+            hdf_file.attrs['specials_hash'] = specials_hash
+        if event_alphabet is not None:
+            hdf_file.attrs['event_alphabet'] = list(event_alphabet)
+        # Bump file-level layout version once we are writing v8 fields.
+        if events is not None or event_manifest is not None or specials_hash is not None:
+            hdf_file.attrs['layout_version'] = 6
     
     
     def _load_group_distributions(self, group):
@@ -278,7 +409,7 @@ class H5DataManager:
                 break
 
 
-    def _clear_dataset(self, hdf_file: h5py.File, ids_to_clear: list[int] = None):
+    def _clear_dataset(self, hdf_file: h5py.File, ids_to_clear: list[int] | None = None):
         for id in (ids_to_clear or []):
             try:
                 del hdf_file[self._group_key(id)]
@@ -298,6 +429,10 @@ class H5DataManager:
     
     def enqueue_get_batches(self, batches: list[list[int]]):
         self.queue.put(('get_batches', batches))
+
+    @property
+    def writer(self) -> DistributionWriteHandle:
+        return DistributionWriteHandle(self.queue)
 
     def _flush_and_wait(self):
         r, w = multiprocessing.Pipe(duplex=False)
@@ -337,7 +472,7 @@ class H5DataManager:
         self.queue.put(('clear_dataset', None))
         self._flush_and_wait()
     
-    def delete_ids(self, ids: list[int], reason: str = None):
+    def delete_ids(self, ids: list[int], reason: str | None = None):
         if not ids:
             return
         
@@ -404,22 +539,24 @@ class H5DataManager:
     
     def close(self):
         try:
-            if not self.loading_process.is_alive():
+            loading_process = getattr(self, "loading_process", None)
+            if loading_process is None or not loading_process.is_alive():
                 return
             self.closing.set()
             try:
                 self.queue.put(None, timeout=2)
             except (queue.Full, OSError):
                 pass
-            self.loading_process.join(timeout=5)
-            if self.loading_process.is_alive():
-                self.loading_process.terminate()
-                self.loading_process.join(timeout=2)
+            loading_process.join(timeout=5)
+            if loading_process.is_alive():
+                loading_process.terminate()
+                loading_process.join(timeout=2)
         except (OSError, ValueError, KeyboardInterrupt, InterruptedError):
-            try:
-                self.loading_process.terminate()
-            except Exception:
-                pass
+            if loading_process is not None:
+                try:
+                    loading_process.terminate()
+                except Exception:
+                    pass
         finally:
             for q in [self.queue, self.result_queue]:
                 if q is not None:

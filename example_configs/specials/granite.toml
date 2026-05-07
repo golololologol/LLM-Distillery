@@ -1,0 +1,4 @@
+# IBM Granite 3 / 4 family.
+[specials]
+E_END_TURN          = ["<|end_of_text|>", "<|endoftext|>"]
+E_BEGIN_TOOL_CALL   = ["<|tool_call|>"]

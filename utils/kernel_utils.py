@@ -24,6 +24,8 @@ def preload_torch_extensions(names: list[str]):
             path = os.path.join(build_dir, name + ext_suffix)
             if os.path.exists(path):
                 spec = importlib.util.spec_from_file_location(name, path)
+                if spec is None or spec.loader is None:
+                    continue
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
                 sys.modules[name] = mod
@@ -43,46 +45,43 @@ class _FusedLossGrad(torch.autograd.Function):
         return precomputed_grad * grad_output, None, None
 
 
-def _try_fused_train(logits, token_ids, convo, teacher_dists, actual_bytes_t, byte_vocab, alpha, loss_type, **kwargs):
+def _try_fused_train(logits, token_ids, length, content_byte_ranges, teacher_dists, actual_bytes_t, byte_vocab, alpha, loss_type, **kwargs):
     if _fused_train_fn is None:
         return None
 
-    length = convo.length
+    content_byte_ranges = [(s, e) for s, e in content_byte_ranges if e > s]
+    if not content_byte_ranges:
+        return None
+
     T1 = length - 1
     device = logits.device
 
     active_idx, active_byte_lens, content_mask = byte_vocab._compute_content_positions(
-        token_ids, convo.content_byte_ranges, length, device
+        token_ids, content_byte_ranges, length, device
     )
 
     if len(active_idx) == 0:
         return None
 
-    N_total_active = active_byte_lens.sum().item()
-    N_content = content_mask.sum().item()
+    N_total_active = int(active_byte_lens.sum().item())
+    N_content = int(content_mask.sum().item())
+    if N_content == 0:
+        return None
 
+    teacher_full = torch.zeros((N_total_active, 256), dtype=torch.float32, device=device)
+    actual_full = torch.zeros(N_total_active, dtype=torch.int32, device=device)
+    content_indices = content_mask.nonzero(as_tuple=True)[0]
     n = min(N_content, teacher_dists.shape[0])
+    teacher_full[content_indices[:n]] = teacher_dists[:n]
+    actual_full[content_indices[:n]] = actual_bytes_t[:n].int()
+    byte_mask = content_mask.to(torch.uint8).contiguous()
+    teacher_dists_k = teacher_full
+    actual_bytes_k = actual_full
 
-    if N_content == N_total_active:
-        teacher_dists_k = teacher_dists[:n]
-        actual_bytes_k = actual_bytes_t[:n].int()
-        loss_scale = 1.0
-    else:
-        teacher_padded = torch.full((N_total_active, 256), 1.0 / 256, dtype=torch.float32, device=device)
-        actual_padded = torch.zeros(N_total_active, dtype=torch.int32, device=device)
-        content_indices = content_mask.nonzero(as_tuple=True)[0]
-        teacher_padded[content_indices[:n]] = teacher_dists[:n]
-        actual_padded[content_indices[:n]] = actual_bytes_t[:n].int()
-        teacher_dists_k = teacher_padded
-        actual_bytes_k = actual_padded
-        loss_scale = N_total_active / N_content
-
-    # Build teacher_offsets and target_byte_lens for active positions
     teacher_offsets = torch.zeros(len(active_idx), dtype=torch.long, device=device)
     if len(active_idx) > 1:
         teacher_offsets[1:] = active_byte_lens[:-1].cumsum(0)
 
-    # Build logits/token_ids for the active subset
     if len(active_idx) == T1:
         chunk_logits = logits[:length]
         chunk_token_ids = token_ids[:length]
@@ -93,18 +92,11 @@ def _try_fused_train(logits, token_ids, convo, teacher_dists, actual_bytes_t, by
     grad_logits_chunk, loss_dict = _fused_train_fn(
         chunk_logits, chunk_token_ids, byte_vocab,
         teacher_dists_k, actual_bytes_k, teacher_offsets, active_byte_lens,
-        alpha, loss_type, **kwargs,
+        alpha, loss_type, byte_mask=byte_mask, **kwargs,
     )
-    if grad_logits_chunk is None:
+    if grad_logits_chunk is None or loss_dict is None:
         return None
 
-    if loss_scale != 1.0:
-        for key in loss_dict:
-            if isinstance(loss_dict[key], torch.Tensor) and loss_dict[key].dim() == 0:
-                loss_dict[key] = loss_dict[key] * loss_scale
-        grad_logits_chunk = grad_logits_chunk * loss_scale
-
-    # Scatter gradients back to full logits shape
     if len(active_idx) == T1:
         grad_logits = torch.zeros_like(logits)
         grad_logits[:T1] = grad_logits_chunk.to(grad_logits.dtype)

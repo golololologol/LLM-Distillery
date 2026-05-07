@@ -1,0 +1,3 @@
+# Cohere Command-R / R+ family.
+[specials]
+E_END_TURN          = ["<|END_OF_TURN_TOKEN|>"]

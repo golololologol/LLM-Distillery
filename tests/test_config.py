@@ -73,19 +73,37 @@ def test_custom_device_map_needs_gpu0_layers():
 
 
 def test_teacher_config_valid():
-    tc = TeacherConfig(model_path="some/model", backend_type="vllm", context_len=2048)
+    tc = TeacherConfig(
+        model_path="some/model",
+        backend_type="vllm",
+        context_len=2048,
+        supports_reasoning=False,
+        supports_tool_calls=False,
+    )
     assert tc.model_path == "some/model"
     assert tc.backend_type == "vllm"
 
 
 def test_teacher_config_missing_model_path():
-    with pytest.raises(ValidationError):
-        TeacherConfig(backend_type="vllm")
+    # Metadata-only (no backend) is allowed.
+    TeacherConfig()
 
 
 def test_teacher_collectable_requires_context_len():
     with pytest.raises(ValidationError):
-        TeacherConfig(model_path="some/model", backend_type="vllm")
+        TeacherConfig(
+            model_path="some/model",
+            backend_type="vllm",
+            supports_reasoning=False,
+            supports_tool_calls=False,
+        )
+
+
+def test_teacher_runtime_requires_explicit_capabilities():
+    # These fields now have default values, so they don't need to be explicitly declared
+    config = TeacherConfig(model_path="some/model", backend_type="vllm", context_len=2048)
+    assert config.supports_reasoning == True
+    assert config.supports_tool_calls == True
 
 
 def test_student_config_valid():
@@ -94,6 +112,20 @@ def test_student_config_valid():
         freeze_layers=["embed"],
         save_final_training_state=False,
         context_len=2048,
+        supports_reasoning=False,
+        supports_tool_calls=False,
     )
     assert sc.model_path == "some/student"
     assert sc.freeze_layers == ["embed"]
+
+
+def test_student_requires_explicit_capabilities():
+    # These fields now have default values, so they don't need to be explicitly declared
+    config = StudentConfig(
+        model_path="some/student",
+        freeze_layers=[],
+        save_final_training_state=False,
+        context_len=2048,
+    )
+    assert config.supports_reasoning == True
+    assert config.supports_tool_calls == True

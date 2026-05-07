@@ -1,0 +1,4 @@
+# Llama 4 family (Maverick / Scout).
+[specials]
+E_END_TURN          = ["<|eot|>"]
+E_END_MESSAGE       = ["<|end_of_text|>"]

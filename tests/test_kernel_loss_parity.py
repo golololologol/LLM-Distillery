@@ -22,11 +22,12 @@ def test_skew_kl_parity(N):
 
     ref = _skew_kl_loss(student, teacher, actual, alpha=0.5)
     ref["train_loss"].backward()
+    assert student.grad is not None
     ref_grad = student.grad.clone()
     student.grad = None
 
     grad_cuda, cuda_dict = fused_skew_kl_forward_backward(student.detach(), teacher, actual, alpha=0.5)
-    if grad_cuda is None:
+    if grad_cuda is None or cuda_dict is None:
         pytest.skip("Kernel compilation failed")
 
     loss_diff = abs(ref["train_loss"].item() - cuda_dict["train_loss"].item())
@@ -52,11 +53,12 @@ def test_akl_parity(N):
 
     ref = _akl_loss(student, teacher, actual, alpha=0.5)
     ref["train_loss"].backward()
+    assert student.grad is not None
     ref_grad = student.grad.clone()
     student.grad = None
 
     grad_cuda, cuda_dict = fused_akl_forward_backward(student.detach(), teacher, actual, alpha=0.5)
-    if grad_cuda is None:
+    if grad_cuda is None or cuda_dict is None:
         pytest.skip("Kernel compilation failed")
 
     loss_diff = abs(ref["train_loss"].item() - cuda_dict["train_loss"].item())
@@ -82,11 +84,12 @@ def test_abomination_parity(N):
 
     ref = _abomination_loss(student, teacher, actual, alpha=0.5)
     ref["train_loss"].backward()
+    assert student.grad is not None
     ref_grad = student.grad.clone()
     student.grad = None
 
     grad_cuda, cuda_dict = fused_abomination_forward_backward(student.detach(), teacher, actual, alpha=0.5)
-    if grad_cuda is None:
+    if grad_cuda is None or cuda_dict is None:
         pytest.skip("Kernel compilation failed")
 
     loss_diff = abs(ref["train_loss"].item() - cuda_dict["train_loss"].item())
@@ -112,11 +115,12 @@ def test_hellinger_parity(N):
 
     ref = _hellinger_loss(student, teacher, actual, alpha=0.5)
     ref["train_loss"].backward()
+    assert student.grad is not None
     ref_grad = student.grad.clone()
     student.grad = None
 
     grad_cuda, cuda_dict = fused_hellinger_forward_backward(student.detach(), teacher, actual, alpha=0.5)
-    if grad_cuda is None:
+    if grad_cuda is None or cuda_dict is None:
         pytest.skip("Kernel compilation failed")
 
     loss_diff = abs(ref["train_loss"].item() - cuda_dict["train_loss"].item())
@@ -142,11 +146,12 @@ def test_jsd_parity(N):
 
     ref = _jsd_loss(student, teacher, actual, alpha=0.5)
     ref["train_loss"].backward()
+    assert student.grad is not None
     ref_grad = student.grad.clone()
     student.grad = None
 
     grad_cuda, cuda_dict = fused_jsd_forward_backward(student.detach(), teacher, actual, alpha=0.5)
-    if grad_cuda is None:
+    if grad_cuda is None or cuda_dict is None:
         pytest.skip("Kernel compilation failed")
 
     loss_diff = abs(ref["train_loss"].item() - cuda_dict["train_loss"].item())
@@ -172,11 +177,12 @@ def test_wasserstein_parity(N):
 
     ref = _wasserstein_loss(student, teacher, actual, alpha=0.5)
     ref["train_loss"].backward()
+    assert student.grad is not None
     ref_grad = student.grad.clone()
     student.grad = None
 
     grad_cuda, cuda_dict = fused_wasserstein_forward_backward(student.detach(), teacher, actual, alpha=0.5)
-    if grad_cuda is None:
+    if grad_cuda is None or cuda_dict is None:
         pytest.skip("Kernel compilation failed")
 
     loss_diff = abs(ref["train_loss"].item() - cuda_dict["train_loss"].item())

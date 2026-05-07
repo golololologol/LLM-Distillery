@@ -4,27 +4,159 @@ import os
 import sys
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, get_args, get_origin
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str) and v.lower() in ('yes', 'true', 't', '1'):
+class SegmentConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    handling: Literal["active", "context", "disabled"]
+
+
+# --- v8 specials helpers -------------------------------------------------
+
+# Resolution paths for ``inherit_specials`` lookups (relative to repo root).
+_SPECIALS_DIR_RELATIVE = os.path.join("example_configs", "specials")
+
+
+def _load_specials_library_entry(name: str) -> dict[str, list[str]]:
+    """Resolve ``inherit_specials = "<name>"`` to a ``[specials]`` dict.
+
+    Looks for ``example_configs/specials/<name>.toml`` (TOML file with a top
+    level ``[specials]`` table or with the slot keys at top level).
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(repo_root, _SPECIALS_DIR_RELATIVE, f"{name}.toml")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"inherit_specials={name!r}: no file at {path}"
+        )
+    with open(path, "rb") as f:
+        raw = tomllib.load(f)
+    if "specials" in raw and isinstance(raw["specials"], dict):
+        return _coerce_specials_dict(raw["specials"])
+    return _coerce_specials_dict(raw)
+
+
+def _coerce_specials_dict(raw: dict) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for k, v in raw.items():
+        if isinstance(v, str):
+            out[k] = [v]
+        elif isinstance(v, (list, tuple)):
+            out[k] = [str(s) for s in v if s is not None]
+        else:
+            raise ValueError(
+                f"specials slot {k!r}: expected string or list of strings, got {type(v).__name__}"
+            )
+    return out
+
+
+def _merged_specials(
+    inherit: Optional[str],
+    overrides: Optional[Dict[str, List[str]]],
+) -> Dict[str, List[str]]:
+    base: dict[str, list[str]] = {}
+    if inherit:
+        base.update(_load_specials_library_entry(inherit))
+    for k, v in (overrides or {}).items():
+        base[k] = list(v)
+    return base
+
+
+def str2bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in ('yes', 'true', 't', '1'):
         return True
-    elif isinstance(v, str) and v.lower() in ('no', 'false', 'f', '0'):
+    elif isinstance(value, str) and value.lower() in ('no', 'false', 'f', '0'):
         return False
     raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
-class TeacherConfig(BaseModel):
+class FormattedModelConfig(BaseModel):
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+
+    chat_template: Optional[str] = Field(None, description="Inline Jinja2 chat template override.")
+    chat_template_path: Optional[str] = Field(None, description="Path to a file containing the Jinja2 chat template.")
+    render_options: Dict[str, Any] = Field(default_factory=dict, description="Pass-through kwargs for apply_chat_template.")
+    tokenizer_kwargs: Dict[str, Any] = Field(default_factory=dict, description="Extra kwargs forwarded to AutoTokenizer.from_pretrained().")
+    supports_reasoning: bool = Field(True)
+    supports_tool_calls: bool = Field(True)
+    segments: Dict[str, SegmentConfig] = Field(default_factory=dict)
+    inherit_specials: Optional[str] = Field(None, description="Name of a specials TOML in example_configs/specials/ to inherit from.")
+    specials: Dict[str, List[str]] = Field(default_factory=dict, description="Per-slot override of the specials map.")
+
+    @field_validator('specials', mode='before')
+    @classmethod
+    def coerce_specials(cls, v):
+        if v is None:
+            return {}
+        if isinstance(v, dict):
+            return _coerce_specials_dict(v)
+        return v
+
+    @field_validator('segments', mode='before')
+    @classmethod
+    def coerce_segments(cls, v):
+        if isinstance(v, dict):
+            return {seg_type: SegmentConfig(**seg_config) if isinstance(seg_config, dict) else seg_config for seg_type, seg_config in v.items()}
+        return v
+
+    @model_validator(mode='after')
+    def validate_segments(self):
+        supported = {"content"}
+        if self.supports_reasoning:
+            supported.add("reasoning")
+        if self.supports_tool_calls:
+            supported.update({"tool_call", "tool_name", "tool_arguments"})
+        owner = type(self).__name__.replace("Config", "").lower()
+        for k, seg in self.segments.items():
+            if k not in supported:
+                raise ValueError(
+                    f"{owner} does not support segment {k!r} (supports_reasoning={self.supports_reasoning}, supports_tool_calls={self.supports_tool_calls}); remove this entry"
+                )
+            if seg.handling not in ("active", "context", "disabled"):
+                raise ValueError(f"{owner.capitalize()} segment '{k}' handling must be 'active', 'context', or 'disabled', got '{seg.handling}'")
+            if k == "content" and seg.handling == "disabled":
+                raise ValueError(f"{owner.capitalize()} segment 'content' cannot be disabled")
+        return self
+
+    def effective_specials(self) -> Dict[str, List[str]]:
+        """Resolved specials map (after ``inherit_specials`` + per-key overrides)."""
+        return _merged_specials(self.inherit_specials, self.specials)
+
+    def resolve_chat_template(self) -> Optional[str]:
+        if self.chat_template_path:
+            with open(self.chat_template_path, "r", encoding="utf-8") as f:
+                raw = f.read()
+            # Support both raw Jinja files and {"chat_template": "..."} JSON
+            # (the format used by Mistral's chat_template.json).
+            if self.chat_template_path.endswith(".json"):
+                import json as _json
+                parsed = _json.loads(raw)
+                if isinstance(parsed, dict) and "chat_template" in parsed:
+                    return parsed["chat_template"]
+            return raw
+        return self.chat_template
+
+    def effective_segments(self) -> dict[str, str]:
+        result = {"content": "active"}
+        for k, seg in self.segments.items():
+            result[k] = seg.handling
+        return result
+
+
+class TeacherConfig(FormattedModelConfig):
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+
     model_path: Optional[str] = Field(None, min_length=1)
     context_len: Optional[int] = Field(None, gt=0)
     backend_type: Optional[str] = Field(None)
     backend_params: Dict[str, Any] = Field(default_factory=dict)
     temperature: float = Field(1.0, gt=0)
     merge_weight: float = Field(1.0, gt=0)
-    chat_template: Optional[str] = Field(None, description="Jinja2 chat template override for this teacher's tokenizer.")
 
     @property
     def can_collect(self) -> bool:
@@ -39,7 +171,10 @@ class TeacherConfig(BaseModel):
         return self
 
 
-class StudentConfig(BaseModel):
+class StudentConfig(FormattedModelConfig):
+    def __init__(self, **data: Any) -> None:
+        super().__init__(**data)
+
     model_path: str = Field(..., min_length=1)
     context_len: int = Field(..., gt=0)
     freeze_layers: List[str] = Field(...)
@@ -48,7 +183,13 @@ class StudentConfig(BaseModel):
     save_training_state_every_n_epochs: Optional[float] = Field(None, gt=0)
     resume_from: Optional[str] = Field(None)
     training_temperature: float = Field(1.0, gt=0)
-    chat_template: Optional[str] = Field(None, description="Jinja2 chat template override for the student tokenizer.")
+    event_remap: Dict[str, str] = Field(default_factory=dict, description="{slot_name: 'drop' | other_slot_name} per-student event-channel remap.")
+
+
+class CanonicalizationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    on_multi_think: Literal["error", "first_only", "warn_first_only"] = "error"
+    inline_reasoning_mode: Literal["disabled", "think_tags"] = "disabled"
 
 
 class PipelineConfig(BaseModel):
@@ -96,12 +237,20 @@ class PipelineConfig(BaseModel):
     """Path to the student model configuration file."""
 
 
+    # Dataset format
+    dataset_format: str = Field("auto", description="Named strategy for converting raw dataset rows to canonical messages. 'auto' detects from row keys (openai/sharegpt/alpaca/completion). See classes/dataset_formats.py for the full registry. {string}")
+    """Named dataset-format strategy. See classes/dataset_formats.py."""
+
+
     # General model settings
-    save_roles: List[str] = Field(default_factory=lambda: ["assistant"], description="List of roles to save in the dataset. If empty, all roles will be saved. {string list}")
-    """List of roles to save in the dataset. If empty, all roles will be saved."""
+    save_roles: List[str] = Field(default_factory=lambda: ["assistant"], description="List of roles to save into the hdf5 dataset. If empty, all roles will be saved. {string list}")
+    """List of roles to save into the hdf5 dataset. If empty, all roles will be saved."""
     
     auto_approve: bool = Field(False, description="Skip interactive confirmation prompts for dataset modifications (deletions, renames). Warnings are still printed. {bool}")
     """When True, dataset sync operations proceed without waiting for user input. Warnings are still printed."""
+
+    canonicalization: CanonicalizationConfig = Field(default_factory=CanonicalizationConfig, description="Canonicalization options applied at dataset load.")
+    """Canonicalization options applied at dataset load."""
 
 
     # Collection settings
@@ -159,7 +308,18 @@ class PipelineConfig(BaseModel):
     """Loss function type."""
 
     entropy_weighting: bool = Field(False, description="Scale per-position loss by teacher distribution entropy. Downweights sparse tokenizer-artifact positions. {bool}")
-    
+    """Flag to enable entropy weighting of the loss."""
+
+    # v8 event channel (plan §9, §12)
+    lambda_event: float = Field(0.0, ge=0, description="Global weight for the event-channel loss. 0 disables the event arm entirely. {float}")
+    """Global weight for the event-channel loss (plan v8)."""
+
+    event_loss: Literal["jsd", "kl_fwd", "kl_rev", "hellinger"] = Field("jsd", description="Divergence function applied on the |E|-event simplex. {string}")
+    """Divergence function applied on the event simplex."""
+
+    event_extensions: List[str] = Field(default_factory=list, description="Named event-vocab extensions appended after the 15-slot core. Empty = core-only. {list[string]}")
+    """Named event-vocab extensions (plan v8 §2)."""
+
     lr_scheduler: str = Field("wsd", description="Learning rate scheduler name. {string}")
     """Name of the learning rate scheduler to use."""
     
@@ -181,7 +341,7 @@ class PipelineConfig(BaseModel):
     train_on: str | list[str] = Field("all", description="Which teacher(s) to train on. 'all' = use all available teachers (single teacher trains directly, multiple merges with per-teacher weights). Can be a specific teacher name, or a list of teacher names to merge a subset. {string | list[string]}")
     """Which teacher(s) to train on."""
     
-    training_strategy: Literal["ddp", "fsdp2", "naive", "naive_layer_split"] = Field("ddp", description="Training parallelism strategy. Options: 'ddp', 'fsdp2', 'naive'/'naive_layer_split'. {string}")
+    training_strategy: Literal["ddp", "fsdp2", "naive", "naive_layer_split"] = Field("naive", description="Training parallelism strategy. Options: 'ddp', 'fsdp2', 'naive'/'naive_layer_split'. {string}")
     """Training parallelism strategy."""
 
 
@@ -203,7 +363,6 @@ class PipelineConfig(BaseModel):
     
     keep_last_n_checkpoints: Optional[int] = Field(None, ge=1, description="Number of most recent checkpoints to keep. Older checkpoints will be deleted. Set to None to keep all checkpoints. {int}")
     """Number of most recent checkpoints to keep."""
-
 
     # Multi-GPU / device settings
     num_gpu0_layers: Optional[int] = Field(None, ge=0, description="Number of layers for GPU 0. Required when device_map = \"custom\". {int}")
@@ -234,6 +393,13 @@ class PipelineConfig(BaseModel):
     def normalize_training_strategy(cls, v):
         if v == "naive":
             return "naive_layer_split"
+        return v
+
+    @field_validator('dataset_format')
+    def validate_dataset_format(cls, v):
+        from classes.dataset_formats import REGISTRY
+        if v != "auto" and v not in REGISTRY:
+            raise ValueError(f"Unknown dataset_format {v!r}. Available: {sorted(REGISTRY)} or 'auto'.")
         return v
 
     @field_validator('train_on', mode='before')
@@ -329,7 +495,7 @@ def merge_config(cli_args: dict, config: dict) -> dict:
     return merged
 
 
-def _suggest_typos(error: Exception, valid_fields: set[str]) -> str:
+def _suggest_typos(error: ValidationError, valid_fields: set[str]) -> str:
     import difflib
     messages = []
     for e in error.errors():
@@ -375,13 +541,15 @@ def get_config(config_path=None) -> tuple[PipelineConfig, bool, bool, bool]:
     merged_params = merge_config(cli_args, toml_config)
     try:
         return PipelineConfig(**merged_params), validate_only, collect_only, train_only
-    except Exception as e:
-        if hasattr(e, 'errors'):
-            suggestions = _suggest_typos(e, set(PipelineConfig.model_fields))
-            if suggestions:
-                print(f"\nConfig errors:\n{suggestions}")
-                sys.exit(1)
+    except ValidationError as e:
+        suggestions = _suggest_typos(e, set(PipelineConfig.model_fields))
+        if suggestions:
+            print(f"\nConfig errors:\n{suggestions}")
+            sys.exit(1)
         raise
+
+
+_NON_BACKEND_KEYS = {"segments", "tokenizer_kwargs"}
 
 
 def _parse_teacher_toml(raw: dict, filename: str) -> TeacherConfig:
@@ -389,7 +557,7 @@ def _parse_teacher_toml(raw: dict, filename: str) -> TeacherConfig:
     backend_params = {}
     core_params = {}
     for k, v in raw.items():
-        if isinstance(v, dict):
+        if isinstance(v, dict) and k not in _NON_BACKEND_KEYS:
             if backend_type is not None:
                 raise ValueError(f"Teacher config {filename} has multiple backend sections: {backend_type}, {k}")
             backend_type = k
@@ -435,7 +603,8 @@ def load_student_config(config_path: str) -> StudentConfig:
             raise ValueError(f"Multiple TOML config files found in {config_path}: {toml_files}\nStudent config path must point to a single config file, or a directory containing exactly one.")
         config_path = os.path.join(config_path, toml_files[0])
 
-    return StudentConfig(**load_config(config_path))
+    raw = load_config(config_path)
+    return StudentConfig(**raw)
 
 
 if __name__ == '__main__':

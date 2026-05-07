@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Pipeline Config — ALL parameters with defaults and explanations
+# Pipeline Config - ALL parameters with defaults and explanations
 # ─────────────────────────────────────────────────────────────────────────────
 # Copy this file to config.toml in the project root and adjust to your setup.
 
@@ -21,6 +21,12 @@ teacher_configs_path = "teacher_configs"
 
 # Path to the student model TOML config file.
 student_config_path = "student_configs/your_student.toml"
+
+# Dataset format strategy. "auto" detects from row keys (handles openai/sharegpt/
+# alpaca/completion/instruction_response/query_answer/dolly). For agentic data
+# (tool_calls, reasoning), pick a strategy explicitly: "hermes_inline",
+# "per_block_roles", "nemotron_post_training". See DATASET_FORMAT.md.
+dataset_format = "auto"
 
 
 # ── General ──────────────────────────────────────────────────────────────────
@@ -49,7 +55,7 @@ grad_accum_batches = 2          # effective batch = batch_size * grad_accum_batc
 grad_checkpointing = true       # trade compute for VRAM (almost always worth it)
 max_grad_norm = 1.0             # gradient clipping norm (0 = disabled)
 
-# torch.compile — faster training after first compilation. Leave false initially.
+# torch.compile - faster training after first compilation. Leave false initially.
 torch_compile = false
 torch_compile_mode = "default"              # "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs"
 torch_compile_backend = "inductor"          # "inductor" | "cudagraphs" | "aot_eager" | "eager"
@@ -92,9 +98,9 @@ data_order = "random"
 training_precision = "bf16"
 
 # Which teacher(s) to train on.
-#   "all"           — single teacher trains directly, multiple merges with per-teacher weights
-#   "teacher_name"  — use a specific teacher only
-#   ["t1", "t2"]    — merge a subset of teachers
+#   "all"           - single teacher trains directly, multiple merges with per-teacher weights
+#   "teacher_name"  - use a specific teacher only
+#   ["t1", "t2"]    - merge a subset of teachers
 train_on = "all"
 
 # Multi-GPU training strategy: "ddp" | "fsdp2" | "naive_layer_split" | "naive"

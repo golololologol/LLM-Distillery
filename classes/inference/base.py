@@ -2,6 +2,7 @@ import importlib
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
+from collections.abc import Callable
 
 from classes.data_classes import ConvoProcessed
 
@@ -48,14 +49,14 @@ def get_available_backends() -> list[str]:
 
 class InferenceBackend(ABC):
     @abstractmethod
-    def start(self, dm_queue) -> None:
+    def start(self, distribution_writer) -> None:
         """Load model onto GPU, prepare for inference."""
 
     @abstractmethod
     def process_chunk(
         self,
         samples: list[ConvoProcessed],
-        progress_callback: callable = None,
+        progress_callback: Callable[[int], None] | None = None,
     ) -> None:
         """Process all samples and write results to data_manager. Blocks until done."""
 

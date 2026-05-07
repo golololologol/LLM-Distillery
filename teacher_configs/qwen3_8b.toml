@@ -1,11 +1,14 @@
 model_path = "TheMelonGod/Qwen3-8B-exl2:8hb-6.0bpw"
-context_len = 2048
+context_len = 4096
 temperature = 2
 merge_weight = 1.0
+supports_reasoning = false
+supports_tool_calls = false
+inherit_specials = "qwen_chatml"
 
 [exllamav2]
 reserve_vram = [2.5, 0.5]
-batch_size = 4
-seq_chunk_len = 2048
+batch_size = 2
+seq_chunk_len = 4096
 num_inference_workers = 2
 one_worker_per_gpu = true

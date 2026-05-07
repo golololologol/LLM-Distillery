@@ -28,30 +28,37 @@ from kernels.losses.hellinger import (
 def fused_train_forward_backward(logits, token_ids, byte_vocab, teacher_dists_flat, actual_bytes_flat,
                                   teacher_offsets, target_byte_lens, alpha, loss_type, **kwargs):
     entropy_weighting = kwargs.pop("entropy_weighting", False)
+    byte_mask = kwargs.pop("byte_mask", None)
     if loss_type == "skew_kl":
         return fused_train_forward_backward_skew_kl(
             logits, token_ids, byte_vocab, teacher_dists_flat, actual_bytes_flat,
-            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting, **kwargs)
+            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting,
+            byte_mask=byte_mask, **kwargs)
     if loss_type == "akl":
         return fused_train_forward_backward_akl(
             logits, token_ids, byte_vocab, teacher_dists_flat, actual_bytes_flat,
-            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting)
+            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting,
+            byte_mask=byte_mask)
     if loss_type == "abomination":
         return fused_train_forward_backward_abomination(
             logits, token_ids, byte_vocab, teacher_dists_flat, actual_bytes_flat,
-            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting)
+            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting,
+            byte_mask=byte_mask)
     if loss_type == "wasserstein":
         return fused_train_forward_backward_wasserstein(
             logits, token_ids, byte_vocab, teacher_dists_flat, actual_bytes_flat,
-            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting)
+            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting,
+            byte_mask=byte_mask)
     if loss_type == "jsd":
         return fused_train_forward_backward_jsd(
             logits, token_ids, byte_vocab, teacher_dists_flat, actual_bytes_flat,
-            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting)
+            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting,
+            byte_mask=byte_mask)
     if loss_type == "hellinger":
         return fused_train_forward_backward_hellinger(
             logits, token_ids, byte_vocab, teacher_dists_flat, actual_bytes_flat,
-            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting)
+            teacher_offsets, target_byte_lens, alpha, entropy_weighting=entropy_weighting,
+            byte_mask=byte_mask)
     return None, None
 
 

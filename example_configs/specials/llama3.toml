@@ -1,0 +1,6 @@
+# Llama 3.x family.
+# Plan v8 §3.
+[specials]
+E_END_TURN          = ["<|eot_id|>"]
+E_END_MESSAGE       = ["<|eom_id|>"]
+E_BEGIN_TOOL_CALL   = ["<|python_tag|>"]

@@ -1,5 +1,16 @@
 import torch
+from typing import Protocol, cast
 from kernels.compiler import _compile_kernel, _compile_kernel_with_header, _cuda_available
+
+
+class _AbominationKernel(Protocol):
+    def abomination_pass1(self, *args: object) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+    def abomination_pass2(self, *args: object) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+
+class _FusedTrainAbominationKernel(Protocol):
+    def fused_train_abomination_pass1(self, *args: object) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+    def fused_train_abomination_pass2(self, *args: object) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
 
 _TRAINING_ABOMINATION_CUDA = r"""
@@ -18,14 +29,14 @@ __global__ void abomination_pass1_kernel(
     int N
 ) {
     const int pos = blockIdx.x;
-    const int b = threadIdx.x;
-    if (pos >= N || b >= 256) return;
+    const int byte_idx = threadIdx.x;
+    if (pos >= N || byte_idx >= 256) return;
 
     const float eps = 1e-8f;
     const int base = pos * 256;
 
-    float S = student[base + b];
-    float T = teacher[base + b];
+    float S = student[base + byte_idx];
+    float T = teacher[base + byte_idx];
     float log_S = logf(S + eps);
     float log_T = logf(T + eps);
 
@@ -35,12 +46,12 @@ __global__ void abomination_pass1_kernel(
     float fwd_sum = blockReduceSum(fwd_b);
     float rev_sum = blockReduceSum(rev_b);
 
-    if (b == 0) {
+    if (byte_idx == 0) {
         fwd_kl[pos] = fwd_sum;
         rev_kl[pos] = rev_sum;
-        int ab = actual_bytes[pos];
-        student_ce[pos] = -logf(student[base + ab] + eps);
-        teacher_ce[pos] = -logf(teacher[base + ab] + eps);
+        int actual_byte = actual_bytes[pos];
+        student_ce[pos] = -logf(student[base + actual_byte] + eps);
+        teacher_ce[pos] = -logf(teacher[base + actual_byte] + eps);
     }
 }
 
@@ -61,8 +72,8 @@ __global__ void abomination_pass2_kernel(
     float alpha
 ) {
     const int pos = blockIdx.x;
-    const int b = threadIdx.x;
-    if (pos >= N || b >= 256) return;
+    const int byte_idx = threadIdx.x;
+    if (pos >= N || byte_idx >= 256) return;
 
     const float eps = 1e-8f;
     const float inv_2N = 1.0f / (2.0f * (float)N);
@@ -74,8 +85,8 @@ __global__ void abomination_pass2_kernel(
     float cdg_i = ce_diff_grad[pos];
     int actual_b = actual_bytes[pos];
 
-    float S = student[base + b];
-    float T_val = teacher[base + b];
+    float S = student[base + byte_idx];
+    float T_val = teacher[base + byte_idx];
     float S_eps = S + eps;
     float log_S = logf(S_eps);
     float log_T = logf(T_val + eps);
@@ -85,7 +96,7 @@ __global__ void abomination_pass2_kernel(
     float w_F = powf(ratio_F, alpha) + cd_i;
     float w_R = powf(ratio_R, alpha) + cd_i;
 
-    if (b == 0) {
+    if (byte_idx == 0) {
         weighted_fwd[pos] = F_i * w_F;
         weighted_rev[pos] = R_i * w_R;
     }
@@ -101,11 +112,11 @@ __global__ void abomination_pass2_kernel(
         dRdS * (w_R + R_i * pw_R)
     );
 
-    if (b == actual_b && cd_i < 5.0f) {
+    if (byte_idx == actual_b && cd_i < 5.0f) {
         grad += inv_2N * (F_i + R_i) * cdg_i * (-1.0f / S_eps);
     }
 
-    grad_student[base + b] = grad;
+    grad_student[base + byte_idx] = grad;
 }
 
 std::vector<torch::Tensor> abomination_pass1(
@@ -150,8 +161,8 @@ std::vector<torch::Tensor> abomination_pass2(
     int N = student.size(0);
     auto opts = torch::TensorOptions().dtype(torch::kFloat32).device(student.device());
     auto grad_student = torch::empty({N, 256}, opts);
-    auto w_fwd = torch::empty({N}, opts);
-    auto w_rev = torch::empty({N}, opts);
+    auto weighted_fkl = torch::empty({N}, opts);
+    auto weighted_rkl = torch::empty({N}, opts);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
     abomination_pass2_kernel<<<N, 256, 0, stream>>>(
@@ -165,13 +176,13 @@ std::vector<torch::Tensor> abomination_pass2(
         fwd_kl_mean,
         rev_kl_mean,
         grad_student.data_ptr<float>(),
-        w_fwd.data_ptr<float>(),
-        w_rev.data_ptr<float>(),
+        weighted_fkl.data_ptr<float>(),
+        weighted_rkl.data_ptr<float>(),
         N,
         alpha
     );
 
-    return {grad_student, w_fwd, w_rev};
+    return {grad_student, weighted_fkl, weighted_rkl};
 }
 """
 
@@ -196,15 +207,16 @@ std::vector<torch::Tensor> abomination_pass2(
 """
 
 
-def get_abomination_kernel():
+def get_abomination_kernel() -> _AbominationKernel | None:
     if not _cuda_available:
         return None
-    return _compile_kernel_with_header(
+    kernel = _compile_kernel_with_header(
         "fused_abomination",
         _TRAINING_ABOMINATION_CPP,
         _TRAINING_ABOMINATION_CUDA,
         ["abomination_pass1", "abomination_pass2"],
     )
+    return None if kernel is None else cast(_AbominationKernel, kernel)
 
 
 def fused_abomination_forward_backward(student_dists, teacher_dists, actual_bytes, alpha, entropy_weights=None):
@@ -212,11 +224,11 @@ def fused_abomination_forward_backward(student_dists, teacher_dists, actual_byte
     if kernel is None:
         return None, None
 
-    s = student_dists.float().contiguous()
-    t = teacher_dists.float().contiguous()
-    ab = actual_bytes.int().contiguous()
+    student = student_dists.float().contiguous()
+    teacher = teacher_dists.float().contiguous()
+    actual_bytes_t = actual_bytes.int().contiguous()
 
-    fwd_kl, rev_kl, student_ce, teacher_ce = kernel.abomination_pass1(s, t, ab)
+    fwd_kl, rev_kl, student_ce, teacher_ce = kernel.abomination_pass1(student, teacher, actual_bytes_t)
 
     eps = 1e-8
     fwd_kl_mean = fwd_kl.mean().clamp(min=eps).item()
@@ -226,7 +238,7 @@ def fused_abomination_forward_backward(student_dists, teacher_dists, actual_byte
     ce_diff_grad = torch.sigmoid(5.0 * raw_diff)
 
     grad_student, weighted_fwd_per, weighted_rev_per = kernel.abomination_pass2(
-        s, t, ab, fwd_kl, rev_kl, ce_diff, ce_diff_grad, fwd_kl_mean, rev_kl_mean, alpha
+        student, teacher, actual_bytes_t, fwd_kl, rev_kl, ce_diff, ce_diff_grad, fwd_kl_mean, rev_kl_mean, alpha
     )
 
     if entropy_weights is not None:
@@ -270,12 +282,30 @@ __device__ void process_depth_abomination_pass1(
     float* bins, float Z,
     const float* teacher_src, float* teacher_row, float* reduce_buf,
     int dist_idx, const int* actual_bytes,
+    const uint8_t* byte_mask,
     float* fwd_kl_out, float* rev_kl_out, float* ce_out, float* tce_out,
     float* bins_global_out, float* Z_out,
     float* teacher_entropy_out,
     int tid
 ) {
     const float eps = 1e-8f;
+
+    if (byte_mask[dist_idx] == 0) {
+        if (tid == 0) {
+            fwd_kl_out[dist_idx] = 0.0f;
+            rev_kl_out[dist_idx] = 0.0f;
+            ce_out[dist_idx] = 0.0f;
+            tce_out[dist_idx] = 0.0f;
+            Z_out[dist_idx] = 1.0f;
+            teacher_entropy_out[dist_idx] = 0.0f;
+        }
+        if (tid < 256) {
+            bins[tid] = 0.0f;
+            bins_global_out[(long long)dist_idx * 256 + tid] = 0.0f;
+        }
+        __syncthreads();
+        return;
+    }
 
     if (tid < 256) {
         bins[tid] /= Z;
@@ -327,6 +357,7 @@ __device__ void process_depth_abomination_pass2(
     const float* bins_global_in, float Z,
     const float* teacher_src, float* teacher_row, float* reduce_buf,
     int dist_idx, const int* actual_bytes,
+    const uint8_t* byte_mask,
     const float* fwd_kl, const float* rev_kl, const float* ce_diff_arr,
     const float* ce_diff_grad_arr,
     float fwd_kl_mean, float rev_kl_mean,
@@ -334,6 +365,16 @@ __device__ void process_depth_abomination_pass2(
     float alpha, float inv_2N, int tid
 ) {
     const float eps = 1e-8f;
+
+    if (byte_mask[dist_idx] == 0) {
+        if (tid == 0) {
+            weighted_fwd[dist_idx] = 0.0f;
+            weighted_rev[dist_idx] = 0.0f;
+        }
+        if (tid < 256) bins[tid] = 0.0f;
+        __syncthreads();
+        return;
+    }
 
     float S = 0.0f;
     if (tid < 256) {
@@ -407,6 +448,7 @@ void fused_train_abomination_pass1_kernel(
     const float* __restrict__ teacher_dists,
     const int* __restrict__ teacher_offsets,
     const int* __restrict__ actual_bytes,
+    const uint8_t* __restrict__ byte_mask,
     float* __restrict__ fwd_kl_out,
     float* __restrict__ rev_kl_out,
     float* __restrict__ ce_out,
@@ -528,18 +570,18 @@ void fused_train_abomination_pass1_kernel(
 
     // ============ PASS 3: Forward metrics per depth ============
     process_depth_abomination_pass1(d0_bins, Z0, teacher_dists + (long long)my_offset * 256,
-        teacher_row, reduce_buf, my_offset, actual_bytes,
+        teacher_row, reduce_buf, my_offset, actual_bytes, byte_mask,
         fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, teacher_entropy_out, tid);
 
     if (my_num_depths >= 2) {
         process_depth_abomination_pass1(d1_bins, Z1, teacher_dists + ((long long)my_offset + 1) * 256,
-            teacher_row, reduce_buf, my_offset + 1, actual_bytes,
+            teacher_row, reduce_buf, my_offset + 1, actual_bytes, byte_mask,
             fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, teacher_entropy_out, tid);
     }
 
     if (my_num_depths >= 3) {
         process_depth_abomination_pass1(d2_bins, Z2, teacher_dists + ((long long)my_offset + 2) * 256,
-            teacher_row, reduce_buf, my_offset + 2, actual_bytes,
+            teacher_row, reduce_buf, my_offset + 2, actual_bytes, byte_mask,
             fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, teacher_entropy_out, tid);
     }
 
@@ -571,7 +613,7 @@ void fused_train_abomination_pass1_kernel(
         __syncthreads(); Zx = reduce_buf[0]; __syncthreads();
 
         process_depth_abomination_pass1(extra_bins, Zx, teacher_dists + ((long long)my_offset + dep) * 256,
-            teacher_row, reduce_buf, my_offset + dep, actual_bytes,
+            teacher_row, reduce_buf, my_offset + dep, actual_bytes, byte_mask,
             fwd_kl_out, rev_kl_out, ce_out, tce_out, bins_out, Z_out, teacher_entropy_out, tid);
     }
 }
@@ -589,6 +631,7 @@ void fused_train_abomination_pass2_kernel(
     const float* __restrict__ teacher_dists,
     const int* __restrict__ teacher_offsets,
     const int* __restrict__ actual_bytes,
+    const uint8_t* __restrict__ byte_mask,
     const float* __restrict__ bins_in,
     const float* __restrict__ Z_in,
     const float* __restrict__ fwd_kl,
@@ -604,7 +647,8 @@ void fused_train_abomination_pass2_kernel(
     float* __restrict__ weighted_fwd_out,
     float* __restrict__ weighted_rev_out,
     float* __restrict__ grad_unnorm_extra,
-    int V, int max_byte_len, int N_total, int max_extra
+    int V, int max_byte_len, int N_total, int max_extra,
+    int n_active
 ) {
     const int t = blockIdx.x;
     const int tid = threadIdx.x;
@@ -633,7 +677,7 @@ void fused_train_abomination_pass2_kernel(
     float global_sum = softmax_sum_in[t];
     float logsumexp = global_max + logf(global_sum);
 
-    const float inv_2N = 1.0f / (2.0f * (float)N_total);
+    const float inv_2N = 1.0f / (2.0f * (float)n_active);
 
     // Initialize bins to zero (unused depths stay zero for pass 4)
     if (tid < 256) {
@@ -646,7 +690,7 @@ void fused_train_abomination_pass2_kernel(
     // ============ Process each depth: compute grad_unnorm ============
     process_depth_abomination_pass2(d0_bins, bins_in, Z_in[my_offset],
         teacher_dists + (long long)my_offset * 256,
-        teacher_row, reduce_buf, my_offset, actual_bytes,
+        teacher_row, reduce_buf, my_offset, actual_bytes, byte_mask,
         fwd_kl, rev_kl, ce_diff_arr, ce_diff_grad_arr, fwd_kl_mean, rev_kl_mean,
         weighted_fwd_out, weighted_rev_out,
         alpha, inv_2N, tid);
@@ -654,7 +698,7 @@ void fused_train_abomination_pass2_kernel(
     if (my_num_depths >= 2) {
         process_depth_abomination_pass2(d1_bins, bins_in, Z_in[my_offset + 1],
             teacher_dists + ((long long)my_offset + 1) * 256,
-            teacher_row, reduce_buf, my_offset + 1, actual_bytes,
+            teacher_row, reduce_buf, my_offset + 1, actual_bytes, byte_mask,
             fwd_kl, rev_kl, ce_diff_arr, ce_diff_grad_arr, fwd_kl_mean, rev_kl_mean,
             weighted_fwd_out, weighted_rev_out,
             alpha, inv_2N, tid);
@@ -663,7 +707,7 @@ void fused_train_abomination_pass2_kernel(
     if (my_num_depths >= 3) {
         process_depth_abomination_pass2(d2_bins, bins_in, Z_in[my_offset + 2],
             teacher_dists + ((long long)my_offset + 2) * 256,
-            teacher_row, reduce_buf, my_offset + 2, actual_bytes,
+            teacher_row, reduce_buf, my_offset + 2, actual_bytes, byte_mask,
             fwd_kl, rev_kl, ce_diff_arr, ce_diff_grad_arr, fwd_kl_mean, rev_kl_mean,
             weighted_fwd_out, weighted_rev_out,
             alpha, inv_2N, tid);
@@ -672,7 +716,7 @@ void fused_train_abomination_pass2_kernel(
     for (int dep = 3; dep < my_num_depths; dep++) {
         process_depth_abomination_pass2(extra_bins, bins_in, Z_in[my_offset + dep],
             teacher_dists + ((long long)my_offset + dep) * 256,
-            teacher_row, reduce_buf, my_offset + dep, actual_bytes,
+            teacher_row, reduce_buf, my_offset + dep, actual_bytes, byte_mask,
             fwd_kl, rev_kl, ce_diff_arr, ce_diff_grad_arr, fwd_kl_mean, rev_kl_mean,
             weighted_fwd_out, weighted_rev_out,
             alpha, inv_2N, tid);
@@ -760,6 +804,7 @@ std::vector<torch::Tensor> fused_train_abomination_pass1(
     torch::Tensor teacher_dists,
     torch::Tensor teacher_offsets,
     torch::Tensor actual_bytes,
+    torch::Tensor byte_mask,
     int N_total
 ) {
     const int T1 = logits.size(0);
@@ -793,6 +838,7 @@ std::vector<torch::Tensor> fused_train_abomination_pass1(
         teacher_dists.data_ptr<float>(),
         teacher_offsets.data_ptr<int>(),
         actual_bytes.data_ptr<int>(),
+        byte_mask.data_ptr<uint8_t>(),
         fwd_kl_out.data_ptr<float>(),
         rev_kl_out.data_ptr<float>(),
         ce_out.data_ptr<float>(),
@@ -820,6 +866,7 @@ std::vector<torch::Tensor> fused_train_abomination_pass2(
     torch::Tensor teacher_dists,
     torch::Tensor teacher_offsets,
     torch::Tensor actual_bytes,
+    torch::Tensor byte_mask,
     torch::Tensor bins_in,
     torch::Tensor Z_in,
     torch::Tensor fwd_kl,
@@ -831,6 +878,7 @@ std::vector<torch::Tensor> fused_train_abomination_pass2(
     float fwd_kl_mean,
     float rev_kl_mean,
     int N_total,
+    int n_active,
     float alpha
 ) {
     const int T1 = logits.size(0);
@@ -863,6 +911,7 @@ std::vector<torch::Tensor> fused_train_abomination_pass2(
         teacher_dists.data_ptr<float>(),
         teacher_offsets.data_ptr<int>(),
         actual_bytes.data_ptr<int>(),
+        byte_mask.data_ptr<uint8_t>(),
         bins_in.data_ptr<float>(),
         Z_in.data_ptr<float>(),
         fwd_kl.data_ptr<float>(),
@@ -878,7 +927,8 @@ std::vector<torch::Tensor> fused_train_abomination_pass2(
         weighted_fwd.data_ptr<float>(),
         weighted_rev.data_ptr<float>(),
         grad_extra.data_ptr<float>(),
-        V, max_byte_len, N_total, max_extra
+        V, max_byte_len, N_total, max_extra,
+        n_active
     );
 
     return {grad_logits, weighted_fwd, weighted_rev};
@@ -899,6 +949,7 @@ std::vector<torch::Tensor> fused_train_abomination_pass1(
     torch::Tensor teacher_dists,
     torch::Tensor teacher_offsets,
     torch::Tensor actual_bytes,
+    torch::Tensor byte_mask,
     int N_total
 );
 std::vector<torch::Tensor> fused_train_abomination_pass2(
@@ -913,6 +964,7 @@ std::vector<torch::Tensor> fused_train_abomination_pass2(
     torch::Tensor teacher_dists,
     torch::Tensor teacher_offsets,
     torch::Tensor actual_bytes,
+    torch::Tensor byte_mask,
     torch::Tensor bins_in,
     torch::Tensor Z_in,
     torch::Tensor fwd_kl,
@@ -924,26 +976,29 @@ std::vector<torch::Tensor> fused_train_abomination_pass2(
     float fwd_kl_mean,
     float rev_kl_mean,
     int N_total,
+    int n_active,
     float alpha
 );
 """
 
 
-def get_fused_train_abomination_kernel():
+def get_fused_train_abomination_kernel() -> _FusedTrainAbominationKernel | None:
     if not _cuda_available:
         return None
-    return _compile_kernel_with_header(
+    kernel = _compile_kernel_with_header(
         "fused_train_abomination",
         _FUSED_TRAIN_ABOMINATION_CPP,
         _FUSED_TRAIN_ABOMINATION_CUDA,
         ["fused_train_abomination_pass1", "fused_train_abomination_pass2"],
     )
+    return None if kernel is None else cast(_FusedTrainAbominationKernel, kernel)
 
 
 
 def fused_train_forward_backward_abomination(logits, token_ids, byte_vocab, teacher_dists_flat,
                                               actual_bytes_flat, teacher_offsets,
-                                              target_byte_lens, alpha, entropy_weighting=False):
+                                              target_byte_lens, alpha, entropy_weighting=False,
+                                              byte_mask=None):
     kernel = get_fused_train_abomination_kernel()
     if kernel is None:
         return None, None
@@ -955,6 +1010,15 @@ def fused_train_forward_backward_abomination(logits, token_ids, byte_vocab, teac
     next_byte_lens = byte_vocab.token_byte_lens[next_tokens]
     next_byte_seqs = byte_vocab.token_byte_seqs[next_tokens]
     N_total = int(teacher_offsets[-1].item()) + int(target_byte_lens[-1].item())
+
+    if byte_mask is None:
+        byte_mask = torch.ones(N_total, dtype=torch.uint8, device=logits.device)
+        n_active = N_total
+    else:
+        byte_mask = byte_mask.to(torch.uint8).contiguous()
+        n_active = int(byte_mask.sum().item())
+    if n_active == 0:
+        return None, None
 
     logits_h = logits[:T1].half().contiguous()
     fb = byte_vocab.first_bytes_i32.contiguous()
@@ -970,27 +1034,28 @@ def fused_train_forward_backward_abomination(logits, token_ids, byte_vocab, teac
 
     # Two-pass approach to avoid inter-block sync deadlock when T1 > max concurrent blocks
     pass1_results = kernel.fused_train_abomination_pass1(
-        logits_h, fb, sb, tb, bl, tbs, nbs, nbl, td, to_, ab, N_total,
+        logits_h, fb, sb, tb, bl, tbs, nbs, nbl, td, to_, ab, byte_mask, N_total,
     )
     fwd_kl, rev_kl, ce, tce, bins, Z_vals, softmax_max, softmax_sum, teacher_entropy = pass1_results
 
     eps = 1e-8
-    fwd_kl_mean = fwd_kl.mean().clamp(min=eps).item()
-    rev_kl_mean = rev_kl.mean().clamp(min=eps).item()
+    fwd_kl_mean = (fwd_kl.sum() / n_active).clamp(min=eps).item()
+    rev_kl_mean = (rev_kl.sum() / n_active).clamp(min=eps).item()
     raw_diff = ce - tce
     ce_diff = torch.nn.functional.softplus(raw_diff, beta=5.0).clamp(max=5.0)
     ce_diff_grad = torch.sigmoid(5.0 * raw_diff)
 
     pass2_results = kernel.fused_train_abomination_pass2(
-        logits_h, fb, sb, tb, bl, tbs, nbs, nbl, td, to_, ab,
+        logits_h, fb, sb, tb, bl, tbs, nbs, nbl, td, to_, ab, byte_mask,
         bins, Z_vals, fwd_kl, rev_kl, ce_diff, ce_diff_grad,
         softmax_max, softmax_sum,
-        fwd_kl_mean, rev_kl_mean, N_total, alpha,
+        fwd_kl_mean, rev_kl_mean, N_total, n_active, alpha,
     )
     grad_logits, weighted_fwd_per, weighted_rev_per = pass2_results
 
     if entropy_weighting:
         ew = teacher_entropy / 5.545177  # normalize by log(256)
+        ew = ew * byte_mask.float()
 
         ew_sum = ew.sum().clamp(min=1e-8)
         weighted_fwd = (weighted_fwd_per * ew).sum() / ew_sum
@@ -1008,19 +1073,19 @@ def fused_train_forward_backward_abomination(logits, token_ids, byte_vocab, teac
         grad_scale = ew_per_token * T1 / ew_token_sum
         grad_logits = grad_logits * grad_scale.unsqueeze(1)
     else:
-        weighted_fwd = weighted_fwd_per.mean()
-        weighted_rev = weighted_rev_per.mean()
+        weighted_fwd = weighted_fwd_per.sum() / n_active
+        weighted_rev = weighted_rev_per.sum() / n_active
 
     total_loss = (weighted_fwd + weighted_rev) / 2
 
     return grad_logits, {
         "train_loss": total_loss,
         "custom loss": total_loss,
-        "CE loss": ce.mean().detach(),
-        "kl_div": fwd_kl.mean().detach(),
-        "reverse kl_div": rev_kl.mean().detach(),
+        "CE loss": (ce.sum() / n_active).detach(),
+        "kl_div": (fwd_kl.sum() / n_active).detach(),
+        "reverse kl_div": (rev_kl.sum() / n_active).detach(),
         "weighted kl_div": weighted_fwd.detach(),
         "weighted rev. kl_div": weighted_rev.detach(),
-        "teacher CE loss": tce.mean().detach(),
-        "CE diff": ce_diff.mean().detach(),
+        "teacher CE loss": (tce.sum() / n_active).detach(),
+        "CE diff": (ce_diff.sum() / n_active).detach(),
     }

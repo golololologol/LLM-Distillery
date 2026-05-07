@@ -39,7 +39,7 @@ def run_parity(bv, loss_type):
     logits, token_ids, td, ab, offsets, nbl = make_data(bv, 8)
     g, l = fused_train_forward_backward(logits, token_ids, bv, td, ab, offsets, nbl, 0.1, loss_type)
     torch.cuda.synchronize()
-    if g is None:
+    if g is None or l is None:
         print("Kernel compilation failed")
         return 2
 
@@ -47,6 +47,7 @@ def run_parity(bv, loss_type):
     student = bv.marginalize_train(logits_ref, token_ids, T_CHUNK=512)
     ref_loss = loss_fn(student, td, ab, 0.1)
     ref_loss["train_loss"].backward()
+    assert logits_ref.grad is not None
     ref_g = logits_ref.grad.float()[:8]
 
     for key in ["kl_div", "CE loss", "train_loss"]:

@@ -1,0 +1,3 @@
+# HuggingFaceH4 Zephyr β family.
+[specials]
+E_END_TURN          = ["</s>"]

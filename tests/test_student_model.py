@@ -1,5 +1,6 @@
 import sys
 from types import ModuleType, SimpleNamespace
+from typing import Any, cast
 from unittest.mock import MagicMock
 
 import classes.student.model as student_model_module
@@ -46,8 +47,8 @@ def _make_loader(name):
 def _install_fake_liger(monkeypatch, liger_loader):
     liger_module = ModuleType("liger_kernel")
     liger_transformers = ModuleType("liger_kernel.transformers")
-    liger_transformers.AutoLigerKernelForCausalLM = liger_loader
-    liger_module.transformers = liger_transformers
+    setattr(liger_transformers, "AutoLigerKernelForCausalLM", liger_loader)
+    setattr(liger_module, "transformers", liger_transformers)
     monkeypatch.setitem(sys.modules, "liger_kernel", liger_module)
     monkeypatch.setitem(sys.modules, "liger_kernel.transformers", liger_transformers)
 
@@ -74,7 +75,7 @@ def _make_student(**config_overrides):
         freeze_layers=[],
     )
 
-    return StudentModel(config, student_config, SimpleNamespace())
+    return StudentModel(cast(Any, config), cast(Any, student_config), cast(Any, SimpleNamespace()))
 
 
 def test_load_model_uses_liger_with_device_hooks_for_naive_layer_split_multi_gpu(monkeypatch, capsys):

@@ -16,14 +16,17 @@ available samples for packing.
 
 import json
 import os
-from exllamav2 import ExLlamaV2Tokenizer, ExLlamaV2Config
+from exllamav2.config import ExLlamaV2Config
+from exllamav2.tokenizer.tokenizer import ExLlamaV2Tokenizer
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from tqdm import tqdm
 
-def good_encode(id: int, text: str, sp_toks: dict, tokenizer, encode_special=True, replace_tokens=True):
+def good_encode(id: int | None, text: str, sp_toks: dict | None, tokenizer, encode_special=True, replace_tokens=True):
     if replace_tokens:
+        if sp_toks is None:
+            raise ValueError("sp_toks is required when replace_tokens=True")
         text = text.replace('<bos>', sp_toks["bos"]).replace('<eos>', sp_toks["eos"])
 
     if tokenizer.__class__.__name__ != "ExLlamaV2Tokenizer":

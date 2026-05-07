@@ -1,5 +1,14 @@
 import torch
+from typing import Protocol, cast
 from kernels.compiler import _compile_kernel, _compile_kernel_with_header, _cuda_available
+
+
+class _SkewKlKernel(Protocol):
+    def fused_skew_kl(self, *args: object) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+
+class _FusedTrainSkewKlKernel(Protocol):
+    def fused_train_skew_kl(self, *args: object) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
 
 _TRAINING_SKEW_KL_CUDA = r"""
@@ -20,28 +29,28 @@ __global__ void fused_skew_kl_kernel(
     float alpha
 ) {
     const int pos = blockIdx.x;
-    const int b = threadIdx.x;
-    if (pos >= N || b >= 256) return;
+    const int byte_idx = threadIdx.x;
+    if (pos >= N || byte_idx >= 256) return;
 
     const float eps = 1e-8f;
     const float inv_N = 1.0f / (float)N;
     const int base = pos * 256;
 
-    float S = student[base + b];
-    float T_val = teacher[base + b];
+    float S = student[base + byte_idx];
+    float T_val = teacher[base + byte_idx];
     float S_eps = S + eps;
     float mix = (1.0f - lam) * T_val + lam * S;
     float mix_eps = mix + eps;
 
     // Per-byte SRKL contribution
-    float srkl_b = S * (logf(S_eps) - logf(mix_eps));
+    float skew_kl_contrib = S * (logf(S_eps) - logf(mix_eps));
 
     // Block-reduce to get per-position SRKL
-    float srkl_sum = blockReduceSum(srkl_b);
+    float srkl_sum = blockReduceSum(skew_kl_contrib);
 
     int actual_b = actual_bytes[pos];
 
-    if (b == 0) {
+    if (byte_idx == 0) {
         loss_srkl[pos] = srkl_sum;
         loss_ce[pos] = -logf(student[base + actual_b] + eps);
         loss_tce[pos] = -logf(teacher[base + actual_b] + eps);
@@ -51,11 +60,11 @@ __global__ void fused_skew_kl_kernel(
     // d(srkl_i)/d(S_b) = log(S_b+eps) + S_b/(S_b+eps) - log(mix_b+eps) - lam*S_b/(mix_b+eps)
     float grad = inv_N * (logf(S_eps) + S / S_eps - logf(mix_eps) - lam * S / mix_eps);
 
-    if (b == actual_b) {
+    if (byte_idx == actual_b) {
         grad += alpha * inv_N * (-1.0f / S_eps);
     }
 
-    grad_student[base + b] = grad;
+    grad_student[base + byte_idx] = grad;
 }
 
 std::vector<torch::Tensor> fused_skew_kl(
@@ -99,15 +108,16 @@ std::vector<torch::Tensor> fused_skew_kl(
 """
 
 
-def get_skew_kl_kernel():
+def get_skew_kl_kernel() -> _SkewKlKernel | None:
     if not _cuda_available:
         return None
-    return _compile_kernel_with_header(
+    kernel = _compile_kernel_with_header(
         "fused_skew_kl",
         _TRAINING_SKEW_KL_CPP,
         _TRAINING_SKEW_KL_CUDA,
         ["fused_skew_kl"],
     )
+    return None if kernel is None else cast(_SkewKlKernel, kernel)
 
 
 
@@ -163,11 +173,24 @@ __device__ void process_depth_skew_kl(
     float* bins, float Z,
     const float* teacher_src, float* teacher_row, float* reduce_buf,
     int dist_idx, const int* actual_bytes,
+    const uint8_t* byte_mask,
     float* loss_per_dist, float* ce_per_dist, float* tce_per_dist,
     float* teacher_entropy_out,
     float inv_N, float lam, float alpha, int tid
 ) {
     const float eps = 1e-8f;
+
+    if (byte_mask[dist_idx] == 0) {
+        if (tid == 0) {
+            loss_per_dist[dist_idx] = 0.0f;
+            ce_per_dist[dist_idx] = 0.0f;
+            tce_per_dist[dist_idx] = 0.0f;
+            teacher_entropy_out[dist_idx] = 0.0f;
+        }
+        if (tid < 256) bins[tid] = 0.0f;
+        __syncthreads();
+        return;
+    }
 
     // Normalize bins
     if (tid < 256) {
@@ -246,6 +269,7 @@ void fused_train_skew_kl_kernel(
     const float* __restrict__ teacher_dists,      // [N_total, 256]
     const int* __restrict__ teacher_offsets,       // [T1]
     const int* __restrict__ actual_bytes,          // [N_total]
+    const uint8_t* __restrict__ byte_mask,         // [N_total]
     float* __restrict__ grad_logits,              // [T1, V]
     float* __restrict__ loss_per_dist,            // [N_total]
     float* __restrict__ ce_per_dist,              // [N_total]
@@ -253,7 +277,7 @@ void fused_train_skew_kl_kernel(
     float* __restrict__ teacher_entropy_out,      // [N_total]
     float* __restrict__ grad_unnorm_extra,        // [T1, max_extra, 256] for d3+
     int V, int max_byte_len, int N_total, int max_extra,
-    float lam, float alpha
+    float lam, float alpha, int n_active
 ) {
     const int t = blockIdx.x;
     const int tid = threadIdx.x;
@@ -392,24 +416,24 @@ void fused_train_skew_kl_kernel(
     __syncthreads(); Z2 = reduce_buf[0]; __syncthreads();
 
     // ============ PASS 3: Loss + backward per depth ============
-    const float inv_N = 1.0f / (float)N_total;
+    const float inv_N = 1.0f / (float)n_active;
 
     // d0
     process_depth_skew_kl(d0_bins, Z0, teacher_dists + (long long)my_offset * 256,
-        teacher_row, reduce_buf, my_offset, actual_bytes,
+        teacher_row, reduce_buf, my_offset, actual_bytes, byte_mask,
         loss_per_dist, ce_per_dist, tce_per_dist, teacher_entropy_out, inv_N, lam, alpha, tid);
 
     // d1
     if (my_num_depths >= 2) {
         process_depth_skew_kl(d1_bins, Z1, teacher_dists + ((long long)my_offset + 1) * 256,
-            teacher_row, reduce_buf, my_offset + 1, actual_bytes,
+            teacher_row, reduce_buf, my_offset + 1, actual_bytes, byte_mask,
             loss_per_dist, ce_per_dist, tce_per_dist, teacher_entropy_out, inv_N, lam, alpha, tid);
     }
 
     // d2
     if (my_num_depths >= 3) {
         process_depth_skew_kl(d2_bins, Z2, teacher_dists + ((long long)my_offset + 2) * 256,
-            teacher_row, reduce_buf, my_offset + 2, actual_bytes,
+            teacher_row, reduce_buf, my_offset + 2, actual_bytes, byte_mask,
             loss_per_dist, ce_per_dist, tce_per_dist, teacher_entropy_out, inv_N, lam, alpha, tid);
     }
 
@@ -447,7 +471,7 @@ void fused_train_skew_kl_kernel(
 
         // Process loss + backward, writes grad_unnorm into extra_bins
         process_depth_skew_kl(extra_bins, Zx, teacher_dists + ((long long)my_offset + dep) * 256,
-            teacher_row, reduce_buf, my_offset + dep, actual_bytes,
+            teacher_row, reduce_buf, my_offset + dep, actual_bytes, byte_mask,
             loss_per_dist, ce_per_dist, tce_per_dist, teacher_entropy_out, inv_N, lam, alpha, tid);
 
         // Copy grad_unnorm to global memory for Pass 4
@@ -538,7 +562,9 @@ std::vector<torch::Tensor> fused_train_skew_kl(
     torch::Tensor teacher_dists,    // [N_total, 256] float
     torch::Tensor teacher_offsets,  // [T1] int
     torch::Tensor actual_bytes,     // [N_total] int
+    torch::Tensor byte_mask,        // [N_total] uint8
     int N_total,
+    int n_active,
     float lam,
     float alpha
 ) {
@@ -577,6 +603,7 @@ std::vector<torch::Tensor> fused_train_skew_kl(
         teacher_dists.data_ptr<float>(),
         teacher_offsets.data_ptr<int>(),
         actual_bytes.data_ptr<int>(),
+        byte_mask.data_ptr<uint8_t>(),
         grad_logits.data_ptr<float>(),
         loss_srkl.data_ptr<float>(),
         loss_ce.data_ptr<float>(),
@@ -584,7 +611,7 @@ std::vector<torch::Tensor> fused_train_skew_kl(
         teacher_entropy_out.data_ptr<float>(),
         grad_extra.data_ptr<float>(),
         V, max_byte_len, N_total, max_extra,
-        lam, alpha
+        lam, alpha, n_active
     );
 
     return {grad_logits, loss_srkl, loss_ce, loss_tce, teacher_entropy_out};
@@ -604,28 +631,32 @@ std::vector<torch::Tensor> fused_train_skew_kl(
     torch::Tensor teacher_dists,
     torch::Tensor teacher_offsets,
     torch::Tensor actual_bytes,
+    torch::Tensor byte_mask,
     int N_total,
+    int n_active,
     float lam,
     float alpha
 );
 """
 
 
-def get_fused_train_skew_kl_kernel():
+def get_fused_train_skew_kl_kernel() -> _FusedTrainSkewKlKernel | None:
     if not _cuda_available:
         return None
-    return _compile_kernel_with_header(
+    kernel = _compile_kernel_with_header(
         "fused_train_skew_kl",
         _FUSED_TRAIN_SKEW_KL_CPP,
         _FUSED_TRAIN_SKEW_KL_CUDA,
         ["fused_train_skew_kl"],
     )
+    return None if kernel is None else cast(_FusedTrainSkewKlKernel, kernel)
 
 
 
 def fused_train_forward_backward_skew_kl(logits, token_ids, byte_vocab, teacher_dists_flat,
                                           actual_bytes_flat, teacher_offsets,
-                                          target_byte_lens, alpha, lam=0.1, entropy_weighting=False):
+                                          target_byte_lens, alpha, lam=0.1, entropy_weighting=False,
+                                          byte_mask=None):
     kernel = get_fused_train_skew_kl_kernel()
     if kernel is None:
         return None, None
@@ -637,6 +668,15 @@ def fused_train_forward_backward_skew_kl(logits, token_ids, byte_vocab, teacher_
     next_byte_lens = byte_vocab.token_byte_lens[next_tokens]
     next_byte_seqs = byte_vocab.token_byte_seqs[next_tokens]  # [T1, max_byte_len]
     N_total = int(teacher_offsets[-1].item()) + int(target_byte_lens[-1].item())
+
+    if byte_mask is None:
+        byte_mask = torch.ones(N_total, dtype=torch.uint8, device=logits.device)
+        n_active = N_total
+    else:
+        byte_mask = byte_mask.to(torch.uint8).contiguous()
+        n_active = int(byte_mask.sum().item())
+    if n_active == 0:
+        return None, None
 
     results = kernel.fused_train_skew_kl(
         logits[:T1].half().contiguous(),
@@ -650,7 +690,8 @@ def fused_train_forward_backward_skew_kl(logits, token_ids, byte_vocab, teacher_
         teacher_dists_flat.float().contiguous(),
         teacher_offsets.int().contiguous(),
         actual_bytes_flat.int().contiguous(),
-        N_total, lam, alpha,
+        byte_mask,
+        N_total, n_active, lam, alpha,
     )
 
     grad_logits, loss_srkl, loss_ce, loss_tce, teacher_entropy = results
@@ -672,8 +713,8 @@ def fused_train_forward_backward_skew_kl(logits, token_ids, byte_vocab, teacher_
         grad_scale = ew_per_token * T1 / ew_token_sum
         grad_logits = grad_logits * grad_scale.unsqueeze(1)
     else:
-        kl_loss = loss_srkl.mean()
-        ce_loss = loss_ce.mean()
+        kl_loss = loss_srkl.sum() / n_active
+        ce_loss = loss_ce.sum() / n_active
 
     total_loss = kl_loss + alpha * ce_loss
 
@@ -682,7 +723,7 @@ def fused_train_forward_backward_skew_kl(logits, token_ids, byte_vocab, teacher_
         "custom loss": total_loss,
         "CE loss": ce_loss.detach(),
         "kl_div": kl_loss.detach(),
-        "teacher CE loss": loss_tce.mean().detach(),
+        "teacher CE loss": (loss_tce.sum() / n_active).detach(),
     }
 
 

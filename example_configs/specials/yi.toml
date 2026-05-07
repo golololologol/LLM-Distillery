@@ -1,0 +1,3 @@
+# Yi 1.5 / 2.5 family (ChatML format).
+[specials]
+E_END_TURN          = ["<|im_end|>"]

@@ -1,5 +1,14 @@
 import torch
+from typing import Protocol, cast
 from kernels.compiler import _compile_kernel, _compile_kernel_with_header, _cuda_available
+
+
+class _AklKernel(Protocol):
+    def fused_akl(self, *args: object) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
+
+class _FusedTrainAklKernel(Protocol):
+    def fused_train_akl(self, *args: object) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
 
 
 _TRAINING_AKL_CUDA = r"""
@@ -22,116 +31,116 @@ __global__ void fused_akl_kernel(
     float alpha
 ) {
     const int pos = blockIdx.x;
-    const int b = threadIdx.x;
-    if (pos >= N || b >= 256) return;
+    const int byte_idx = threadIdx.x;
+    if (pos >= N || byte_idx >= 256) return;
 
     const float eps = 1e-8f;
     const float inv_N = 1.0f / (float)N;
     const int base = pos * 256;
 
-    float S = student[base + b];
-    float T = teacher[base + b];
+    float S = student[base + byte_idx];
+    float teacher_prob = teacher[base + byte_idx];
     float S_eps = S + eps;
-    float T_eps = T + eps;
+    float T_eps = teacher_prob + eps;
     float log_S = logf(S_eps);
     float log_T = logf(T_eps);
 
-    float fkl_b = T * (log_T - log_S);
+    float fkl_b = teacher_prob * (log_T - log_S);
     float rkl_b = S * (log_S - log_T);
 
     // === Phase 1: reduce fkl, rkl ===
     __shared__ float shared_f[256];
 
     float fkl_sum = blockReduceSum(fkl_b);
-    if (b == 0) shared_f[0] = fkl_sum;
+    if (byte_idx == 0) shared_f[0] = fkl_sum;
     __syncthreads();
     float fkl_pos = shared_f[0];
     __syncthreads();
 
     float rkl_sum = blockReduceSum(rkl_b);
-    if (b == 0) shared_f[0] = rkl_sum;
+    if (byte_idx == 0) shared_f[0] = rkl_sum;
     __syncthreads();
     float rkl_pos = shared_f[0];
     __syncthreads();
 
     // === Phase 2: parallel rank scan for head/tail classification ===
-    shared_f[b] = T;
+    shared_f[byte_idx] = teacher_prob;
     __syncthreads();
 
-    int my_rank = 0;
+    int rank = 0;
     for (int j = 0; j < 256; j++) {
         float other_T = shared_f[j];
-        if (other_T > T || (other_T == T && j < b))
-            my_rank++;
+        if (other_T > teacher_prob || (other_T == teacher_prob && j < byte_idx))
+            rank++;
     }
     __syncthreads();
 
     // Write sorted values (descending) into shared_f
-    shared_f[my_rank] = T;
+    shared_f[rank] = teacher_prob;
     __syncthreads();
 
     // Inclusive prefix sum on sorted teacher values
-    float pval = shared_f[b];
+    float pval = shared_f[byte_idx];
     for (int offset = 1; offset < 256; offset <<= 1) {
         __syncthreads();
-        float tmp = (b >= offset) ? shared_f[b - offset] : 0.0f;
+        float tmp = (byte_idx >= offset) ? shared_f[byte_idx - offset] : 0.0f;
         __syncthreads();
-        shared_f[b] = pval + tmp;
-        pval = shared_f[b];
+        shared_f[byte_idx] = pval + tmp;
+        pval = shared_f[byte_idx];
     }
     __syncthreads();
 
     // Head = bytes whose cumulative sum position <= 0.5
-    int is_head = (my_rank == 0 || shared_f[my_rank] <= 0.5f) ? 1 : 0;
+    int is_head = (rank == 0 || shared_f[rank] <= 0.5f) ? 1 : 0;
     __syncthreads();
 
-    // === Phase 3: compute adaptive weight w ===
-    float gap = fabsf(T - S);
+    // === Phase 3: compute adaptive weight blend_weight ===
+    float gap = fabsf(teacher_prob - S);
     float head_gap_b = gap * (float)is_head;
     float tail_gap_b = gap * (float)(1 - is_head);
 
     float head_gap = blockReduceSum(head_gap_b);
-    if (b == 0) shared_f[0] = head_gap;
+    if (byte_idx == 0) shared_f[0] = head_gap;
     __syncthreads();
     head_gap = shared_f[0];
     __syncthreads();
 
     float tail_gap = blockReduceSum(tail_gap_b);
-    if (b == 0) shared_f[0] = tail_gap;
+    if (byte_idx == 0) shared_f[0] = tail_gap;
     __syncthreads();
     tail_gap = shared_f[0];
 
     float denom = head_gap + tail_gap + eps;
-    float w = tail_gap / denom;
+    float blend_weight = tail_gap / denom;
 
     // === Phase 4: per-position loss and outputs ===
     int actual_b = actual_bytes[pos];
 
-    if (b == 0) {
-        float akl = (1.0f - w) * fkl_pos + w * rkl_pos;
+    if (byte_idx == 0) {
+        float akl = (1.0f - blend_weight) * fkl_pos + blend_weight * rkl_pos;
         out_akl[pos] = akl;
         out_ce[pos] = -logf(student[base + actual_b] + eps);
         out_tce[pos] = -logf(teacher[base + actual_b] + eps);
         out_fkl[pos] = fkl_pos;
         out_rkl[pos] = rkl_pos;
-        out_w[pos] = w;
+        out_w[pos] = blend_weight;
     }
 
     // === Phase 5: gradient ===
     // d(loss)/d(S_b) has three terms from: (1-w)*fkl, w*rkl, and d(w)/d(S_b)*(rkl-fkl)
-    float dFdS = -T / S_eps;
+    float dFdS = -teacher_prob / S_eps;
     float dRdS = log_S + S / S_eps - log_T;
 
     float grad = inv_N * (
-        (1.0f - w) * dFdS
-        + w * dRdS
+        (1.0f - blend_weight) * dFdS
+        + blend_weight * dRdS
     );
 
-    if (b == actual_b) {
+    if (byte_idx == actual_b) {
         grad += alpha * inv_N * (-1.0f / S_eps);
     }
 
-    grad_student[base + b] = grad;
+    grad_student[base + byte_idx] = grad;
 }
 
 std::vector<torch::Tensor> fused_akl(
@@ -179,15 +188,16 @@ std::vector<torch::Tensor> fused_akl(
 """
 
 
-def get_akl_kernel():
+def get_akl_kernel() -> _AklKernel | None:
     if not _cuda_available:
         return None
-    return _compile_kernel_with_header(
+    kernel = _compile_kernel_with_header(
         "fused_akl",
         _TRAINING_AKL_CPP,
         _TRAINING_AKL_CUDA,
         ["fused_akl"],
     )
+    return None if kernel is None else cast(_AklKernel, kernel)
 
 
 
@@ -243,12 +253,28 @@ __device__ void process_depth_akl(
     float* bins, float Z,
     const float* teacher_src, float* teacher_row, float* reduce_buf,
     int dist_idx, const int* actual_bytes,
+    const uint8_t* byte_mask,
     float* loss_per_dist, float* ce_per_dist, float* tce_per_dist,
     float* fkl_per_dist, float* rkl_per_dist, float* w_per_dist,
     float* teacher_entropy_out,
     float inv_N, float alpha, int tid
 ) {
     const float eps = 1e-8f;
+
+    if (byte_mask[dist_idx] == 0) {
+        if (tid == 0) {
+            loss_per_dist[dist_idx] = 0.0f;
+            ce_per_dist[dist_idx] = 0.0f;
+            tce_per_dist[dist_idx] = 0.0f;
+            fkl_per_dist[dist_idx] = 0.0f;
+            rkl_per_dist[dist_idx] = 0.0f;
+            w_per_dist[dist_idx] = 0.0f;
+            teacher_entropy_out[dist_idx] = 0.0f;
+        }
+        if (tid < 256) bins[tid] = 0.0f;
+        __syncthreads();
+        return;
+    }
 
     // Normalize bins and load teacher
     if (tid < 256) {
@@ -287,19 +313,19 @@ __device__ void process_depth_akl(
 
     // Parallel threshold scan for head/tail classification
     // Each thread computes its rank (# of values strictly greater)
-    int my_rank = 0;
-    float my_T = (tid < 256) ? teacher_row[tid] : 0.0f;
+    int rank = 0;
+    float teacher_prob = (tid < 256) ? teacher_row[tid] : 0.0f;
     if (tid < 256) {
         for (int j = 0; j < 256; j++) {
             float other_T = teacher_row[j];
-            if (other_T > my_T || (other_T == my_T && j < tid))
-                my_rank++;
+            if (other_T > teacher_prob || (other_T == teacher_prob && j < tid))
+                rank++;
         }
     }
     __syncthreads();
 
     // Write sorted values (descending) into teacher_row
-    if (tid < 256) teacher_row[my_rank] = my_T;
+    if (tid < 256) teacher_row[rank] = teacher_prob;
     __syncthreads();
 
     // Inclusive prefix sum on sorted teacher values
@@ -316,7 +342,7 @@ __device__ void process_depth_akl(
     __syncthreads();
 
     // Head = bytes whose cumulative sum position <= 0.5
-    int is_head = (tid < 256) ? ((my_rank == 0 || teacher_row[my_rank] <= 0.5f) ? 1 : 0) : 0;
+    int is_head = (tid < 256) ? ((rank == 0 || teacher_row[rank] <= 0.5f) ? 1 : 0) : 0;
     __syncthreads();
 
     // Reload original teacher from global memory (sort destroyed teacher_row)
@@ -417,6 +443,7 @@ void fused_train_akl_kernel(
     const float* __restrict__ teacher_dists,
     const int* __restrict__ teacher_offsets,
     const int* __restrict__ actual_bytes,
+    const uint8_t* __restrict__ byte_mask,
     float* __restrict__ grad_logits,
     float* __restrict__ loss_per_dist,
     float* __restrict__ ce_per_dist,
@@ -427,7 +454,7 @@ void fused_train_akl_kernel(
     float* __restrict__ teacher_entropy_out,
     float* __restrict__ grad_unnorm_extra,
     int V, int max_byte_len, int N_total, int max_extra,
-    float alpha
+    float alpha, int n_active
 ) {
     const int t = blockIdx.x;
     const int tid = threadIdx.x;
@@ -563,17 +590,17 @@ void fused_train_akl_kernel(
     __syncthreads(); Z2 = reduce_buf[0]; __syncthreads();
 
     // ============ PASS 3: Loss + backward per depth ============
-    const float inv_N = 1.0f / (float)N_total;
+    const float inv_N = 1.0f / (float)n_active;
 
     process_depth_akl(d0_bins, Z0, teacher_dists + (long long)my_offset * 256,
-        teacher_row, reduce_buf, my_offset, actual_bytes,
+        teacher_row, reduce_buf, my_offset, actual_bytes, byte_mask,
         loss_per_dist, ce_per_dist, tce_per_dist,
         fkl_per_dist, rkl_per_dist, w_per_dist,
         teacher_entropy_out, inv_N, alpha, tid);
 
     if (my_num_depths >= 2) {
         process_depth_akl(d1_bins, Z1, teacher_dists + ((long long)my_offset + 1) * 256,
-            teacher_row, reduce_buf, my_offset + 1, actual_bytes,
+            teacher_row, reduce_buf, my_offset + 1, actual_bytes, byte_mask,
             loss_per_dist, ce_per_dist, tce_per_dist,
             fkl_per_dist, rkl_per_dist, w_per_dist,
             teacher_entropy_out, inv_N, alpha, tid);
@@ -581,7 +608,7 @@ void fused_train_akl_kernel(
 
     if (my_num_depths >= 3) {
         process_depth_akl(d2_bins, Z2, teacher_dists + ((long long)my_offset + 2) * 256,
-            teacher_row, reduce_buf, my_offset + 2, actual_bytes,
+            teacher_row, reduce_buf, my_offset + 2, actual_bytes, byte_mask,
             loss_per_dist, ce_per_dist, tce_per_dist,
             fkl_per_dist, rkl_per_dist, w_per_dist,
             teacher_entropy_out, inv_N, alpha, tid);
@@ -615,7 +642,7 @@ void fused_train_akl_kernel(
         __syncthreads(); Zx = reduce_buf[0]; __syncthreads();
 
         process_depth_akl(extra_bins, Zx, teacher_dists + ((long long)my_offset + dep) * 256,
-            teacher_row, reduce_buf, my_offset + dep, actual_bytes,
+            teacher_row, reduce_buf, my_offset + dep, actual_bytes, byte_mask,
             loss_per_dist, ce_per_dist, tce_per_dist,
             fkl_per_dist, rkl_per_dist, w_per_dist,
             teacher_entropy_out, inv_N, alpha, tid);
@@ -707,7 +734,9 @@ std::vector<torch::Tensor> fused_train_akl(
     torch::Tensor teacher_dists,
     torch::Tensor teacher_offsets,
     torch::Tensor actual_bytes,
+    torch::Tensor byte_mask,
     int N_total,
+    int n_active,
     float alpha
 ) {
     const int T1 = logits.size(0);
@@ -747,6 +776,7 @@ std::vector<torch::Tensor> fused_train_akl(
         teacher_dists.data_ptr<float>(),
         teacher_offsets.data_ptr<int>(),
         actual_bytes.data_ptr<int>(),
+        byte_mask.data_ptr<uint8_t>(),
         grad_logits.data_ptr<float>(),
         loss_akl.data_ptr<float>(),
         loss_ce.data_ptr<float>(),
@@ -757,7 +787,7 @@ std::vector<torch::Tensor> fused_train_akl(
         teacher_entropy_out.data_ptr<float>(),
         grad_extra.data_ptr<float>(),
         V, max_byte_len, N_total, max_extra,
-        alpha
+        alpha, n_active
     );
 
     return {grad_logits, loss_akl, loss_ce, loss_tce, loss_fkl, loss_rkl, loss_w, teacher_entropy_out};
@@ -777,27 +807,31 @@ std::vector<torch::Tensor> fused_train_akl(
     torch::Tensor teacher_dists,
     torch::Tensor teacher_offsets,
     torch::Tensor actual_bytes,
+    torch::Tensor byte_mask,
     int N_total,
+    int n_active,
     float alpha
 );
 """
 
 
-def get_fused_train_akl_kernel():
+def get_fused_train_akl_kernel() -> _FusedTrainAklKernel | None:
     if not _cuda_available:
         return None
-    return _compile_kernel_with_header(
+    kernel = _compile_kernel_with_header(
         "fused_train_akl",
         _FUSED_TRAIN_AKL_CPP,
         _FUSED_TRAIN_AKL_CUDA,
         ["fused_train_akl"],
     )
+    return None if kernel is None else cast(_FusedTrainAklKernel, kernel)
 
 
 
 def fused_train_forward_backward_akl(logits, token_ids, byte_vocab, teacher_dists_flat,
                                       actual_bytes_flat, teacher_offsets,
-                                      target_byte_lens, alpha, entropy_weighting=False):
+                                      target_byte_lens, alpha, entropy_weighting=False,
+                                      byte_mask=None):
     kernel = get_fused_train_akl_kernel()
     if kernel is None:
         return None, None
@@ -809,6 +843,15 @@ def fused_train_forward_backward_akl(logits, token_ids, byte_vocab, teacher_dist
     next_byte_lens = byte_vocab.token_byte_lens[next_tokens]
     next_byte_seqs = byte_vocab.token_byte_seqs[next_tokens]
     N_total = int(teacher_offsets[-1].item()) + int(target_byte_lens[-1].item())
+
+    if byte_mask is None:
+        byte_mask = torch.ones(N_total, dtype=torch.uint8, device=logits.device)
+        n_active = N_total
+    else:
+        byte_mask = byte_mask.to(torch.uint8).contiguous()
+        n_active = int(byte_mask.sum().item())
+    if n_active == 0:
+        return None, None
 
     results = kernel.fused_train_akl(
         logits[:T1].half().contiguous(),
@@ -822,7 +865,8 @@ def fused_train_forward_backward_akl(logits, token_ids, byte_vocab, teacher_dist
         teacher_dists_flat.float().contiguous(),
         teacher_offsets.int().contiguous(),
         actual_bytes_flat.int().contiguous(),
-        N_total, alpha,
+        byte_mask,
+        N_total, n_active, alpha,
     )
 
     grad_logits, loss_akl, loss_ce, loss_tce, loss_fkl, loss_rkl, loss_w, teacher_entropy = results
@@ -844,8 +888,8 @@ def fused_train_forward_backward_akl(logits, token_ids, byte_vocab, teacher_dist
         grad_scale = ew_per_token * T1 / ew_token_sum
         grad_logits = grad_logits * grad_scale.unsqueeze(1)
     else:
-        kl_loss = loss_akl.mean()
-        ce_loss = loss_ce.mean()
+        kl_loss = loss_akl.sum() / n_active
+        ce_loss = loss_ce.sum() / n_active
 
     total_loss = kl_loss + alpha * ce_loss
 
@@ -853,9 +897,9 @@ def fused_train_forward_backward_akl(logits, token_ids, byte_vocab, teacher_dist
         "train_loss": total_loss,
         "custom loss": total_loss,
         "CE loss": ce_loss.detach(),
-        "kl_div": loss_fkl.mean().detach(),
-        "reverse kl_div": loss_rkl.mean().detach(),
-        "teacher CE loss": loss_tce.mean().detach(),
-        "adaptive_weight": loss_w.mean().detach(),
+        "kl_div": (loss_fkl.sum() / n_active).detach(),
+        "reverse kl_div": (loss_rkl.sum() / n_active).detach(),
+        "teacher CE loss": (loss_tce.sum() / n_active).detach(),
+        "adaptive_weight": (loss_w.sum() / n_active).detach(),
     }
 

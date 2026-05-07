@@ -2,6 +2,8 @@
 import queue
 import threading
 from multiprocessing import get_context
+from collections.abc import Callable
+from typing import Any
 import numpy as np
 import torch
 
@@ -17,13 +19,15 @@ class ExLlamaV2Backend(InferenceBackend):
         model_path: str,
         context_len: int,
         batch_size: int = 1,
-        reserve_vram: list[float] = None,
+        reserve_vram: list[float] | None = None,
         seq_chunk_len: int = 256,
         max_queue_size: int = 16,
         marg_chunk_size: int = 256,
         temperature: float = 1.0,
         num_inference_workers: int = 1,
         one_worker_per_gpu: bool = False,
+        specials_config: dict | None = None,
+        event_extensions: list | None = None,
     ):
         self.model_path = model_path
         self.context_len = context_len
@@ -34,14 +38,16 @@ class ExLlamaV2Backend(InferenceBackend):
         self.marg_chunk_size = marg_chunk_size
         self.temperature = temperature
         self.one_worker_per_gpu = one_worker_per_gpu
+        self.specials_config = specials_config
+        self.event_extensions = event_extensions or []
         self.num_inference_workers = num_gpus() if one_worker_per_gpu else num_inference_workers
         self.worker_processes = []
         self.num_alive_workers = 0
-        self.inference_queue = None
-        self.result_queue = None
+        self.inference_queue: Any = None
+        self.result_queue: Any = None
 
-    def start(self, dm_queue) -> None:
-        self.dm_queue = dm_queue
+    def start(self, distribution_writer) -> None:
+        self.distribution_writer = distribution_writer
         ctx = get_context("spawn")
         self.inference_queue = ctx.Queue(self.max_queue_size)
         self.result_queue = ctx.Queue(self.max_queue_size)
@@ -55,11 +61,12 @@ class ExLlamaV2Backend(InferenceBackend):
         self.worker_processes = []
 
         worker_args_base = (
-            self.inference_queue, self.result_queue, dm_queue, load_status_queue,
+            self.inference_queue, self.result_queue, distribution_writer, load_status_queue,
             self.model_path, self.context_len, self.batch_size,
         )
         worker_kwargs_tail = (
             self.seq_chunk_len, self.marg_chunk_size, self.model_path, self.temperature,
+            self.specials_config, self.event_extensions,
         )
 
         if self.one_worker_per_gpu:
@@ -136,7 +143,7 @@ class ExLlamaV2Backend(InferenceBackend):
     def process_chunk(
         self,
         samples: list[ConvoProcessed],
-        progress_callback: callable = None,
+        progress_callback: Callable[[int], None] | None = None,
     ) -> None:
         samples = sorted(samples, key=lambda s: s.length, reverse=True)
 
@@ -144,16 +151,21 @@ class ExLlamaV2Backend(InferenceBackend):
         for i in range(0, len(samples), self.batch_size):
             batch = samples[i : i + self.batch_size]
             batch_tokens = np.stack([sample.tokens for sample in batch])
-            batch_metadata = [
-                {
+            batch_metadata = []
+            for sample in batch:
+                anchors_pairs = sample.usable_anchors(length=sample.length)
+                anchor_positions = [tp for tp, _ in anchors_pairs]
+                event_template = [m for _, m in anchors_pairs]
+                batch_metadata.append({
                     "id": sample.origin_convo_id,
-                    "content_byte_ranges": sample.content_byte_ranges,
+                    "content_byte_ranges": sample.byte_ranges(),
                     "content_sha": sample.content_sha,
                     "cropped": sample.cropped,
                     "length": sample.length,
-                }
-                for sample in batch
-            ]
+                    "segment_manifest": [s.to_manifest_entry() for s in sample.segments],
+                    "anchor_token_positions": anchor_positions,
+                    "event_manifest_template": event_template,
+                })
             batches.append((batch_tokens, batch_metadata))
 
         def feed_batches():
@@ -202,7 +214,7 @@ class ExLlamaV2Backend(InferenceBackend):
             self.worker_processes = []
             self.num_alive_workers = 0
 
-            for q in [self.inference_queue, self.result_queue, getattr(self, 'dm_queue', None)]:
+            for q in [self.inference_queue, self.result_queue, getattr(self, 'distribution_writer', None)]:
                 if q is not None:
                     try:
                         q.cancel_join_thread()

@@ -1,23 +1,23 @@
 # Paths
-cache_folder = "test_data/cache_ablation"
-dataset_path = "test_data/ultrachat_1000.jsonl"
-validation_dataset_path = "test_data/ultrachat_100_val.jsonl"
+cache_folder = "data/distillery_experiment/teacher_cache"
+dataset_path = "data/distillery_experiment/train.jsonl"
+validation_dataset_path = "data/distillery_experiment/val.jsonl"
 teacher_configs_path = "teacher_configs/"
 student_config_path = "student_configs/tinyllama_1.1b.toml"
 
 # General model settings
 save_roles = ["assistant"]
-auto_approve = false
+auto_approve = true
 
 # Collection settings
 marg_chunk_inference = 256
 marg_chunk_training = 256
 
 # Training settings
-num_epochs = 1
-num_warmup_steps = 50
-batch_size = 4
-grad_accum_batches = 2
+num_epochs = 2
+num_warmup_steps = 200
+batch_size = 8
+grad_accum_batches = 1
 grad_checkpointing = true
 max_grad_norm = 15.0
 torch_compile = true
@@ -31,10 +31,10 @@ lr_decay_start = 0.9
 alpha = 0.5
 loss_type = "abomination"
 lr_scheduler = "wsd"
-optimizer = "apollomini"
+optimizer = "apollo"
 data_order = "random"
 training_precision = "bf16"
-train_on = ["gemma4_31b"]
+train_on = ["qwen3.5_9b"]
 training_strategy = "naive"
 seed = 42
 
@@ -42,7 +42,7 @@ seed = 42
 validate_every_n_epochs = 0.1
 best_metric = "train_loss"
 save_student_every_n_epochs = 1.0
-save_best_model = false
+save_best_model = true
 save_best_state = false
 keep_last_n_checkpoints = 2
 

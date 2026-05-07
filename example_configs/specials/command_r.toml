@@ -1,0 +1,4 @@
+# Cohere Command R specials
+# Uses <|END_OF_TURN_TOKEN|> (id=255001) as EOS / end-of-turn marker.
+[specials]
+E_END_TURN = ["<|END_OF_TURN_TOKEN|>"]

@@ -77,6 +77,8 @@ Dataset format: JSONL with OpenAI-style messages:
 {"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi there!"}]}
 ```
 
+Reasoning traces and tool calls have a specific structured shape — see [DATASET_FORMAT.md](DATASET_FORMAT.md) for the full spec, the format-strategy registry (set `dataset_format = "<name>"` in pipeline config), and the verification workflow. Always sanity-check converted data with [`tools/inspect_segments.py`](tools/inspect_segments.py) before collecting.
+
 Set `dataset_path` and `validation_dataset_path` in `config.toml`.
 
 ### 4. Run

@@ -1,0 +1,14 @@
+model_path = "E:/modelki/Qwen3.5-27B-exl3-6.00bpw"
+context_len = 4096
+temperature = 2
+merge_weight = 1.0
+supports_reasoning = false
+supports_tool_calls = false
+inherit_specials = "qwen_chatml"
+
+[exllamav3]
+reserve_vram = [2.5, 0.5]
+batch_size = 2
+seq_chunk_len = 4096
+num_inference_workers = 1
+one_worker_per_gpu = false

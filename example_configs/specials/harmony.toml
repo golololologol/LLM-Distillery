@@ -1,0 +1,11 @@
+# gpt-oss / OpenAI Harmony format.
+# Plan v8 §3. Channel selectors after <|channel|> route to reasoning/answer/commentary slots.
+[specials]
+E_END_TURN          = ["<|return|>"]
+E_END_MESSAGE       = ["<|end|>"]
+E_BEGIN_TOOL_CALL   = ["<|call|>"]
+# Channel-name tokens live at indices that the tokenizer treats as single
+# tokens after <|channel|>. They are not literal '<|...|>'-wrapped specials.
+E_BEGIN_REASONING   = ["analysis"]
+E_BEGIN_ANSWER      = ["final"]
+E_BEGIN_COMMENTARY  = ["commentary"]

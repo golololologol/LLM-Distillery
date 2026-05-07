@@ -1,8 +1,21 @@
 import pytest
 import torch
 import numpy as np
+from pathlib import Path
 
 requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--regenerate-golden", action="store_true", default=False,
+        help="Rewrite golden files instead of comparing.",
+    )
+
+
+@pytest.fixture(scope="session")
+def regenerate_golden(request):
+    return request.config.getoption("--regenerate-golden")
 
 @pytest.fixture(autouse=True)
 def set_seed():
@@ -13,8 +26,25 @@ def set_seed():
 
 @pytest.fixture(scope="session")
 def tokenizer():
-    from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained("test_data/tiny_tokenizer")
+    from transformers.tokenization_utils_fast import PreTrainedTokenizerFast
+
+    root = Path("test_data/tiny_tokenizer")
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_file=str(root / "tokenizer.json"),
+        eos_token="<|im_end|>",
+        pad_token="<|endoftext|>",
+        additional_special_tokens=[
+            "<|im_start|>", "<|im_end|>",
+            "<|object_ref_start|>", "<|object_ref_end|>",
+            "<|box_start|>", "<|box_end|>",
+            "<|quad_start|>", "<|quad_end|>",
+            "<|vision_start|>", "<|vision_end|>",
+            "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>",
+        ],
+        chat_template=(root / "chat_template.jinja").read_text(encoding="utf-8"),
+    )
+    tokenizer.name_or_path = str(root)
+    return tokenizer
 
 @pytest.fixture(scope="session")
 def byte_vocab(tokenizer):
